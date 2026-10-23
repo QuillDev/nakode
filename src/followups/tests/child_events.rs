@@ -197,7 +197,7 @@ fn stopped_and_closed_parents_require_explicit_recovery() {
 }
 
 #[test]
-fn profile_change_and_deleted_child_cannot_dispatch_old_evidence() {
+fn live_profile_change_holds_evidence_but_source_deletion_preserves_admitted_delivery() {
     let f = Fixture::new();
     let child = child(&f);
     report(&f, &child, "done", "completed");
@@ -229,8 +229,73 @@ fn profile_change_and_deleted_child_cannot_dispatch_old_evidence() {
         .0
         .execute("DELETE FROM sessions WHERE id = ?1", [&child])
         .unwrap();
-    assert!(f.store().claim(&f.session).is_err());
+    let batch = f.store().claim(&f.session).unwrap().unwrap();
+    assert!(batch.prompt.text.contains(&child));
+    assert!(batch.prompt.text.contains("durable_child_evidence"));
     assert_eq!(f.store().list(&f.session, 0, 64).unwrap().items.len(), 1);
+}
+
+#[test]
+fn source_deletion_preserves_claim_recovery_and_never_replays_a_dispatch_fence() {
+    for dispatching in [false, true] {
+        let f = Fixture::new();
+        let child = child(&f);
+        report(&f, &child, "done", "completed");
+        f.store().admit_child_events().unwrap();
+        let batch = f.store().claim(&f.session).unwrap().unwrap();
+        if dispatching {
+            f.store().fence_dispatch(&f.session, &batch.id).unwrap();
+        }
+        SqliteSessionRepository::open(&f.path)
+            .unwrap()
+            .delete(&child)
+            .unwrap();
+        let recovered = f.store().claim(&f.session).unwrap();
+        if dispatching {
+            assert!(recovered.is_none(), "uncertainty never permits replay");
+        } else {
+            let recovered = recovered.unwrap();
+            assert_eq!(recovered.id, batch.id);
+            assert_eq!(recovered.prompt.text, batch.prompt.text);
+            f.store().fence_dispatch(&f.session, &batch.id).unwrap();
+        }
+        assert_eq!(
+            f.store().list(&f.session, 0, 64).unwrap().items[0].state,
+            "dispatching"
+        );
+        f.store().acknowledge(&f.session, &batch.id).unwrap();
+        assert_eq!(
+            f.store().list(&f.session, 0, 64).unwrap().items[0].state,
+            "consumed"
+        );
+    }
+}
+
+#[test]
+fn unavailable_source_provenance_is_explicitly_blocked_without_claiming_or_consuming() {
+    let f = Fixture::new();
+    let child = child(&f);
+    report(&f, &child, "done", "completed");
+    f.store().admit_child_events().unwrap();
+    SqliteSessionRepository::open(&f.path)
+        .unwrap()
+        .delete(&child)
+        .unwrap();
+    f.store()
+        .0
+        .execute("DELETE FROM followup_sources", [])
+        .unwrap();
+    assert!(f.store().claim(&f.session).is_err());
+    let inbox = f.store().list(&f.session, 0, 64).unwrap();
+    assert!(
+        inbox
+            .blocked_reason
+            .unwrap()
+            .contains("ownership is unavailable")
+    );
+    assert_eq!(inbox.pending_count, 1);
+    assert!(inbox.unsettled_batch_id.is_none());
+    assert_eq!(inbox.items[0].state, "pending");
 }
 
 #[test]

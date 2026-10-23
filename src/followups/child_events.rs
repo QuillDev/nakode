@@ -212,8 +212,9 @@ impl InboxStore {
     }
 }
 
-/// Revalidate the persisted relationship before claiming a batch, not just at admission. Unknown
-/// ownership holds evidence for explicit recovery rather than dispatching under an old binding.
+/// Revalidate live sources before claiming. A deleted source cannot change ownership: its
+/// transactionally admitted receipt and runtime-owned source retain the exact destination and
+/// inert provenance independently of the source's report/link rows.
 pub(super) fn authorized_child_messages(
     connection: &rusqlite::Connection,
     parent: &str,
@@ -222,17 +223,20 @@ pub(super) fn authorized_child_messages(
         "SELECT NOT EXISTS (
            SELECT 1 FROM followup_messages m
            JOIN child_followup_deliveries d ON d.message_sequence = m.sequence
-           LEFT JOIN session_child_reports r ON r.sequence = d.report_sequence
-           LEFT JOIN session_child_links l ON l.child_id = r.child_id AND l.parent_id = m.session_id
-           LEFT JOIN sessions p ON p.id = l.parent_id
-           LEFT JOIN sessions c ON c.id = l.child_id
+           LEFT JOIN followup_sources s ON s.message_sequence = m.sequence
+           LEFT JOIN sessions c ON c.id = json_extract(s.source_json, '$.sessionId')
+           LEFT JOIN session_child_links l ON l.child_id = c.id AND l.parent_id = m.session_id
+           LEFT JOIN sessions p ON p.id = m.session_id
            LEFT JOIN session_skill_profiles pp ON pp.session_id = p.id
            LEFT JOIN session_skill_profiles cp ON cp.session_id = c.id
            WHERE m.session_id = ?1 AND m.sequence NOT IN (SELECT message_sequence FROM followup_removals) AND (m.batch_id IS NULL OR m.batch_id IN (
              SELECT batch_id FROM followup_batches WHERE state <> 'consumed'))
-           AND (l.parent_id IS NULL OR NOT (
-             (cp.profile_id IS NOT NULL AND pp.profile_id IS NOT NULL AND cp.profile_id = pp.profile_id)
-             OR (cp.profile_id IS NULL AND pp.profile_id IS NULL AND c.workspace = p.workspace)))
+           AND (s.message_sequence IS NULL
+             OR json_extract(s.source_json, '$.kind') IS NOT 'durable_child_evidence'
+             OR COALESCE(json_extract(s.source_json, '$.sessionId'), '') = ''
+             OR (c.id IS NOT NULL AND (l.parent_id IS NULL OR NOT (
+               (cp.profile_id IS NOT NULL AND pp.profile_id IS NOT NULL AND cp.profile_id = pp.profile_id)
+               OR (cp.profile_id IS NULL AND pp.profile_id IS NULL AND c.workspace = p.workspace)))))
          )", params![parent], |row| row.get(0),
     ).map_err(failure)
 }

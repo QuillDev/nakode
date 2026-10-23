@@ -76,9 +76,12 @@ submitted through ordinary `EnqueueFollowup`.
   bodies also have a 16-KiB serialized limit: an oversized item is explicitly held without silently
   truncating its choices or suppressing other items. This limit is a delivery boundary, not an
   answer or permission to bypass inspection. Unlinked sessions remain inert.
-- Deleted/changed ownership holds previously admitted evidence rather than rerouting it. The
-  current inbox has no general per-item discard/uncertainty-reconciliation API; such recovery
-  remains an explicit product gap, not permission to retry uncertain work.
+- Already-admitted evidence survives source deletion: the transactional receipt and runtime-owned
+  source metadata retain its exact parent destination and inert provenance. Claim revalidates live
+  sources against their current link/profile; unavailable provenance or changed live ownership is
+  held and exposed as `blocked_reason`, never rerouted. Deletion does not acknowledge delivery or
+  permit replay of a dispatch fence. Uncertain-dispatch reconciliation remains an explicit product
+  gap, not permission to retry uncertain work.
 - A crash before a pending question is observed cannot make an in-memory provider interaction
   durable. Once observed, its report survives, but the original question's restart availability
   follows `docs/linked-child-questions.md`. Delivery never fabricates an answerable interaction.
