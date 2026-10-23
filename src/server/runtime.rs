@@ -2080,16 +2080,20 @@ impl NativeServerRuntime {
             } => Some((session_id.clone(), fence.parent_session_id.clone())),
             _ => None,
         };
-        if let Some((session_id, parent)) = &deletion_hold
-            && let Err(error) = self.effects.persistence.sessions.hold_child_deletion(
+        let mut new_deletion_hold = None;
+        if let Some((session_id, parent)) = &deletion_hold {
+            match self.effects.persistence.sessions.hold_child_deletion(
                 session_id.as_str(),
                 parent.as_ref().map(nakode_protocol::SessionId::as_str),
-            )
-        {
-            if let nakode_server::ServerRequest::Command { respond, .. } = request {
-                let _ = respond.send(Err(child_deletion_hold_error(&error)));
+            ) {
+                Ok(created) => new_deletion_hold = created.then(|| session_id.clone()),
+                Err(error) => {
+                    if let nakode_server::ServerRequest::Command { respond, .. } = request {
+                        let _ = respond.send(Err(child_deletion_hold_error(&error)));
+                    }
+                    return;
+                }
             }
-            return;
         }
         let mut rollback = BridgeMutationRollback::capture(&request, &self.core);
         let mut outcome = if let Some(store) = child_question_store.as_ref() {
@@ -2098,6 +2102,23 @@ impl NativeServerRuntime {
         } else {
             self.core.handle(&self.endpoint, request)
         };
+        // A stale revision, replay-only miss or other rejection had no effect, so the hold it took
+        // must not keep refusing claim and transfer.
+        let rejected = outcome.effects.is_empty()
+            && outcome
+                .command_response
+                .as_ref()
+                .is_some_and(|response| response.result.is_err());
+        if rejected
+            && let Some(session_id) = &new_deletion_hold
+            && let Err(error) = self
+                .effects
+                .persistence
+                .sessions
+                .release_child_deletion_hold(session_id.as_str())
+        {
+            eprintln!("nakode: a rejected child deletion hold remains until it expires: {error}");
+        }
         // Only a newly accepted Stop pauses the inbox. Rejected fences, replay-only misses and
         // cached retries must not mutate scheduling after an explicit later Resume.
         if outcome.changed

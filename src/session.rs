@@ -898,11 +898,19 @@ pub trait SessionRepository: Send + Sync {
     /// Before a delegated stop or deletion has any effect, verify the exact durable parent and hold
     /// that link: relinking is refused until the deletion commits or the hold expires.
     /// `None` requires the session to have no durable parent. Repeating it refreshes the hold.
+    /// Returns whether no unexpired hold existed before, so a rejected command can release it.
     ///
     /// # Errors
     /// Refuses unsupported storage, an absent session, a changed parent or a failed transaction.
-    fn hold_child_deletion(&self, _id: &str, _parent: Option<&str>) -> Result<(), SessionError> {
+    fn hold_child_deletion(&self, _id: &str, _parent: Option<&str>) -> Result<bool, SessionError> {
         Err(SessionError::ChildCreationUnsupported)
+    }
+    /// Releases a hold whose stop or deletion was rejected before it had any effect.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated.
+    fn release_child_deletion_hold(&self, _id: &str) -> Result<(), SessionError> {
+        Ok(())
     }
     /// Deletes every logical session and every session-scoped persistence row.
     ///
@@ -4161,7 +4169,7 @@ impl SessionRepository for SqliteSessionRepository {
         self.delete_guarded(id, DeletionGuard::Child { parent })
     }
 
-    fn hold_child_deletion(&self, id: &str, parent: Option<&str>) -> Result<(), SessionError> {
+    fn hold_child_deletion(&self, id: &str, parent: Option<&str>) -> Result<bool, SessionError> {
         let mut connection = self
             .connection
             .lock()
@@ -4186,9 +4194,16 @@ impl SessionRepository for SqliteSessionRepository {
         if current.as_deref() != parent {
             return Err(SessionError::ParentFenceMismatch);
         }
-        let expires_at_ms = unix_timestamp()
-            .saturating_add(CHILD_DELETION_HOLD_SECONDS)
-            .saturating_mul(1_000);
+        let now_ms = unix_timestamp().saturating_mul(1_000);
+        let already_held: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM session_deletion_holds WHERE child_id = ?1 AND expires_at_ms > ?2
+             )",
+            params![id, now_ms],
+            |row| row.get(0),
+        )?;
+        let expires_at_ms =
+            now_ms.saturating_add(CHILD_DELETION_HOLD_SECONDS.saturating_mul(1_000));
         transaction.execute(
             "INSERT INTO session_deletion_holds (child_id, parent_id, expires_at_ms)
              VALUES (?1, ?2, ?3)
@@ -4197,6 +4212,18 @@ impl SessionRepository for SqliteSessionRepository {
             params![id, parent, expires_at_ms],
         )?;
         transaction.commit()?;
+        Ok(!already_held)
+    }
+
+    fn release_child_deletion_hold(&self, id: &str) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection.execute(
+            "DELETE FROM session_deletion_holds WHERE child_id = ?1",
+            [id],
+        )?;
         Ok(())
     }
 

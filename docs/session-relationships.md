@@ -56,7 +56,8 @@ teardown. A mismatch refuses with a non-retryable conflict and nothing is stoppe
 While the hold is live, triggers refuse every insert, re-point or removal of the
 child's link; claim/transfer refuses explicitly and owner-Chat adoption skips the
 relink while still admitting the message. Successful deletion removes the hold in its
-transaction. A hold left by an interrupted caller expires after two minutes; after
+transaction. A command rejected before any effect (stale revision, replay-only miss)
+releases a hold it newly took. A hold left by an interrupted caller expires after two minutes; after
 expiry the deletion transaction's parent check is still the final fence.
 
 Older servers ignore both fences, so callers must see `DeletionParentHold` (stop and
@@ -70,7 +71,7 @@ upward and downward pending/inflight refusal, withdrawal, future routing and
 parent-deletion fences. `src/server/runtime/tests/followups/child_deletion.rs` covers
 fenced deletion of open/closed children, other-parent/orphan/unknown refusal, a
 reparent committed after the projection check, a transfer before a fenced stop
-(no interruption, no hold), relinks refused while held and allowed after expiry,
+(no interruption, no hold), release of a hold whose stop was rejected, relinks refused while held and allowed after expiry,
 the deletion transaction's recheck after an expired hold, and a held cross-runtime
 child refusing a claim. The runtime followup relationship test covers exact-call
 authentication, running-turn/transcript preservation, replacement projections and

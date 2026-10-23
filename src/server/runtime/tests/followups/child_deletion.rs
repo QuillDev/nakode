@@ -216,6 +216,36 @@ async fn a_child_transferred_before_the_stop_is_neither_interrupted_nor_held() {
 }
 
 #[tokio::test]
+async fn a_fenced_stop_rejected_before_any_effect_releases_its_hold() {
+    let mut h = Box::pin(running_child()).await;
+    let child = h.session.to_string();
+    let caller = create_session(&h, "calling chat");
+    let other = create_session(&h, "other chat");
+    link(&h, &child, &caller);
+    h.runtime.refresh_catalogs();
+
+    let stale = h.command(
+        "stale",
+        Some(u64::MAX),
+        false,
+        stop_child(&child, Some(&caller)),
+    );
+    assert!(stale.await.unwrap_err().message.contains("stale"));
+    let unexecuted = h.command("lost", None, true, stop_child(&child, Some(&caller)));
+    assert!(
+        unexecuted
+            .await
+            .unwrap_err()
+            .message
+            .contains("not executed")
+    );
+
+    assert!(!interrupted(&mut h));
+    assert!(!held(&h, &child));
+    assert_eq!(relink(&h, &child, &other).unwrap(), 1);
+}
+
+#[tokio::test]
 async fn a_fenced_stop_holds_the_link_against_every_relink_until_it_expires() {
     let mut h = Box::pin(running_child()).await;
     let child = h.session.to_string();
