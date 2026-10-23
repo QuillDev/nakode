@@ -6731,7 +6731,10 @@ fn child_deletion_hold_error(error: &SessionError) -> ServiceError {
     match error {
         SessionError::ParentFenceMismatch => ServiceError {
             code: ErrorCode::Conflict,
-            message: format!("{error}; nothing was stopped"),
+            // The FStack Host recognizes this refusal by "not a current linked child".
+            message:
+                "not a current linked child of the expected parent; nothing was stopped or deleted"
+                    .to_owned(),
             retryable: false,
         },
         SessionError::SessionNotFound(_) => ServiceError {
