@@ -23,6 +23,9 @@
 /nakode.v1.NakodeService/RemoveFollowup
 /nakode.v1.NakodeService/SetFollowupPaused
 /nakode.v1.NakodeService/ListFollowups
+/nakode.v1.NakodeService/ListBackgroundTasks
+/nakode.v1.NakodeService/GetBackgroundTask
+/nakode.v1.NakodeService/StopBackgroundTask
 /nakode.v1.NakodeService/ListChildQuestions
 /nakode.v1.NakodeService/AnswerChildQuestions
 /nakode.v1.NakodeService/CreateSession

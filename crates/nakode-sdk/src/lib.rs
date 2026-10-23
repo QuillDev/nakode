@@ -1791,6 +1791,45 @@ impl NakodeClient {
     typed_mutation!(reparent_child_session, api::ReparentChildSessionRequest);
     typed_mutation!(publish_child_report, api::PublishChildReportRequest);
 
+    /// Lists runtime-supervised background tasks, optionally only those of one owner session.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error; servers without `BackgroundTasks` answer
+    /// `Unimplemented`.
+    pub async fn list_background_tasks(
+        &self,
+        request: api::ListBackgroundTasksRequest,
+    ) -> Result<api::BackgroundTaskInventory, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .list_background_tasks(request)
+            .await?
+            .into_inner())
+    }
+
+    /// Reads one background task with a bounded log tail and endpoint probes.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn get_background_task(
+        &self,
+        request: api::GetBackgroundTaskRequest,
+    ) -> Result<api::BackgroundTaskDetail, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .get_background_task(request)
+            .await?
+            .into_inner())
+    }
+
+    typed_mutation!(
+        stop_background_task,
+        api::StopBackgroundTaskRequest,
+        "BackgroundTasks"
+    );
+
     /// Reads ordered inert reports without opening either session or starting inference.
     ///
     /// # Errors

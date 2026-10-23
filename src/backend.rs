@@ -85,6 +85,11 @@ const PROVIDER_TOOL_IDENTITIES: &[(&str, &str, &str)] = &[
     (CLAUDE_PROVIDER, "grep", "Grep"),
     (CLAUDE_PROVIDER, "find", "Glob"),
     (CLAUDE_PROVIDER, "bash", "Bash"),
+    (
+        CLAUDE_PROVIDER,
+        crate::background_tasks::BACKGROUND_TASKS_TOOL_NAME,
+        "mcp__nakode__background_tasks",
+    ),
     (CLAUDE_PROVIDER, "write", "Write"),
     (CLAUDE_PROVIDER, "edit", "Edit"),
     (CLAUDE_PROVIDER, "ask", "AskUserQuestion"),

@@ -131,6 +131,7 @@ impl ToolRegistry {
                 Arc::new(write::WriteTool),
                 Arc::new(edit::EditTool),
                 Arc::new(bash::BashTool),
+                Arc::new(crate::background_tasks::BackgroundTasksTool),
                 Arc::new(grep::GrepTool),
                 Arc::new(find::FindTool),
                 Arc::new(ls::LsTool),
@@ -641,6 +642,8 @@ mod tests {
             "write",
             "edit",
             "bash",
+            #[cfg(unix)]
+            "background_tasks",
             "grep",
             "find",
             "ls",

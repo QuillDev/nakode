@@ -7,7 +7,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::tools::{NAKODE_AGENT_TOOL_NAME, SEARCH_SHARED_CONTEXT_TOOL_NAME};
+use crate::{
+    background_tasks::BACKGROUND_TASKS_TOOL_NAME,
+    tools::{NAKODE_AGENT_TOOL_NAME, SEARCH_SHARED_CONTEXT_TOOL_NAME},
+};
 
 pub const CANONICAL_AGENT_TOOLS: &[&str] = &[
     "read",
@@ -18,6 +21,7 @@ pub const CANONICAL_AGENT_TOOLS: &[&str] = &[
     "find",
     "ls",
     "bash",
+    BACKGROUND_TASKS_TOOL_NAME,
     "write",
     "edit",
     "eval",
@@ -797,7 +801,7 @@ pub fn required_capability(tool: &str) -> Option<&'static str> {
     match tool {
         "read" | "grep" | "find" | "ls" | "return_image" => Some("filesystem_read"),
         "write" | "edit" => Some("filesystem_write"),
-        "bash" => Some("command_execution"),
+        "bash" | BACKGROUND_TASKS_TOOL_NAME => Some("command_execution"),
         "eval" | "ask" => Some("interaction"),
         "browser" => Some("network"),
         "memory_store" | "memory_search" => Some("memory"),

@@ -4,6 +4,10 @@
 //! no dependency on a terminal, renderer, provider adapter, process runtime, or
 //! persistence implementation.
 
+mod background_task;
+pub use background_task::{
+    BackgroundTaskDetail, BackgroundTaskEndpointView, BackgroundTaskInventory, BackgroundTaskView,
+};
 mod base64_bytes;
 mod child_question;
 pub use child_question::{ChildQuestionAvailability, ChildQuestionSnapshot, ChildQuestions};

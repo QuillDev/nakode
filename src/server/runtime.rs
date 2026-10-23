@@ -47,6 +47,7 @@ use crate::{
     state::{AgentBrowserStatus, DomainState, Effect},
 };
 
+mod background_tasks;
 mod child_creation;
 mod child_materials;
 mod followups;
@@ -328,6 +329,10 @@ pub(crate) async fn prepare_runtime(
         std::env::current_exe().map_err(NativeRuntimeError::CurrentExecutable)?;
     let session_repository = Arc::new(SqliteSessionRepository::open_default()?);
     let session_database = session_repository.database_path().to_path_buf();
+    // Optional: a registry failure disables background tasks without blocking the runtime.
+    if let Err(error) = crate::background_tasks::initialize(&session_database).await {
+        eprintln!("nakode: background tasks are unavailable: {error}");
+    }
     let credential_store = Arc::new(SqliteCredentialStore::open(&session_database)?);
     let mut providers = session_repository.list_providers()?;
     enable_e2e_fixture_provider(&mut providers);
@@ -1394,6 +1399,9 @@ impl NativeServerRuntime {
         let Some(request) = self.handle_followup_request(request) else {
             return;
         };
+        let Some(request) = self.handle_background_task_request(request) else {
+            return;
+        };
         let Some(request) = self.handle_relationship_request(request) else {
             return;
         };
@@ -2247,6 +2255,13 @@ impl NativeServerRuntime {
             let canonical_id = nakode_protocol::SessionId::from(delete_session_id.clone());
             remove_session_release_effect(&mut effects, &delete_session_id);
             let terminated_shell_ids = self.terminate_deleted_session_work(&canonical_id).await;
+            // Fences new launches by this owner and marks its managed tasks. Their process trees
+            // are stopped in the background once the deletion commits; trees that cannot be
+            // proven gone remain as cleanup_failed orphan records.
+            let background_tasks = crate::background_tasks::service();
+            if let Some(service) = &background_tasks {
+                service.begin_owner_deletion(&delete_session_id).await;
+            }
             // Provider tasks can persist native history during their terminal path. Fence and await
             // every backend before the repository transaction so a successful deletion cannot be
             // repopulated by a completion racing behind its acknowledgement.
@@ -2260,6 +2275,11 @@ impl NativeServerRuntime {
                     &terminated_shell_ids,
                     "session deletion stopped the shell before backend teardown failed",
                 );
+                if let Some(service) = &background_tasks {
+                    service
+                        .finish_owner_deletion(&delete_session_id, false)
+                        .await;
+                }
                 outcome.respond_with_error(ServiceError {
                     code: ErrorCode::Internal,
                     message: format!(
@@ -2304,6 +2324,11 @@ impl NativeServerRuntime {
                     &terminated_shell_ids,
                     "shell stopped before durable session deletion failed",
                 );
+                if let Some(service) = &background_tasks {
+                    service
+                        .finish_owner_deletion(&delete_session_id, false)
+                        .await;
+                }
                 // A changed parent is an authoritative refusal: retrying the same fence cannot help.
                 let refused = matches!(
                     error,
@@ -2331,6 +2356,14 @@ impl NativeServerRuntime {
             }
             crate::session_environment::remove(&delete_session_id);
             crate::tools::desktop::record_discard(&delete_session_id);
+            if let Some(service) = &background_tasks {
+                // Cleanup runs off the actor; its outcome is recorded on each task.
+                drop(
+                    service
+                        .finish_owner_deletion(&delete_session_id, true)
+                        .await,
+                );
+            }
         }
         self.complete_native_delegations(&effects);
         self.register_effect_owners(&session_id, &effects);
@@ -3507,6 +3540,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::OrchestratorThreadBridge,
             ServiceCapability::ConditionalActivationForce,
             ServiceCapability::WorkspacePathInspection,
+            ServiceCapability::BackgroundTasks,
         ]
         .into_iter()
         .collect(),

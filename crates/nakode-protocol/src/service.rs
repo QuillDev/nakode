@@ -70,6 +70,8 @@ pub enum ServiceCapability {
     ConditionalActivationForce,
     /// Read-only server-side canonical path and Git placement inspection.
     WorkspacePathInspection,
+    /// Runtime-supervised background process trees owned by logical sessions: list, inspect, stop.
+    BackgroundTasks,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -194,6 +196,8 @@ pub struct SkillCatalogueView {
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum QueryResult {
     Followups(crate::FollowupInbox),
+    BackgroundTasks(crate::BackgroundTaskInventory),
+    BackgroundTask(Box<crate::BackgroundTaskDetail>),
     SessionRouting(SessionId),
     ChildMaterials(crate::MaterialPage),
     ChildMaterial(crate::ChildMaterial),
