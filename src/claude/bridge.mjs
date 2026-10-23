@@ -81,16 +81,21 @@ function delegationOutcome(toolResult) {
 // Nakode's own tools for Claude: `delegate` creates attributed sub-agents, and `return_image`
 // attaches an image file from this machine to the transcript. Nakode reads and validates the file
 // itself, so its bytes never pass through the provider.
-function nakodeServer(session, turn, { delegate: withDelegate, returnImage, desktop }) {
+function nakodeServer(
+  session,
+  turn,
+  { delegate: withDelegate, returnImage, desktop, backgroundTasks },
+) {
   const tools = [];
   if (returnImage) tools.push(returnImageTool(session, turn));
+  if (backgroundTasks) tools.push(backgroundTasksTool(session, turn));
   for (const name of desktop) tools.push(desktopTool(name, session, turn));
   if (withDelegate) tools.push(delegateTool(session, turn));
   return createSdkMcpServer({
     name: "nakode",
     version: "1.0.0",
     instructions:
-      "Nakode tools: delegate bounded work to configured archetypes, attach images from this machine to the transcript, and use and record this agent's private desktop when it has one.",
+      "Nakode tools: delegate bounded work to configured archetypes, attach images from this machine to the transcript, manage runtime-supervised background processes, and use and record this agent's private desktop when it has one.",
     tools,
   });
 }
@@ -142,6 +147,41 @@ function desktopTool(name, session, turn) {
         arguments: args,
       });
     }),
+  );
+}
+
+// Nakode's runtime supervises these processes; Claude Code's own background shells end with it.
+function backgroundTasksTool(session, turn) {
+  return tool(
+    "background_tasks",
+    "Manage long-running background processes such as dev servers, workers and watchers on this session's execution machine. The Nakode runtime supervises them: they keep running after this call and this turn, are stopped when this session is deleted, and write a bounded log. `start` launches a shell command; `list` shows this session's tasks; `inspect` returns status, a log tail and endpoint probes; `stop` terminates one task's whole process tree. Running only means the processes are alive, not that the service is ready: check the log or endpoints. Endpoints are addresses on the execution machine, so localhost there is not the owner's localhost. Use Bash for finite commands such as installs and builds; prefer this tool over Bash run_in_background for anything that must outlive the turn.",
+    {
+      action: z.enum(["start", "list", "inspect", "stop"]),
+      command: z.string().min(1).optional().describe("start: shell command to run"),
+      name: z.string().min(1).max(120).optional().describe("start: short label, such as web dev server"),
+      cwd: z.string().min(1).optional().describe("start: working directory; workspace-relative or absolute"),
+      endpoints: z
+        .array(z.string().min(1).max(512))
+        .max(8)
+        .optional()
+        .describe("start: addresses the task will serve on the execution machine, such as http://127.0.0.1:3000"),
+      task_id: z.string().min(1).optional().describe("inspect/stop: exact task id"),
+      log_bytes: z.number().int().min(0).max(65536).optional().describe("inspect: log tail size; default 8192"),
+      grace_seconds: z.number().min(0).max(60).optional().describe("stop: seconds between SIGTERM and SIGKILL; default 5"),
+    },
+    async (args, extra) =>
+      new Promise((resolve) => {
+        const id = randomUUID();
+        externalToolCalls.set(id, { resolve, sessionId: session.sessionId, turnId: turn.turnId });
+        write({
+          event: "background_task_request",
+          id,
+          turnId: turn.turnId,
+          callId: extra?._meta?.["claudecode/toolUseId"] || id,
+          workspace: turn.workspace,
+          arguments: args,
+        });
+      }),
   );
 }
 
@@ -312,6 +352,7 @@ function providerToolName(name) {
 const NAKODE_MCP_TOOLS = new Set([
   "mcp__nakode__delegate",
   "mcp__nakode__return_image",
+  "mcp__nakode__background_tasks",
   "mcp__nakode__desktop_screenshot",
   "mcp__nakode__desktop_action",
   "mcp__nakode__screen_record",
@@ -571,6 +612,7 @@ const POLICY_TOOL_NAMES = new Map([
   ["grep", ["Grep"]],
   ["find", ["Glob"]],
   ["bash", ["Bash"]],
+  ["background_tasks", ["mcp__nakode__background_tasks"]],
   ["write", ["Write"]],
   ["edit", ["Edit"]],
   ["ask", ["AskUserQuestion"]],
@@ -585,6 +627,7 @@ const CLAUDE_POLICY_TOOLS = new Set([
   "Edit",
   "AskUserQuestion",
   "mcp__nakode__delegate",
+  "mcp__nakode__background_tasks",
 ]);
 
 /**
@@ -1100,15 +1143,19 @@ async function sendTurn(command) {
       allows("mcp__nakode__delegate"),
   );
   const returnImage = allows("mcp__nakode__return_image");
+  // Ownership is bound by the supervisor from the logical owner; without one the tool is absent.
+  const backgroundTasks = Boolean(
+    session.ownerSessionId && allows("mcp__nakode__background_tasks"),
+  );
   // Offered where this machine gives agents a desktop.
   const desktop = process.env.DISPLAY
     ? Object.keys(DESKTOP_TOOLS).filter((name) => allows(`mcp__nakode__${name}`))
     : [];
-  if (withDelegate || returnImage || desktop.length > 0) {
+  if (withDelegate || returnImage || backgroundTasks || desktop.length > 0) {
     mcpServers.nakode = nakodeServer(
       session,
       { turnId: command.turnId, workspace: command.workspace },
-      { delegate: withDelegate, returnImage, desktop },
+      { delegate: withDelegate, returnImage, desktop, backgroundTasks },
     );
   }
   if (session.externalTools.length > 0) {
@@ -1409,6 +1456,7 @@ async function handle(command) {
     }
     case "resolve_external_tool":
     case "resolve_image_return":
+    case "resolve_background_task":
     case "resolve_delegation":
       resolveExternalToolCall(
         command.id,

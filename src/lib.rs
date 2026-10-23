@@ -7,6 +7,7 @@ pub(crate) mod api_projection;
 #[cfg(feature = "tui")]
 pub mod app;
 pub mod backend;
+pub(crate) mod background_tasks;
 mod child_questions;
 mod child_reports;
 pub mod claude;

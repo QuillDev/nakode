@@ -801,6 +801,9 @@ impl ServerCore {
             | Command::AnswerChildQuestions { .. } => Err(DomainCommandError::Invalid(
                 "linked child operations require the persistence runtime".to_owned(),
             )),
+            Command::StopBackgroundTask { .. } => Err(DomainCommandError::Invalid(
+                "background tasks require the persistence runtime".to_owned(),
+            )),
             Command::CreateSession {
                 parent_session_id: Some(_),
                 ..
@@ -3563,13 +3566,15 @@ impl ServerCore {
     fn query_view(&self, query: Query) -> Result<QueryResult, ServiceError> {
         match query {
             Query::GetSessionRouting { session_id } => self.query_session_routing(session_id),
-            Query::ListFollowups { .. }
+            Query::ListBackgroundTasks { .. }
+            | Query::GetBackgroundTask { .. }
+            | Query::ListFollowups { .. }
             | Query::ListChildMaterials { .. }
             | Query::GetChildMaterial { .. }
             | Query::ListChildReports { .. }
             | Query::ListChildQuestions { .. } => Err(service_error(
                 ErrorCode::Internal,
-                "child reports require the persistence runtime",
+                "this query requires the persistence runtime",
                 true,
             )),
             Query::InspectWorkspacePath { .. } => Err(service_error(
@@ -4839,7 +4844,8 @@ impl ServerCore {
             // Deletion can rotate the default engine; select it after acceptance.
             Command::DeleteSession { .. }
             | Command::ClearSelf { .. }
-            | Command::PruneSession { .. } => None,
+            | Command::PruneSession { .. }
+            | Command::StopBackgroundTask { .. } => None,
         }
     }
 

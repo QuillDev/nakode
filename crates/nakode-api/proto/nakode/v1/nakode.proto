@@ -44,6 +44,13 @@ service NakodeService {
   rpc RemoveFollowup(RemoveFollowupRequest) returns (MutationResult);
   rpc SetFollowupPaused(SetFollowupPausedRequest) returns (MutationResult);
   rpc ListFollowups(ListFollowupsRequest) returns (FollowupInbox);
+  // Runtime-supervised background process trees owned by logical sessions on this machine.
+  // Owner integrations see every task, including orphans of deleted sessions. Requires the
+  // `BackgroundTasks` service capability. Running means processes are alive, never ready.
+  rpc ListBackgroundTasks(ListBackgroundTasksRequest) returns (BackgroundTaskInventory);
+  rpc GetBackgroundTask(GetBackgroundTaskRequest) returns (BackgroundTaskDetail);
+  // Terminates one exact task's whole process tree; an already ended task is success.
+  rpc StopBackgroundTask(StopBackgroundTaskRequest) returns (MutationResult);
   rpc ListChildQuestions(ListChildQuestionsRequest) returns (ChildQuestionSnapshot);
   rpc AnswerChildQuestions(AnswerChildQuestionsRequest) returns (MutationResult);
   rpc CreateSession(CreateSessionRequest) returns (MutationResult);
@@ -243,6 +250,64 @@ message ListFollowupsRequest {
   uint32 limit = 3;
   // Empty/all preserves legacy ascending history; active is ascending, consumed is newest first.
   string view = 4;
+}
+message ListBackgroundTasksRequest {
+  // Empty lists every task in this runtime.
+  string owner_session_id = 1;
+}
+message GetBackgroundTaskRequest {
+  string task_id = 1;
+  // Bounded by the server; zero returns no log.
+  uint32 log_tail_bytes = 2;
+}
+message StopBackgroundTaskRequest {
+  MutationOptions mutation = 1;
+  string task_id = 2;
+}
+message BackgroundTask {
+  string task_id = 1;
+  string name = 2;
+  string owner_session_id = 3;
+  optional string origin_run_id = 4;
+  optional string origin_turn_id = 5;
+  string command = 6;
+  string cwd = 7;
+  // Hostname of the supervising machine; endpoints are relative to it.
+  string machine = 8;
+  // launching, running, stopping, exited, stopped, failed_to_start, cleanup_failed or unknown.
+  string state = 9;
+  // child while this runtime process is the OS parent; adopted after a runtime restart.
+  string supervision = 10;
+  optional uint32 process_id = 11;
+  optional int32 exit_code = 12;
+  optional int32 exit_signal = 13;
+  optional string detail = 14;
+  // requested or owner_deleted.
+  optional string stop_reason = 15;
+  // Set once the owning session was deleted; the task is then an orphan.
+  optional int64 owner_deleted_at_ms = 16;
+  repeated string endpoints = 17;
+  int64 created_at_ms = 18;
+  optional int64 started_at_ms = 19;
+  optional int64 ended_at_ms = 20;
+  int64 updated_at_ms = 21;
+}
+message BackgroundTaskInventory {
+  string machine = 1;
+  int64 observed_at_ms = 2;
+  repeated BackgroundTask tasks = 3;
+}
+message BackgroundTaskEndpoint {
+  string endpoint = 1;
+  // accepting, refused or unknown, probed from the supervising machine.
+  string probe = 2;
+}
+message BackgroundTaskDetail {
+  BackgroundTask task = 1;
+  string log_tail = 2;
+  bool log_truncated = 3;
+  repeated BackgroundTaskEndpoint endpoints = 4;
+  int64 observed_at_ms = 5;
 }
 message FollowupItem {
   uint64 sequence = 1;

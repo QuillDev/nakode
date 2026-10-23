@@ -566,6 +566,8 @@ async fn run_supervisor(
     let mut deferred_command = None;
     let mut delegation_scope = DelegationScope::default();
     let mut delegations = ClaudeDelegations::new(config.native_delegation.clone());
+    // Background task calls may wait on process termination, so they run off this loop.
+    let (background_replies_tx, mut background_replies) = mpsc::channel::<Value>(16);
     let mut authentication_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut authentication_callback: Option<mpsc::Sender<String>> = None;
     let _ = events.send(BackendEvent::Ready(claude_identity())).await;
@@ -661,6 +663,11 @@ async fn run_supervisor(
                 let owner = session_owner(attachment.as_ref());
                 handle_command(command, &config, credential.as_ref(), bridge.as_mut(), &events, owner).await;
             }
+            Some(reply) = background_replies.recv() => {
+                if let Some(bridge) = bridge.as_mut() {
+                    let _ = send(bridge, reply).await;
+                }
+            }
             completion = delegations.next_completion() => {
                 if let Some(bridge) = bridge.as_mut() {
                     let _ = send(bridge, completion.bridge_reply()).await;
@@ -717,6 +724,29 @@ async fn run_supervisor(
                     if let Some(bridge) = bridge.as_mut() {
                         let _ = send(bridge, reply).await;
                     }
+                    continue;
+                }
+                if event_name == Some("background_task_request") {
+                    // The owner comes from control-plane attachment, never from the payload.
+                    let caller = delegation_scope
+                        .background_task_caller(string(&message, "turnId"), string(&message, "callId"));
+                    let replies = background_replies_tx.clone();
+                    tokio::spawn(async move {
+                        let workspace = PathBuf::from(string(&message, "workspace"));
+                        let (output, failed) = match crate::background_tasks::execute_tool_call(
+                            caller,
+                            &workspace,
+                            &message["arguments"],
+                        )
+                        .await
+                        {
+                            Ok(output) => (output, false),
+                            Err(error) => (error, true),
+                        };
+                        let _ = replies
+                            .send(json!({"method": "resolve_background_task", "id": string(&message, "id"), "output": output, "failed": failed}))
+                            .await;
+                    });
                     continue;
                 }
                 if event_name == Some(DELEGATION_REQUEST_EVENT) {

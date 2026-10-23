@@ -313,6 +313,11 @@ pub enum Command {
         session_id: SessionId,
         message_id: String,
     },
+    /// Terminates one exact managed background task's process tree. Owner integrations may stop
+    /// orphaned tasks; an already ended task is success.
+    StopBackgroundTask {
+        task_id: String,
+    },
     SetFollowupPaused {
         session_id: SessionId,
         paused: bool,
@@ -743,6 +748,14 @@ pub enum Command {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Query {
+    /// Every managed background task in this runtime, or only those of one owner session.
+    ListBackgroundTasks {
+        owner_session_id: Option<SessionId>,
+    },
+    GetBackgroundTask {
+        task_id: String,
+        log_tail_bytes: u32,
+    },
     ListFollowups {
         session_id: SessionId,
         after_sequence: u64,

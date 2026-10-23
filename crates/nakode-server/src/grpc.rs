@@ -919,6 +919,78 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         ))
     }
 
+    async fn list_background_tasks(
+        &self,
+        request: tonic::Request<api::ListBackgroundTasksRequest>,
+    ) -> Result<tonic::Response<api::BackgroundTaskInventory>, tonic::Status> {
+        let input = request.into_inner();
+        let owner_session_id = (!input.owner_session_id.is_empty())
+            .then(|| protocol::SessionId::from(input.owner_session_id));
+        let (result, timing) = self
+            .query(protocol::Query::ListBackgroundTasks { owner_session_id })
+            .await?;
+        let protocol::QueryResult::BackgroundTasks(inventory) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected background task inventory response",
+                &timing,
+            ));
+        };
+        Ok(response_with_timing(
+            api::BackgroundTaskInventory {
+                machine: inventory.machine,
+                observed_at_ms: inventory.observed_at_ms,
+                tasks: inventory.tasks.into_iter().map(background_task).collect(),
+            },
+            &timing,
+        ))
+    }
+
+    async fn get_background_task(
+        &self,
+        request: tonic::Request<api::GetBackgroundTaskRequest>,
+    ) -> Result<tonic::Response<api::BackgroundTaskDetail>, tonic::Status> {
+        let input = request.into_inner();
+        let (result, timing) = self
+            .query(protocol::Query::GetBackgroundTask {
+                task_id: input.task_id,
+                log_tail_bytes: input.log_tail_bytes,
+            })
+            .await?;
+        let protocol::QueryResult::BackgroundTask(detail) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected background task response",
+                &timing,
+            ));
+        };
+        let detail = *detail;
+        Ok(response_with_timing(
+            api::BackgroundTaskDetail {
+                task: Some(background_task(detail.task)),
+                log_tail: detail.log_tail,
+                log_truncated: detail.log_truncated,
+                endpoints: detail
+                    .endpoints
+                    .into_iter()
+                    .map(|endpoint| api::BackgroundTaskEndpoint {
+                        endpoint: endpoint.endpoint,
+                        probe: endpoint.probe,
+                    })
+                    .collect(),
+                observed_at_ms: detail.observed_at_ms,
+            },
+            &timing,
+        ))
+    }
+
+    command_rpc!(
+        stop_background_task,
+        api::StopBackgroundTaskRequest,
+        input,
+        protocol::Command::StopBackgroundTask {
+            task_id: input.task_id,
+        }
+    );
+
     async fn list_child_reports(
         &self,
         request: tonic::Request<api::ListChildReportsRequest>,
@@ -2990,6 +3062,32 @@ fn provider(value: protocol::ProviderView) -> api::Provider {
         supported_builtin_tools: supported_builtin_tools.unwrap_or_default(),
         remote_authentication_supported: value.remote_authentication_supported,
         accounts: value.accounts.into_iter().map(provider_account).collect(),
+    }
+}
+
+fn background_task(value: protocol::BackgroundTaskView) -> api::BackgroundTask {
+    api::BackgroundTask {
+        task_id: value.task_id,
+        name: value.name,
+        owner_session_id: value.owner_session_id,
+        origin_run_id: value.origin_run_id,
+        origin_turn_id: value.origin_turn_id,
+        command: value.command,
+        cwd: value.cwd,
+        machine: value.machine,
+        state: value.state,
+        supervision: value.supervision,
+        process_id: value.process_id,
+        exit_code: value.exit_code,
+        exit_signal: value.exit_signal,
+        detail: value.detail,
+        stop_reason: value.stop_reason,
+        owner_deleted_at_ms: value.owner_deleted_at_ms,
+        endpoints: value.endpoints,
+        created_at_ms: value.created_at_ms,
+        started_at_ms: value.started_at_ms,
+        ended_at_ms: value.ended_at_ms,
+        updated_at_ms: value.updated_at_ms,
     }
 }
 

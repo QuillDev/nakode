@@ -56,6 +56,23 @@ impl DelegationScope {
     }
 }
 
+impl DelegationScope {
+    /// The authenticated background-task caller for one bridge tool call, if this Claude session
+    /// acts for a logical owner. Identity in the bridge payload is never consulted.
+    pub(crate) fn background_task_caller(
+        &self,
+        turn_id: String,
+        call_id: String,
+    ) -> Option<crate::background_tasks::CallerScope> {
+        Some(crate::background_tasks::CallerScope {
+            owner: self.owner_session_id.clone()?,
+            run_id: self.parent_run_id.clone(),
+            turn_id: Some(turn_id).filter(|id| !id.is_empty()),
+            call_id: Some(call_id).filter(|id| !id.is_empty()),
+        })
+    }
+}
+
 /// The terminal outcome of one delegation, ready to send back to the bridge.
 #[derive(Debug)]
 pub(crate) struct DelegationCompletion {

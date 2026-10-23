@@ -3988,6 +3988,8 @@ mod tests {
             "write",
             "edit",
             "bash",
+            #[cfg(unix)]
+            "background_tasks",
             "grep",
             "find",
             "ls",
