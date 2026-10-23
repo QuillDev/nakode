@@ -35,15 +35,21 @@ When a turn has `sdk_unknown` cancellations, the bridge emits one warning at tur
 SDK lifecycle events of that turn (for example `task_notification`, `api_retry`, hook events) with
 their offsets, so the next occurrence can be diagnosed from the transcript instead of provider storage.
 
-Remaining limits: the cause of a given `sdk_unknown` cancellation is still not provable from the
-bridge. The model is told not to stop and wait, but it may still do so; Nakode never continues
-or replays the call automatically, so an owner continuation can still be needed.
-Audits carry the same evidence. Provider-history snapshots retain host permission records
-by exact session and call ID because the SDK's transcript does not save callback metadata.
-History refresh cannot replace known host evidence with missing/unknown SDK evidence.
+## Background-task turns
 
-Offline regression fixtures exercise production bridge functions and query registration;
-Rust coverage checks retained-history reconstruction. These are not live-provider proof.
-Public SDK 0.3.280 / CLI 2.1.280 uses the generic STOP sentence for cancellation and
-skipped batch results. That static-source finding does not establish why an earlier live
-SDK invocation cancelled. Missing metadata in historical transcripts remains unknown.
+The recurring `sdk_unknown` cancellation had one established cause. For a string prompt, the SDK
+closes Claude Code's stdin at the first `result`. A background Bash or Monitor task keeps the
+process alive and starts another turn when it finishes. In that turn Claude Code's control
+requests fail with an `AbortError("Stream closed")`, the SDK-callback PreToolUse hook rethrows it,
+and the tool call is cancelled with the generic STOP text. Nakode received no stop, so it was
+`sdk_unknown`.
+
+The bridge now always sends streaming input and keeps it open after a `result` while
+non-ambient background tasks are live (`background_tasks_changed`), or while a `task_notification`
+announces a follow-up turn. Input closes at the first idle `result`, or after a short grace once the
+task list empties with no follow-up turn. Turns with background tasks stay open while those tasks
+run, as Claude Code's process already did.
+
+Remaining limits: other SDK-internal cancellations (refusal fallback, ambient watchers, unknown
+CLI paths) still yield `sdk_unknown`/`sdk_retracted`. The model is told not to stop for them, but it
+may, and Nakode never continues or replays the call automatically.

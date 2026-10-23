@@ -1166,9 +1166,35 @@ function emitStreamEvent(turnId, message, session) {
   }
 }
 
-function turnPrompt(command) {
-  if (!command.images?.length) return command.prompt;
-  return (async function* () {
+// The SDK closes Claude Code's stdin at the first result of a string prompt. A background task
+// (background Bash, Monitor) can then start another turn in the same process, where every SDK
+// callback, including Nakode's PreToolUse hook, fails with "Stream closed". Claude Code reports
+// that as the generic user-cancellation text, so the agent stops with no owner stop.
+// Streaming input therefore stays open until no background task can start another turn.
+const BACKGROUND_SETTLE_GRACE_MS = 2000;
+
+function turnInput(command) {
+  let settle;
+  const settled = new Promise((resolve) => {
+    settle = resolve;
+  });
+  let liveTasks = 0;
+  let idle = false;
+  let grace = null;
+  const clearGrace = () => {
+    if (grace !== null) clearTimeout(grace);
+    grace = null;
+  };
+  const close = () => {
+    clearGrace();
+    settle();
+  };
+  const settleWhenIdle = () => {
+    if (!idle || liveTasks > 0 || grace !== null) return;
+    // A finished task normally announces its follow-up turn first; the grace absorbs reordering.
+    grace = setTimeout(close, BACKGROUND_SETTLE_GRACE_MS);
+  };
+  const prompt = (async function* () {
     yield {
       type: "user",
       session_id: command.sessionId,
@@ -1176,12 +1202,32 @@ function turnPrompt(command) {
       message: {
         role: "user",
         content: [
-          ...command.images,
+          ...(command.images || []),
           ...(command.prompt ? [{ type: "text", text: command.prompt }] : []),
         ],
       },
     };
+    await settled;
   })();
+  return {
+    prompt,
+    close,
+    observe(message) {
+      if (message.type === "result") {
+        idle = true;
+        if (liveTasks === 0) close();
+      } else if (message.type === "system" && message.subtype === "background_tasks_changed") {
+        liveTasks = (message.tasks || []).filter((task) => !task.ambient).length;
+        settleWhenIdle();
+      } else if (message.type === "system" && message.subtype === "task_notification") {
+        idle = false;
+        clearGrace();
+      } else if (message.type === "stream_event" || message.type === "assistant") {
+        idle = false;
+        clearGrace();
+      }
+    },
+  };
 }
 
 async function sendTurn(command) {
@@ -1283,6 +1329,7 @@ async function sendTurn(command) {
   let completion = null;
   let turnPermissions = new Map();
   const lifecycle = sdkLifecycleLog();
+  const input = turnInput(command);
   let timedOut = false;
   const timeout = session.timeoutSeconds
     ? setTimeout(() => {
@@ -1291,10 +1338,11 @@ async function sendTurn(command) {
       }, session.timeoutSeconds * 1000)
     : null;
   try {
-    const stream = query({ prompt: turnPrompt(command), options });
+    const stream = query({ prompt: input.prompt, options });
     await processLifecycle.started();
     write({ event: "turn_started", turnId: command.turnId });
     for await (const message of stream) {
+      input.observe(message);
       // Retract superseded results first, so this message's replacement is the final projection.
       if (Array.isArray(message.supersedes))
         retractToolResults(command.turnId, message.supersedes, "a model refusal fallback");
@@ -1349,6 +1397,7 @@ async function sendTurn(command) {
           : errorMessage(error),
     };
   } finally {
+    input.close();
     if (timeout !== null) clearTimeout(timeout);
     interruptExternalToolCalls(
       (pending) => pending.turnId === command.turnId,

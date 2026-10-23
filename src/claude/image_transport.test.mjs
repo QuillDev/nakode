@@ -6,7 +6,7 @@ import test from "node:test";
 // This verifies SDK input encoding, not live Anthropic acceptance.
 test("Claude sends image+text and image-only SDK messages in new and resumed sessions", async () => {
   const source = readFileSync(new URL("./bridge.mjs", import.meta.url), "utf8");
-  const start = source.indexOf("function turnPrompt");
+  const start = source.indexOf("const BACKGROUND_SETTLE_GRACE_MS");
   const end = source.indexOf("/**\n * The Claude Code to run", start);
   assert.ok(start > 0 && end > start);
   const requests = [];
@@ -38,9 +38,8 @@ test("Claude sends image+text and image-only SDK messages in new and resumed ses
   const errorMessage = (error) => error.message;
   const query = async function* (request) {
     const messages = [];
-    if (typeof request.prompt !== "string") {
-      for await (const message of request.prompt) messages.push(message);
-    }
+    // Like the SDK, read the turn's message; the input stays open until the turn settles.
+    messages.push((await request.prompt[Symbol.asyncIterator]().next()).value);
     requests.push({ ...request, messages });
     yield { type: "result", subtype: "success", result: "observed" };
   };
@@ -63,7 +62,7 @@ test("Claude sends image+text and image-only SDK messages in new and resumed ses
     }]);
   }
   await sendTurn({ sessionId: "session", turnId: "text", prompt: "text", images: [], workspace: "/isolated" });
-  assert.equal(requests[2].prompt, "text");
+  assert.deepEqual(requests[2].messages[0].message.content, [{ type: "text", text: "text" }]);
   assert.equal(emitted.filter((message) => message.event === "turn_completed").length, 3);
   assert.equal(runs.size, 0);
 });

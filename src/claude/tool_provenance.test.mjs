@@ -35,7 +35,8 @@ function fixture(mode = "bypassPermissions") {
   const SUBAGENT_RESULT = /never matches/;
   // sendTurn runs against a scripted SDK stream; inference and process supervision stay isolated.
   let sdkMessages = [];
-  const query = () => sdkMessages;
+  let sdk = null;
+  const query = ({ prompt }) => (sdk ? sdk(prompt) : sdkMessages);
   const streamMessageIds = new Map();
   const providerProcessLifecycle = () => ({
     spawn() {}, async started() {}, async released() {}, didStart: () => true,
@@ -66,7 +67,8 @@ function fixture(mode = "bypassPermissions") {
       api.emitUserToolResults("turn", { uuid, message: { content: [{ type: "tool_result", tool_use_id: "call", is_error: isError, content: output }] } });
       return emitted.at(-1);
     },
-    async turn(messages, beforeResults = null) {
+    useSdk(stream) { sdk = stream; },
+    async turn(messages = [], beforeResults = null) {
       sdkMessages = (async function* () {
         for (const message of messages) {
           if (beforeResults && message.type === "user") await beforeResults();
@@ -292,6 +294,59 @@ test("a runtime stop during a turn is never reported as unattributed", async () 
   const result = f.emitted.find((event) => event.event === "tool_call" && event.status === "error");
   assert.equal(result.permission.source, "runtime_interrupt");
   assert.equal(f.emitted.some((event) => event.event === "warning"), false);
+});
+
+// Models Claude Code's input lifetime: once the SDK finishes the prompt iterable it closes stdin,
+// and a later hook-gated tool call fails with the generic cancellation text ("Stream closed").
+function backgroundTaskSdk(f, { followUpTurn = true } = {}) {
+  const pause = () => new Promise((resolve) => setImmediate(resolve));
+  return async function* (prompt) {
+    let inputClosed = false;
+    const iterator = prompt[Symbol.asyncIterator]();
+    await iterator.next();
+    const drained = iterator.next().then(() => { inputClosed = true; });
+    const toolTurn = (id, command) => [
+      { type: "assistant", message: { content: [{ type: "tool_use", id, name: "Bash", input: { command } }] } },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, is_error: inputClosed,
+        content: inputClosed ? SDK_CANCELLATION_TEXT : "ok" }] } },
+    ];
+    yield { type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "ci", task_type: "local_bash" }] };
+    yield* toolTurn("first", "gh pr checks 202");
+    yield { type: "result", subtype: "success", result: "waiting on CI" };
+    await pause();
+    if (followUpTurn) yield { type: "system", subtype: "task_notification", task_id: "ci", status: "completed" };
+    yield { type: "system", subtype: "background_tasks_changed", tasks: [] };
+    await pause();
+    if (followUpTurn) {
+      yield* toolTurn("after-notification", "gh pr checks 202");
+      yield { type: "result", subtype: "success", result: "checks passed" };
+    }
+    await drained;
+    f.inputClosedAtEnd = inputClosed;
+  };
+}
+
+test("originating path: a background-task turn keeps its tool calls instead of SDK cancellation", async () => {
+  const f = fixture();
+  f.useSdk(backgroundTaskSdk(f));
+  await f.turn();
+  const results = f.emitted.filter((event) => event.event === "tool_call" && event.status !== "running");
+  assert.deepEqual(results.map((event) => [event.callId, event.status, event.result.output]), [
+    ["first", "completed", "ok"],
+    ["after-notification", "completed", "ok"],
+  ]);
+  assert.equal(results.some((event) => event.permission?.source === "sdk_unknown"), false);
+  assert.equal(f.emitted.some((event) => event.event === "warning"), false);
+  assert.equal(f.inputClosedAtEnd, true); // input still closes once no task can start a turn
+  assert.equal(f.emitted.at(-2).status, "finished");
+});
+
+test("input closes after a finished background task that starts no follow-up turn", async () => {
+  const f = fixture();
+  f.useSdk(backgroundTaskSdk(f, { followUpTurn: false }));
+  await f.turn();
+  assert.equal(f.inputClosedAtEnd, true);
+  assert.equal(f.emitted.at(-2).event, "turn_completed");
 });
 
 test("refusal notices never relabel a runtime stop or a policy denial", async () => {
