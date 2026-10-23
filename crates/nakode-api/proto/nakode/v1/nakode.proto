@@ -874,6 +874,9 @@ message OpenSessionRequest {
   // Optional account affinity for restoration. The server validates the persisted account and never
   // silently swaps an established session to another credential.
   optional string account_id = 6;
+  // Establishes missing projection intent on an already attached session only. Requires profile_id.
+  // Existing kind/lifecycle must match; this never reopens an archived bridge or restores providers.
+  optional SessionBridgeIntent bridge = 7;
 }
 message ListActiveSessionsRequest { string workspace_id = 1; }
 // Complete current membership. Overview snapshots exclude conversation bodies; poll this for status.

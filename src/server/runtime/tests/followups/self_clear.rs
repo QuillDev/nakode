@@ -23,6 +23,10 @@ fn prepare_chat(h: &mut Harness) {
     let connection = rusqlite::Connection::open(&h.runtime.effects.persistence.database).unwrap();
     connection.execute("INSERT INTO session_bridges (session_id, workspace, kind, lifecycle, display_title, revision, updated_at_ms) VALUES (?1, ?2, 'chat', 'open', 'Disposable Chat', 1, 1) ON CONFLICT(session_id) DO UPDATE SET kind = 'chat', lifecycle = 'open'", rusqlite::params![h.session.as_str(), h.state().workspace]).unwrap();
     h.runtime.refresh_catalogs();
+    install_clear_turn(h);
+}
+
+fn install_clear_turn(h: &mut Harness) {
     h.runtime
         .core
         .engine_for_mut(&h.session)
@@ -198,5 +202,142 @@ async fn clear_self_refuses_all_durable_child_lifecycles_before_stopping_caller(
                 .as_deref(),
             Some(h.session.as_str())
         );
+    }
+}
+
+fn remove_fixture_bridge(h: &mut Harness) {
+    let connection = rusqlite::Connection::open(&h.runtime.effects.persistence.database).unwrap();
+    connection
+        .execute(
+            "DELETE FROM session_bridges WHERE session_id = ?1",
+            [h.session.as_str()],
+        )
+        .unwrap();
+    h.runtime.refresh_catalogs();
+}
+
+fn adopt_chat(h: &Harness, profile: &str) -> Command {
+    Command::OpenSession {
+        session_id: h.session.clone(),
+        bridge: Some(nakode_protocol::SessionBridgeIntent {
+            kind: nakode_protocol::OrchestratorKind::Chat,
+            lifecycle: BridgeLifecycle::Open,
+            display_title: "Hosted Chat".to_owned(),
+        }),
+        profile_id: Some(profile.to_owned()),
+        tools: None,
+        mcp_grant: None,
+        enabled_skill_ids: Vec::new(),
+        account_id: None,
+    }
+}
+
+#[tokio::test]
+async fn legacy_hosted_chat_requires_public_profile_and_bridge_adoption() {
+    let mut h = Harness::new().await;
+    // Match the old Host CreateSession path: neither profile nor bridge was supplied.
+    remove_fixture_bridge(&mut h);
+    let clear = command(&h, "clear-call");
+    assert!(
+        h.command("missing-metadata", None, false, clear.clone())
+            .await
+            .is_err()
+    );
+    let adopt = adopt_chat(&h, "profile");
+    h.command("adopt", None, false, adopt).await.unwrap();
+    // Adoption does not start a turn or synthesize a ClearSelf invocation.
+    assert!(h.state().active_turn.is_none());
+    assert!(h.state().external_tool_calls.is_empty());
+    install_clear_turn(&mut h);
+    h.command("clear-adopted", None, false, clear)
+        .await
+        .unwrap();
+    assert!(h.runtime.core.engine_for(&h.session).is_none());
+}
+
+#[tokio::test]
+async fn bridge_adoption_preserves_established_profile_kind_and_archived_lifecycle() {
+    for mismatch in ["profile", "kind", "lifecycle"] {
+        let mut h = Harness::new().await;
+        prepare_chat(&mut h);
+        let connection =
+            rusqlite::Connection::open(&h.runtime.effects.persistence.database).unwrap();
+        match mismatch {
+            "kind" => {
+                connection
+                    .execute(
+                        "UPDATE session_bridges SET kind = 'agent' WHERE session_id = ?1",
+                        [h.session.as_str()],
+                    )
+                    .unwrap();
+            }
+            "lifecycle" => {
+                connection
+                    .execute(
+                        "UPDATE session_bridges SET lifecycle = 'archived' WHERE session_id = ?1",
+                        [h.session.as_str()],
+                    )
+                    .unwrap();
+            }
+            _ => {}
+        }
+        h.runtime.refresh_catalogs();
+        let adopt = adopt_chat(
+            &h,
+            if mismatch == "profile" {
+                "other"
+            } else {
+                "profile"
+            },
+        );
+        assert!(h.command("mismatch", None, false, adopt).await.is_err());
+        assert!(h.runtime.core.engine_for(&h.session).is_some());
+    }
+}
+
+#[tokio::test]
+async fn public_adoption_does_not_remove_unsettled_coordination() {
+    let mut h = Harness::new().await;
+    h.enqueue("pending-instruction").await;
+    remove_fixture_bridge(&mut h);
+    let adopt = adopt_chat(&h, "profile");
+    h.command("adopt", None, false, adopt).await.unwrap();
+    install_clear_turn(&mut h);
+    let clear = command(&h, "clear-call");
+    assert!(
+        h.command("still-pending", None, false, clear)
+            .await
+            .is_err()
+    );
+    assert!(h.runtime.core.engine_for(&h.session).is_some());
+}
+
+#[tokio::test]
+async fn adopted_chat_still_refuses_other_native_work_and_cancelling_turns() {
+    for cancelling in [false, true] {
+        let mut h = Harness::new().await;
+        remove_fixture_bridge(&mut h);
+        install_clear_turn(&mut h);
+        let adopt = adopt_chat(&h, "profile");
+        h.command("adopt-live", None, false, adopt).await.unwrap();
+        let state = h
+            .runtime
+            .core
+            .engine_for_mut(&h.session)
+            .unwrap()
+            .state_mut();
+        if cancelling {
+            state.active_turn.as_mut().unwrap().cancelling = true;
+        } else {
+            // Record supervised work in the isolated state without executing its shell effect.
+            let _effects = state.run_shell_command("fixture-only".to_owned()).unwrap();
+        }
+        let clear = command(&h, "clear-call");
+        assert!(
+            h.command("protected-work", None, false, clear)
+                .await
+                .is_err()
+        );
+        assert!(h.runtime.core.engine_for(&h.session).is_some());
     }
 }

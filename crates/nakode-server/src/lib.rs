@@ -265,6 +265,11 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
     fixed("NakodeService", "SteerTurn", RequestLane::Control),
     fixed("NakodeService", "CancelTurn", RequestLane::Control),
     fixed("NakodeService", "CancelSessionWork", RequestLane::Control),
+    fixed(
+        "NakodeService",
+        "InterruptSessionWork",
+        RequestLane::Control,
+    ),
     fixed("NakodeService", "CompactContext", RequestLane::Control),
     fixed("NakodeService", "ResolveInteraction", RequestLane::Control),
     fixed(

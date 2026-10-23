@@ -2,6 +2,8 @@
 
 `ClearSelf` is a public gRPC command and Rust SDK method, authenticated against the exact sole pending external tool call named `ClearSelf` on an open Chat bridge. Its model-facing input is `{}`. The client supplies the session and call identity from its authenticated tool executor, never from tool arguments. The current live turn must not be cancelling; stale calls after backend loss are ineligible.
 
+Clients must create Chats with both `profile_id` and an open Chat `bridge` intent. For legacy sessions missing that metadata, `OpenSession` accepts an optional `bridge` intent together with `profile_id` on an already attached, live session. Existing profile, kind and lifecycle must match; adoption does not reopen an archived bridge, restore a provider or change the tool table. Clients must derive this intent from authenticated session ownership, never model arguments.
+
 The runtime refuses incomplete canonical inventory, any durable linked child (including idle and retained/archived children), other native work, queued prompts, pending inbound bridge delivery and unsettled coordination. Persistence is read before teardown and rechecked in the deletion transaction. An unsupported repository fails closed.
 
 All canonical individual session deletion now refuses parent deletion while durable children remain. An SQLite immediate transaction serializes deletion against child creation and relationship claim/transfer; foreign keys prevent attachment after deletion. No child is silently detached or deleted.
