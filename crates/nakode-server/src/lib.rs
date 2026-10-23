@@ -160,6 +160,9 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
     fixed("NakodeService", "SetFollowupPaused", RequestLane::Control),
     fixed("NakodeService", "RemoveFollowup", RequestLane::Control),
     fixed("NakodeService", "ListFollowups", RequestLane::Hydration),
+    fixed("NakodeService", "ListBackgroundTasks", RequestLane::Query),
+    fixed("NakodeService", "GetBackgroundTask", RequestLane::Query),
+    fixed("NakodeService", "StopBackgroundTask", RequestLane::Control),
     fixed("NakodeService", "ListChildReports", RequestLane::Query),
     fixed("NakodeService", "GetSoul", RequestLane::Query),
     fixed("NakodeService", "SaveSoul", RequestLane::Control),
@@ -527,6 +530,8 @@ fn query_lane(query: &Query) -> QueryLane {
         | Query::GetArtifact { .. }
         | Query::GetSessionImage { .. } => QueryLane::Hydration,
         Query::GetSessionRouting { .. }
+        | Query::ListBackgroundTasks { .. }
+        | Query::GetBackgroundTask { .. }
         | Query::InspectWorkspacePath { .. }
         | Query::ListSkills { .. }
         | Query::ListChildQuestions { .. }

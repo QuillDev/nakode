@@ -47,6 +47,7 @@ use crate::{
     state::{AgentBrowserStatus, DomainState, Effect},
 };
 
+mod background_tasks;
 mod child_creation;
 mod child_materials;
 mod followups;
@@ -328,6 +329,10 @@ pub(crate) async fn prepare_runtime(
         std::env::current_exe().map_err(NativeRuntimeError::CurrentExecutable)?;
     let session_repository = Arc::new(SqliteSessionRepository::open_default()?);
     let session_database = session_repository.database_path().to_path_buf();
+    // Optional: a registry failure disables background tasks without blocking the runtime.
+    if let Err(error) = crate::background_tasks::initialize(&session_database).await {
+        eprintln!("nakode: background tasks are unavailable: {error}");
+    }
     let credential_store = Arc::new(SqliteCredentialStore::open(&session_database)?);
     let mut providers = session_repository.list_providers()?;
     enable_e2e_fixture_provider(&mut providers);
@@ -1370,6 +1375,68 @@ impl NativeServerRuntime {
             .query_retained_session(query, session, history, children, shared_context)
     }
 
+    /// Takes the deletion hold a fenced child stop or deletion needs, returning the child when this
+    /// call newly took it.
+    fn hold_child_deletion(
+        &self,
+        request: &nakode_server::ServerRequest,
+    ) -> Result<Option<nakode_protocol::SessionId>, ServiceError> {
+        let nakode_server::ServerRequest::Command {
+            command:
+                Command::CancelSessionWork {
+                    session_id,
+                    parent_fence: Some(fence),
+                }
+                | Command::DeleteSession {
+                    session_id,
+                    parent_fence: Some(fence),
+                },
+            ..
+        } = request
+        else {
+            return Ok(None);
+        };
+        let created = self
+            .effects
+            .persistence
+            .sessions
+            .hold_child_deletion(
+                session_id.as_str(),
+                fence
+                    .parent_session_id
+                    .as_ref()
+                    .map(nakode_protocol::SessionId::as_str),
+            )
+            .map_err(|error| child_deletion_hold_error(&error))?;
+        Ok(created.then(|| session_id.clone()))
+    }
+
+    /// A stale revision, replay-only miss or other rejection had no effect, so the hold it newly
+    /// took must not keep refusing claim and transfer.
+    fn release_rejected_child_deletion_hold(
+        &self,
+        outcome: &crate::server::DispatchOutcome,
+        hold: Option<nakode_protocol::SessionId>,
+    ) {
+        let Some(session_id) = hold else {
+            return;
+        };
+        let rejected = outcome.effects.is_empty()
+            && outcome
+                .command_response
+                .as_ref()
+                .is_some_and(|response| response.result.is_err());
+        if rejected
+            && let Err(error) = self
+                .effects
+                .persistence
+                .sessions
+                .release_child_deletion_hold(session_id.as_str())
+        {
+            eprintln!("nakode: a rejected child deletion hold remains until it expires: {error}");
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     // The request dispatcher keeps fencing, typed routing, persistence rollback, and response
     // completion in one exhaustive match so a newly added public request cannot bypass a guard.
@@ -1392,6 +1459,9 @@ impl NativeServerRuntime {
             }
         };
         let Some(request) = self.handle_followup_request(request) else {
+            return;
+        };
+        let Some(request) = self.handle_background_task_request(request) else {
             return;
         };
         let Some(request) = self.handle_relationship_request(request) else {
@@ -2065,36 +2135,15 @@ impl NativeServerRuntime {
         }
         // A delegated child stop or deletion verifies and holds the durable parent link before any
         // cancellation, shell or backend effect, so a claim or transfer cannot slip in between.
-        let deletion_hold = match &request {
-            nakode_server::ServerRequest::Command {
-                command:
-                    Command::CancelSessionWork {
-                        session_id,
-                        parent_fence: Some(fence),
-                    }
-                    | Command::DeleteSession {
-                        session_id,
-                        parent_fence: Some(fence),
-                    },
-                ..
-            } => Some((session_id.clone(), fence.parent_session_id.clone())),
-            _ => None,
-        };
-        let mut new_deletion_hold = None;
-        if let Some((session_id, parent)) = &deletion_hold {
-            match self.effects.persistence.sessions.hold_child_deletion(
-                session_id.as_str(),
-                parent.as_ref().map(nakode_protocol::SessionId::as_str),
-            ) {
-                Ok(created) => new_deletion_hold = created.then(|| session_id.clone()),
-                Err(error) => {
-                    if let nakode_server::ServerRequest::Command { respond, .. } = request {
-                        let _ = respond.send(Err(child_deletion_hold_error(&error)));
-                    }
-                    return;
+        let new_deletion_hold = match self.hold_child_deletion(&request) {
+            Ok(hold) => hold,
+            Err(error) => {
+                if let nakode_server::ServerRequest::Command { respond, .. } = request {
+                    let _ = respond.send(Err(error));
                 }
+                return;
             }
-        }
+        };
         let mut rollback = BridgeMutationRollback::capture(&request, &self.core);
         let mut outcome = if let Some(store) = child_question_store.as_ref() {
             self.core
@@ -2102,23 +2151,7 @@ impl NativeServerRuntime {
         } else {
             self.core.handle(&self.endpoint, request)
         };
-        // A stale revision, replay-only miss or other rejection had no effect, so the hold it took
-        // must not keep refusing claim and transfer.
-        let rejected = outcome.effects.is_empty()
-            && outcome
-                .command_response
-                .as_ref()
-                .is_some_and(|response| response.result.is_err());
-        if rejected
-            && let Some(session_id) = &new_deletion_hold
-            && let Err(error) = self
-                .effects
-                .persistence
-                .sessions
-                .release_child_deletion_hold(session_id.as_str())
-        {
-            eprintln!("nakode: a rejected child deletion hold remains until it expires: {error}");
-        }
+        self.release_rejected_child_deletion_hold(&outcome, new_deletion_hold);
         // Only a newly accepted Stop pauses the inbox. Rejected fences, replay-only misses and
         // cached retries must not mutate scheduling after an explicit later Resume.
         if outcome.changed
@@ -2296,6 +2329,13 @@ impl NativeServerRuntime {
             let canonical_id = nakode_protocol::SessionId::from(delete_session_id.clone());
             remove_session_release_effect(&mut effects, &delete_session_id);
             let terminated_shell_ids = self.terminate_deleted_session_work(&canonical_id).await;
+            // Fences new launches by this owner and marks its managed tasks. Their process trees
+            // are stopped in the background once the deletion commits; trees that cannot be
+            // proven gone remain as cleanup_failed orphan records.
+            let background_tasks = crate::background_tasks::service();
+            if let Some(service) = &background_tasks {
+                service.begin_owner_deletion(&delete_session_id).await;
+            }
             // Provider tasks can persist native history during their terminal path. Fence and await
             // every backend before the repository transaction so a successful deletion cannot be
             // repopulated by a completion racing behind its acknowledgement.
@@ -2309,6 +2349,11 @@ impl NativeServerRuntime {
                     &terminated_shell_ids,
                     "session deletion stopped the shell before backend teardown failed",
                 );
+                if let Some(service) = &background_tasks {
+                    service
+                        .finish_owner_deletion(&delete_session_id, false)
+                        .await;
+                }
                 outcome.respond_with_error(ServiceError {
                     code: ErrorCode::Internal,
                     message: format!(
@@ -2353,6 +2398,11 @@ impl NativeServerRuntime {
                     &terminated_shell_ids,
                     "shell stopped before durable session deletion failed",
                 );
+                if let Some(service) = &background_tasks {
+                    service
+                        .finish_owner_deletion(&delete_session_id, false)
+                        .await;
+                }
                 // A changed parent is an authoritative refusal: retrying the same fence cannot help.
                 let refused = matches!(
                     error,
@@ -2380,6 +2430,14 @@ impl NativeServerRuntime {
             }
             crate::session_environment::remove(&delete_session_id);
             crate::tools::desktop::record_discard(&delete_session_id);
+            if let Some(service) = &background_tasks {
+                // Cleanup runs off the actor; its outcome is recorded on each task.
+                drop(
+                    service
+                        .finish_owner_deletion(&delete_session_id, true)
+                        .await,
+                );
+            }
         }
         self.complete_native_delegations(&effects);
         self.register_effect_owners(&session_id, &effects);
@@ -3556,6 +3614,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::OrchestratorThreadBridge,
             ServiceCapability::ConditionalActivationForce,
             ServiceCapability::WorkspacePathInspection,
+            ServiceCapability::BackgroundTasks,
         ]
         .into_iter()
         .collect(),

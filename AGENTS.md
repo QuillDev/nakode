@@ -61,6 +61,7 @@ state.
 - Delegation, review, bounded fan-out, synthesis, cancellation, and status
 - The portable agent loop and local coding-tool contracts
 - Local process execution, file mutation, workspace policy, and supervision
+- Managed background tasks are spawned by the runtime, owned by the authenticated logical session, survive turns and close, stop on owner deletion, and keep explicit unknown/cleanup-failed records; agents never control other owners' tasks. `docs/background-tasks.md`.
 - Approval policy, permission envelopes, unattended mode, and cancellation for
   in-process sessions
 - Claude permission provenance distinguishes policy, validator, approval, runtime interruption,
