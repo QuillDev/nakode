@@ -2032,6 +2032,17 @@ impl NativeServerRuntime {
                 ..
             }
         );
+        let child_parent_fence = match &request {
+            nakode_server::ServerRequest::Command {
+                command:
+                    Command::DeleteSession {
+                        parent_fence: Some(fence),
+                        ..
+                    },
+                ..
+            } => Some(fence.parent_session_id.clone()),
+            _ => None,
+        };
         if let nakode_server::ServerRequest::Command {
             command: Command::ClearSelf { session_id, .. },
             ..
@@ -2258,13 +2269,16 @@ impl NativeServerRuntime {
                 });
                 return;
             }
+            let sessions = &self.effects.persistence.sessions;
             let deletion = if self_clear {
-                self.effects
-                    .persistence
-                    .sessions
-                    .delete_self(&delete_session_id)
+                sessions.delete_self(&delete_session_id)
+            } else if let Some(parent) = &child_parent_fence {
+                sessions.delete_child(
+                    &delete_session_id,
+                    parent.as_ref().map(nakode_protocol::SessionId::as_str),
+                )
             } else {
-                self.effects.persistence.sessions.delete(&delete_session_id)
+                sessions.delete(&delete_session_id)
             };
             if let Err(error) = deletion {
                 // DeleteSession mutates the complete in-memory projection (including default-session
@@ -2290,12 +2304,28 @@ impl NativeServerRuntime {
                     &terminated_shell_ids,
                     "shell stopped before durable session deletion failed",
                 );
-                outcome.respond_with_error(ServiceError {
-                    code: ErrorCode::Internal,
-                    message: format!(
-                        "session deletion was not durably committed; retry the operation: {error}"
-                    ),
-                    retryable: true,
+                // A changed parent is an authoritative refusal: retrying the same fence cannot help.
+                let refused = matches!(
+                    error,
+                    crate::session::SessionError::ParentFenceMismatch
+                        | crate::session::SessionError::SessionNotFound(_)
+                ) && child_parent_fence.is_some();
+                outcome.respond_with_error(if refused {
+                    ServiceError {
+                        code: ErrorCode::Conflict,
+                        message: format!(
+                            "{error}. Backend work may have been stopped; history was retained"
+                        ),
+                        retryable: false,
+                    }
+                } else {
+                    ServiceError {
+                        code: ErrorCode::Internal,
+                        message: format!(
+                            "session deletion was not durably committed; retry the operation: {error}"
+                        ),
+                        retryable: true,
+                    }
                 });
                 return;
             }
@@ -11027,6 +11057,7 @@ mod tests {
         let key = IdempotencyKey::from("stalled-delete-retry");
         let command = Command::DeleteSession {
             session_id: session_id.clone(),
+            parent_fence: None,
         };
 
         let started = Instant::now();
@@ -11214,6 +11245,7 @@ mod tests {
                 false,
                 Command::DeleteSession {
                     session_id: session_id.clone(),
+                    parent_fence: None,
                 },
             )
             .await
@@ -11840,6 +11872,7 @@ mod tests {
         let key = IdempotencyKey::from("durable-delete-retry");
         let command = Command::DeleteSession {
             session_id: session_id.clone(),
+            parent_fence: None,
         };
 
         let failure = endpoint

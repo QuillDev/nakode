@@ -841,7 +841,16 @@ message ListSessionsRequest { string workspace_id = 1; uint32 limit = 2; }
 // former initial sessions are rotated to a fresh control-plane successor and deleted.
 // Requires the `SessionDeletion` capability.
 message ClearSelfRequest { MutationOptions mutation = 1; string session_id = 2; string source_call_id = 3; }
-message DeleteSessionRequest { MutationOptions mutation = 1; string session_id = 2; }
+message DeleteSessionRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  // Present only for delegated child deletion. The durable parent must still equal the fence when
+  // the deletion transaction commits; otherwise nothing is deleted. Older servers ignore it, so
+  // callers must check the server's capability before relying on it.
+  optional DeletionParentFence parent_fence = 3;
+}
+// An absent parent_session_id requires the target to have no durable runtime parent.
+message DeletionParentFence { optional string parent_session_id = 1; }
 message ListSessionsResponse {
   repeated SessionSummary sessions = 1;
   // True only when this response contains the complete canonical logical-session inventory.

@@ -1967,12 +1967,18 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             slug: input.slug
         }
     );
-    command_rpc!(
+    try_command_rpc!(
         prune_session,
         api::DeleteSessionRequest,
         input,
-        protocol::Command::PruneSession {
-            session_id: protocol::SessionId::from(input.session_id)
+        if input.parent_fence.is_some() {
+            Err(tonic::Status::invalid_argument(
+                "PruneSession does not accept a parent fence",
+            ))
+        } else {
+            Ok(protocol::Command::PruneSession {
+                session_id: protocol::SessionId::from(input.session_id),
+            })
         }
     );
     command_rpc!(
@@ -1980,7 +1986,12 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         api::DeleteSessionRequest,
         input,
         protocol::Command::DeleteSession {
-            session_id: protocol::SessionId::from(input.session_id)
+            session_id: protocol::SessionId::from(input.session_id),
+            parent_fence: input
+                .parent_fence
+                .map(|fence| protocol::DeletionParentFence {
+                    parent_session_id: fence.parent_session_id.map(protocol::SessionId::from),
+                }),
         }
     );
     command_rpc!(
