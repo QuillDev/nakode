@@ -237,18 +237,26 @@ async fn legacy_hosted_chat_requires_public_profile_and_bridge_adoption() {
     let mut h = Harness::new().await;
     // Match the old Host CreateSession path: neither profile nor bridge was supplied.
     remove_fixture_bridge(&mut h);
+    install_clear_turn(&mut h);
     let clear = command(&h, "clear-call");
+    let error = h
+        .command("missing-metadata", None, false, clear.clone())
+        .await
+        .unwrap_err();
     assert!(
-        h.command("missing-metadata", None, false, clear.clone())
-            .await
-            .is_err()
+        error
+            .message
+            .contains("self-clear requires an owned open Chat with no unsettled coordination")
     );
     let adopt = adopt_chat(&h, "profile");
     h.command("adopt", None, false, adopt).await.unwrap();
-    // Adoption does not start a turn or synthesize a ClearSelf invocation.
-    assert!(h.state().active_turn.is_none());
-    assert!(h.state().external_tool_calls.is_empty());
-    install_clear_turn(&mut h);
+    // Adoption preserves the invoking turn and exact pending call instead of synthesizing work.
+    assert_eq!(
+        h.state().active_turn.as_ref().unwrap().id,
+        "disposable-turn"
+    );
+    assert_eq!(h.state().external_tool_calls.len(), 1);
+    assert_eq!(h.state().external_tool_calls[0].id, "clear-call");
     h.command("clear-adopted", None, false, clear)
         .await
         .unwrap();
