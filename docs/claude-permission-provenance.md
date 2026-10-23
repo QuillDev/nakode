@@ -30,6 +30,14 @@ in-flight tools discarded by a model refusal fallback. The SDK names those retra
 `model_refusal_fallback.retracted_message_uuids` and `supersedes`; the bridge re-attributes the
 matching calls as `sdk_retracted` and emits a warning. `model_refusal_no_fallback` emits a warning
 that the turn ended on a refusal. Neither replaces a recorded denial or runtime stop.
+
+When a turn has `sdk_unknown` cancellations, the bridge emits one warning at turn end. It lists the
+SDK lifecycle events of that turn (for example `task_notification`, `api_retry`, hook events) with
+their offsets, so the next occurrence can be diagnosed from the transcript instead of provider storage.
+
+Remaining limits: the cause of a given `sdk_unknown` cancellation is still not provable from the
+bridge. The model is told not to stop and wait, but it may still do so; Nakode never continues
+or replays the call automatically, so an owner continuation can still be needed.
 Audits carry the same evidence. Provider-history snapshots retain host permission records
 by exact session and call ID because the SDK's transcript does not save callback metadata.
 History refresh cannot replace known host evidence with missing/unknown SDK evidence.

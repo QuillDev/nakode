@@ -35,7 +35,7 @@ function fixture(mode = "bypassPermissions") {
   const SUBAGENT_RESULT = /never matches/;
   // sendTurn runs against a scripted SDK stream; inference and process supervision stay isolated.
   let sdkMessages = [];
-  const query = async function* () { yield* sdkMessages; };
+  const query = () => sdkMessages;
   const streamMessageIds = new Map();
   const providerProcessLifecycle = () => ({
     spawn() {}, async started() {}, async released() {}, didStart: () => true,
@@ -66,8 +66,13 @@ function fixture(mode = "bypassPermissions") {
       api.emitUserToolResults("turn", { uuid, message: { content: [{ type: "tool_result", tool_use_id: "call", is_error: isError, content: output }] } });
       return emitted.at(-1);
     },
-    async turn(messages) {
-      sdkMessages = messages;
+    async turn(messages, beforeResults = null) {
+      sdkMessages = (async function* () {
+        for (const message of messages) {
+          if (beforeResults && message.type === "user") await beforeResults();
+          yield message;
+        }
+      })();
       await api.sendTurn({ sessionId: "session", turnId: "turn", prompt: "check CI", workspace: "/isolated" });
     },
     refusal: (message) => api.sdkRefusal("turn", { original_model: "claude-opus-5-5", ...message }),
@@ -252,6 +257,41 @@ test("a superseding replacement result is the final projection of its call", asy
     projections.map((event) => [event.permission?.source, event.result.output]),
     [["sdk_unknown", SDK_CANCELLATION_TEXT], ["sdk_retracted", SDK_CANCELLATION_TEXT], [undefined, "all checks passed"]],
   );
+});
+
+test("originating path: unattributed SDK cancellation does not stop the turn and is diagnosable", async () => {
+  const f = fixture();
+  await f.turn([
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "call", name: "Bash", input: { command: "gh pr checks 613" } }] } },
+    { type: "system", subtype: "thinking_tokens" },
+    { type: "system", subtype: "task_notification", task_id: "monitor", status: "completed" },
+    { type: "user", uuid: "wire-1", message: { content: [{ type: "tool_result", tool_use_id: "call", is_error: true, content: SDK_CANCELLATION_TEXT }] } },
+    { type: "result", subtype: "success", result: "continued" },
+  ]);
+  const result = f.emitted.find((event) => event.event === "tool_call" && event.status === "error");
+  assert.equal(result.permission.source, "sdk_unknown");
+  assert.equal(result.denied, false);
+  assert.equal(result.result.output, SDK_CANCELLATION_TEXT); // no rewrite, no replay
+  assert.match(permissionContext(result.permission), /not an instruction to stop/);
+  const warning = f.emitted.find((event) => event.event === "warning");
+  assert.match(warning.message, /not an owner stop/);
+  assert.match(warning.message, /task_notification \+[\d.]+s, unattributed cancellation of Bash/);
+  assert.doesNotMatch(warning.message, /thinking_tokens/);
+  assert.equal(f.emitted.at(-2).status, "finished"); // turn_completed precedes the history snapshot
+  assert.equal(f.runs.size, 0);
+});
+
+test("a runtime stop during a turn is never reported as unattributed", async () => {
+  const f = fixture();
+  const stop = { type: "system", subtype: "status" };
+  await f.turn([
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "call", name: "Bash", input: { command: "sleep 9" } }] } },
+    stop,
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "call", is_error: true, content: SDK_CANCELLATION_TEXT }] } },
+  ], () => f.cancel());
+  const result = f.emitted.find((event) => event.event === "tool_call" && event.status === "error");
+  assert.equal(result.permission.source, "runtime_interrupt");
+  assert.equal(f.emitted.some((event) => event.event === "warning"), false);
 });
 
 test("refusal notices never relabel a runtime stop or a policy denial", async () => {

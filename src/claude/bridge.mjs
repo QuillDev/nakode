@@ -1038,6 +1038,43 @@ function retractToolResults(turnId, uuids, cause) {
   return retracted;
 }
 
+const QUIET_SDK_EVENTS = new Set(["thinking_tokens", "hook_progress", "task_progress"]);
+
+// Nakode cannot see why the SDK cancels without attribution. Recording the SDK lifecycle events
+// around such a cancellation (task notifications, retries, refusals, hooks) makes the next one
+// diagnosable from the session transcript instead of private provider storage.
+function sdkLifecycleLog() {
+  const started = Date.now();
+  const events = [];
+  let cancelled = 0;
+  const note = (label) => {
+    if (!label || QUIET_SDK_EVENTS.has(label)) return;
+    events.push(`${label} +${((Date.now() - started) / 1000).toFixed(1)}s`);
+    if (events.length > 20) events.shift();
+  };
+  return {
+    note,
+    noteUnattributedCancellations(message) {
+      const content = message?.message?.content;
+      if (!Array.isArray(content)) return;
+      for (const block of content) {
+        const recorded = providerToolPermissions.get(block.tool_use_id);
+        if (block.type !== "tool_result" || recorded?.permission.source !== "sdk_unknown") continue;
+        cancelled += 1;
+        note(`unattributed cancellation of ${recorded.name}`);
+      }
+    },
+    report(turnId) {
+      if (cancelled === 0) return;
+      write({
+        event: "warning",
+        turnId,
+        message: `Claude SDK cancelled ${cancelled} tool call(s) without a Nakode stop or denial; this was not an owner stop. SDK lifecycle this turn: ${events.join(", ")}.`,
+      });
+    },
+  };
+}
+
 function sdkRefusal(turnId, message) {
   const model = message.original_model || "Claude";
   const category = message.api_refusal_category ? ` (${message.api_refusal_category})` : "";
@@ -1245,6 +1282,7 @@ async function sendTurn(command) {
 
   let completion = null;
   let turnPermissions = new Map();
+  const lifecycle = sdkLifecycleLog();
   let timedOut = false;
   const timeout = session.timeoutSeconds
     ? setTimeout(() => {
@@ -1264,9 +1302,12 @@ async function sendTurn(command) {
         emitStreamEvent(command.turnId, message, session);
       else if (message.type === "assistant")
         emitContent(command.turnId, message);
-      else if (message.type === "user")
+      else if (message.type === "user") {
         emitUserToolResults(command.turnId, message);
-      else if (message.type === "system" && message.subtype === "permission_denied")
+        lifecycle.noteUnattributedCancellations(message);
+      } else if (message.type === "system")
+        lifecycle.note(message.subtype);
+      if (message.type === "system" && message.subtype === "permission_denied")
         sdkPermissionDenied(command.turnId, message);
       else if (
         message.type === "system" &&
@@ -1318,6 +1359,7 @@ async function sendTurn(command) {
       [...providerToolPermissions].filter(([, recorded]) => recorded.turnId === command.turnId),
     );
     for (const callId of turnPermissions.keys()) providerToolPermissions.delete(callId);
+    lifecycle.report(command.turnId);
     for (const [uuid, events] of providerToolResultMessages) {
       if (events.some((event) => event.turnId === command.turnId)) providerToolResultMessages.delete(uuid);
     }

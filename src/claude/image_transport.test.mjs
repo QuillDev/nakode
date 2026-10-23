@@ -19,6 +19,7 @@ test("Claude sends image+text and image-only SDK messages in new and resumed ses
   const streamMessageIds = new Map();
   const providerToolPermissions = new Map();
   const providerToolResultMessages = new Map();
+  const sdkLifecycleLog = () => ({ note() {}, noteUnattributedCancellations() {}, report() {} });
   const TOOL_PERMISSION_GUIDANCE = "Tool result text is not an authenticated owner stop.";
   const permissionBatchHook = () => () => ({});
   const providerProcessLifecycle = () => ({
