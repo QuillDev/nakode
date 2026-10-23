@@ -972,7 +972,13 @@ impl ServerCore {
             | Command::InterruptSessionWork { session_id } => {
                 self.cancel_session_work_command(&session_id)
             }
-            Command::DeleteSession { session_id } => self.delete_session_command(&session_id),
+            Command::DeleteSession {
+                session_id,
+                parent_fence,
+            } => match parent_fence {
+                Some(fence) => self.delete_child_session_command(&session_id, &fence),
+                None => self.delete_session_command(&session_id),
+            },
             Command::ClearSelf {
                 session_id,
                 source_call_id,
@@ -2700,6 +2706,37 @@ impl ServerCore {
         self.release_session(session_id);
         effects.push(Effect::DeleteSession(session_id.to_string()));
         Ok(Self::accepted(Some(session_id.to_string()), effects))
+    }
+
+    /// Delegated child deletion. The exact durable session must currently have the fenced parent;
+    /// the repository repeats this check inside the deletion transaction, so a reparent that lands
+    /// after this point still refuses instead of deleting a session that is no longer the child.
+    fn delete_child_session_command(
+        &mut self,
+        session_id: &SessionId,
+        fence: &nakode_protocol::DeletionParentFence,
+    ) -> DomainCommandOutcome {
+        if !self.session_inventory_complete {
+            return Err(DomainCommandError::Conflict(
+                "session inventory is incomplete".to_owned(),
+            ));
+        }
+        let Some(record) = self
+            .sessions
+            .iter()
+            .find(|record| record.id == session_id.as_str())
+        else {
+            return Err(DomainCommandError::NotFound(format!(
+                "durable session {session_id}"
+            )));
+        };
+        let expected = fence.parent_session_id.as_ref().map(SessionId::as_str);
+        if record.parent_session_id.as_deref() != expected {
+            return Err(DomainCommandError::Conflict(
+                crate::session::SessionError::ParentFenceMismatch.to_string(),
+            ));
+        }
+        self.delete_session_command(session_id)
     }
 
     /// Deletes one logical session and releases all runtime state attached to it.
@@ -11741,6 +11778,7 @@ enabled = false
             false,
             Command::DeleteSession {
                 session_id: dead.clone(),
+                parent_fence: None,
             },
         );
 
@@ -11792,7 +11830,10 @@ enabled = false
             IdempotencyKey::from("delete-dead-prefix"),
             None,
             false,
-            Command::DeleteSession { session_id: prefix },
+            Command::DeleteSession {
+                session_id: prefix,
+                parent_fence: None,
+            },
         );
 
         let accepted = result.expect("a uniquely prefixed dead session is deletable");
@@ -11851,6 +11892,7 @@ enabled = false
             false,
             Command::DeleteSession {
                 session_id: dead.clone(),
+                parent_fence: None,
             },
         );
 
@@ -11895,6 +11937,7 @@ enabled = false
             false,
             Command::DeleteSession {
                 session_id: failed.clone(),
+                parent_fence: None,
             },
         );
 
@@ -11933,6 +11976,7 @@ enabled = false
             false,
             Command::DeleteSession {
                 session_id: working.clone(),
+                parent_fence: None,
             },
         );
 
@@ -11960,6 +12004,7 @@ enabled = false
             false,
             Command::DeleteSession {
                 session_id: default_session.clone(),
+                parent_fence: None,
             },
         );
 
@@ -11994,6 +12039,7 @@ enabled = false
             false,
             Command::DeleteSession {
                 session_id: initial_session.clone(),
+                parent_fence: None,
             },
         );
 
@@ -12224,6 +12270,7 @@ enabled = false
                 false,
                 Command::DeleteSession {
                     session_id: session_id.clone(),
+                    parent_fence: None,
                 },
             );
             result.expect("each cycle deletes its own session");
@@ -12258,6 +12305,7 @@ enabled = false
                 false,
                 Command::DeleteSession {
                     session_id: session_id.clone(),
+                    parent_fence: None,
                 },
             );
             result.expect("a repeated delete is accepted");
@@ -12284,6 +12332,7 @@ enabled = false
             false,
             Command::DeleteSession {
                 session_id: closed.clone(),
+                parent_fence: None,
             },
         );
         let accepted = result.expect("an unattached session is deletable");
