@@ -1190,6 +1190,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         (|| -> Result<protocol::Command, tonic::Status> {
             Ok(protocol::Command::OpenSession {
                 session_id: protocol::SessionId::from(input.session_id),
+                bridge: bridge_intent(input.bridge)?,
                 tools: session_tools(input.tools),
                 mcp_grant: mcp_grant(input.mcp_grant)?,
                 profile_id: input.profile_id,

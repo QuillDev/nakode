@@ -3602,6 +3602,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::PendingFollowupRemoval,
             ServiceCapability::ExternalChildReports,
             ServiceCapability::ParentSessionCreation,
+            ServiceCapability::AttachedSessionBridge,
             ServiceCapability::ChildMaterials,
             ServiceCapability::QueuedPromptSteering,
             ServiceCapability::ArchetypeManagement,

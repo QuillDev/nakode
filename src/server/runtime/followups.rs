@@ -342,6 +342,7 @@ impl NativeServerRuntime {
                     None,
                     false,
                     Command::OpenSession {
+                        bridge: None,
                         session_id: session.clone(),
                         account_id: None,
                         tools: None,

@@ -394,6 +394,9 @@ pub enum Command {
     },
     OpenSession {
         session_id: SessionId,
+        /// Establish missing projection metadata on an attached, profile-bound session only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bridge: Option<SessionBridgeIntent>,
         /// Optional account affinity for restoration. Established sessions remain pinned to their
         /// persisted account; this is only an explicit validation/legacy binding input.
         #[serde(default, skip_serializing_if = "Option::is_none")]

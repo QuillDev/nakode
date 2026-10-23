@@ -846,14 +846,24 @@ impl ServerCore {
                 profile_id,
                 enabled_skill_ids,
                 account_id,
-            } => self.open_session_command_with_mcp_and_profile(
-                &session_id,
-                tools,
-                mcp_grant.as_ref(),
-                profile_id,
-                &enabled_skill_ids,
-                account_id.as_deref(),
-            ),
+                bridge,
+            } => {
+                let bridge =
+                    self.open_session_bridge_record(&session_id, profile_id.as_deref(), bridge)?;
+                let (accepted, mut effects) = self.open_session_command_with_mcp_and_profile(
+                    &session_id,
+                    tools,
+                    mcp_grant.as_ref(),
+                    profile_id,
+                    &enabled_skill_ids,
+                    account_id.as_deref(),
+                )?;
+                if let Some(bridge) = bridge {
+                    effects.push(Effect::PersistSessionBridge(bridge.clone()));
+                    self.session_bridges.push(bridge);
+                }
+                Ok((accepted, effects))
+            }
             Command::SetSessionBridgeLifecycle {
                 session_id,
                 lifecycle,
@@ -2162,6 +2172,67 @@ impl ServerCore {
         bridge.pending_inbound = None;
         bump_bridge_revision(bridge);
         Some(Effect::PersistSessionBridge(bridge.clone()))
+    }
+
+    fn open_session_bridge_record(
+        &self,
+        session_id: &SessionId,
+        profile_id: Option<&str>,
+        intent: Option<nakode_protocol::SessionBridgeIntent>,
+    ) -> Result<Option<SessionBridgeRecord>, DomainCommandError> {
+        let Some(intent) = intent else {
+            return Ok(None);
+        };
+        let Some(engine) = self.sessions_by_id.get(session_id) else {
+            if !self
+                .sessions
+                .iter()
+                .any(|record| record.id == session_id.as_str())
+            {
+                return Err(DomainCommandError::NotFound(session_id.to_string()));
+            }
+            return Err(DomainCommandError::Conflict(
+                "bridge adoption requires an attached session".to_owned(),
+            ));
+        };
+        if profile_id.is_none() || !engine.state().provider_is_live() {
+            return Err(DomainCommandError::Conflict(
+                "bridge adoption requires a live profile-bound session".to_owned(),
+            ));
+        }
+        if let Some(existing) = self
+            .session_bridges
+            .iter()
+            .find(|bridge| bridge.session_id == session_id.as_str())
+        {
+            if existing.kind != intent.kind || existing.lifecycle != intent.lifecycle {
+                return Err(DomainCommandError::Conflict(
+                    "established bridge kind or lifecycle differs".to_owned(),
+                ));
+            }
+            return Ok(None);
+        }
+        let display_title = validated_bridge_title(&intent.display_title, None)?;
+        Ok(Some(SessionBridgeRecord {
+            session_id: session_id.to_string(),
+            workspace: engine.state().workspace.clone(),
+            kind: intent.kind,
+            lifecycle: intent.lifecycle,
+            display_title,
+            revision: 1,
+            transport: None,
+            external_parent_id: None,
+            external_thread_id: None,
+            last_projected: None,
+            delivery: None,
+            live_turn_id: None,
+            live_external_message_id: None,
+            active_source_message_id: None,
+            recent_inbound_event_ids: Vec::new(),
+            pending_inbound: None,
+            inbound_turn_origins: Vec::new(),
+            updated_at_ms: unix_timestamp_ms(),
+        }))
     }
 
     #[cfg(test)]
@@ -12942,6 +13013,7 @@ enabled = false
             assert!(effects.is_empty());
             let (result, effects) = core.execute_command(
                 Command::OpenSession {
+                    bridge: None,
                     session_id: id.clone(),
                     tools: None,
                     mcp_grant: None,

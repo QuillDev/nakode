@@ -1067,6 +1067,22 @@ impl NakodeClient {
             .id)
     }
 
+    /// Opens using the complete public attachment contract. Bridge adoption requires explicit
+    /// server support and refuses retained/unattached sessions rather than restoring providers.
+    ///
+    /// # Errors
+    /// Returns a capability, transport or server validation error.
+    pub async fn open_session_request(
+        &self,
+        mut request: api::OpenSessionRequest,
+    ) -> Result<api::MutationResult, SdkError> {
+        if request.bridge.is_some() {
+            self.require_capability("AttachedSessionBridge").await?;
+        }
+        request.mutation = Some(mutation(None));
+        send_mutation!(self, open_session, request)
+    }
+
     /// Opens or reattaches and returns the server's authoritative effective tool boundary.
     ///
     /// # Errors
@@ -1080,6 +1096,7 @@ impl NakodeClient {
             self,
             open_session,
             api::OpenSessionRequest {
+                bridge: None,
                 mutation: Some(mutation(None)),
                 session_id: session_id.into(),
                 tools: attachment.tools,
@@ -3282,6 +3299,7 @@ impl NakodeClient {
 
 #[cfg(test)]
 mod tests {
+    mod bridge_adoption;
     mod followups;
     mod hydration_cost;
     mod parent_creation;

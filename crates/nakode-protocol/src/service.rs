@@ -48,6 +48,8 @@ pub enum ServiceCapability {
     LinkedChildQuestions,
     /// Atomically create a durable same-runtime child with its profile and parent association.
     ParentSessionCreation,
+    /// Establish missing projection metadata on an already attached profile-bound session.
+    AttachedSessionBridge,
     /// `SteerQueuedPrompt` atomically redirects active work to a server-owned follow-up.
     QueuedPromptSteering,
     /// Local-only, owner-opted invocation metadata settings and bounded usage queries.
