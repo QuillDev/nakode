@@ -140,8 +140,9 @@ async fn stop_reaches_descendants_that_left_the_process_group() {
     let scope = owner("owner-a");
     let escaped_pid = pid_file(&fixture, "escaped.pid");
     // Job control puts the background job in its own process group, still parented by the shell.
+    // Bash, because dash ignores `set -m` without a terminal.
     let command = format!(
-        "set -m; sleep 300 & echo $! > {}; wait",
+        "bash -c 'set -m; sleep 300 & echo $! > {}; wait'",
         escaped_pid.display()
     );
     let task = service
@@ -172,7 +173,7 @@ async fn stop_keeps_escalating_to_descendants_orphaned_by_the_first_signal() {
     // The escaped job ignores SIGTERM; the shell that parents it dies of SIGTERM, so the job is
     // reparented and can no longer be found through parent links.
     let command = format!(
-        "set -m; sh -c 'trap \"\" TERM; exec sleep 300' & echo $! > {}; wait",
+        r#"bash -c 'set -m; sh -c "trap \"\" TERM; exec sleep 300" & echo $! > {}; wait'"#,
         escaped_pid.display()
     );
     let task = service
