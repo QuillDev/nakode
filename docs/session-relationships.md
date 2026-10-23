@@ -46,11 +46,21 @@ lives outside this runtime). The server checks its projection before any effect,
 and the SQLite IMMEDIATE deletion transaction re-reads `session_child_links`, so a
 claim, transfer or owner-Chat adoption that commits first refuses the deletion with
 a non-retryable conflict. Unknown sessions are not found, never idempotent success.
-Prefix resolution does not apply. Backend teardown precedes the transaction, so a
-race refusal may leave the provider stopped while history is retained. Callers
-authenticate the requesting orchestrator themselves; the fence is not authority.
-`PruneSession` refuses a fence. Older servers ignore the field, so callers must
-see `DeletionParentFence` in `GetServerInfo` capabilities before relying on it.
+Prefix resolution does not apply. Callers authenticate the requesting orchestrator
+themselves; the fence is not authority. `PruneSession` refuses a fence.
+
+`CancelSessionWork` accepts the same fence for the stop that precedes deleting a live
+child. A fenced stop or deletion first verifies the parent in an IMMEDIATE transaction
+and records a `session_deletion_holds` row, before any cancellation, shell or backend
+teardown. A mismatch refuses with a non-retryable conflict and nothing is stopped.
+While the hold is live, triggers refuse every insert, re-point or removal of the
+child's link; claim/transfer refuses explicitly and owner-Chat adoption skips the
+relink while still admitting the message. Successful deletion removes the hold in its
+transaction. A hold left by an interrupted caller expires after two minutes; after
+expiry the deletion transaction's parent check is still the final fence.
+
+Older servers ignore both fences, so callers must see `DeletionParentHold` (stop and
+delete) or `DeletionParentFence` (delete only) in `GetServerInfo` capabilities.
 
 ## Verification
 
@@ -58,8 +68,11 @@ see `DeletionParentFence` in `GetServerInfo` capabilities before relying on it.
 persistence, ABA, competing transactions, profile/native/closed/cycle rejection,
 upward and downward pending/inflight refusal, withdrawal, future routing and
 parent-deletion fences. `src/server/runtime/tests/followups/child_deletion.rs` covers
-fenced deletion of open/closed children, other-parent/orphan/unknown refusal and a
-reparent committed after the projection check. The runtime followup relationship test covers exact-call
+fenced deletion of open/closed children, other-parent/orphan/unknown refusal, a
+reparent committed after the projection check, a transfer before a fenced stop
+(no interruption, no hold), relinks refused while held and allowed after expiry,
+the deletion transaction's recheck after an expired hold, and a held cross-runtime
+child refusing a claim. The runtime followup relationship test covers exact-call
 authentication, running-turn/transcript preservation, replacement projections and
 receipt replay after external-call settlement.
 

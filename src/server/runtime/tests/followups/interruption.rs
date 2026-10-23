@@ -44,6 +44,7 @@ async fn interrupt(h: &mut Harness, manual: bool) {
     let command = if manual {
         Command::CancelSessionWork {
             session_id: h.session.clone(),
+            parent_fence: None,
         }
     } else {
         Command::InterruptSessionWork {

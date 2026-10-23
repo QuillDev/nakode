@@ -2019,7 +2019,7 @@ impl NativeServerRuntime {
         };
         let stop_inbox = match &request {
             nakode_server::ServerRequest::Command {
-                command: Command::CancelSessionWork { session_id },
+                command: Command::CancelSessionWork { session_id, .. },
                 ..
             } => Some(session_id.clone()),
             _ => None,
@@ -2060,6 +2060,34 @@ impl NativeServerRuntime {
                     message: error.to_string(),
                     retryable: false,
                 }));
+            }
+            return;
+        }
+        // A delegated child stop or deletion verifies and holds the durable parent link before any
+        // cancellation, shell or backend effect, so a claim or transfer cannot slip in between.
+        let deletion_hold = match &request {
+            nakode_server::ServerRequest::Command {
+                command:
+                    Command::CancelSessionWork {
+                        session_id,
+                        parent_fence: Some(fence),
+                    }
+                    | Command::DeleteSession {
+                        session_id,
+                        parent_fence: Some(fence),
+                    },
+                ..
+            } => Some((session_id.clone(), fence.parent_session_id.clone())),
+            _ => None,
+        };
+        if let Some((session_id, parent)) = &deletion_hold
+            && let Err(error) = self.effects.persistence.sessions.hold_child_deletion(
+                session_id.as_str(),
+                parent.as_ref().map(nakode_protocol::SessionId::as_str),
+            )
+        {
+            if let nakode_server::ServerRequest::Command { respond, .. } = request {
+                let _ = respond.send(Err(child_deletion_hold_error(&error)));
             }
             return;
         }
@@ -6698,6 +6726,29 @@ fn take_remove_provider_account_effect(effects: &mut Vec<Effect>) -> Option<(Str
     Some((provider, account_id))
 }
 
+/// A refused hold happened before any effect: the session was neither stopped nor deleted.
+fn child_deletion_hold_error(error: &SessionError) -> ServiceError {
+    match error {
+        SessionError::ParentFenceMismatch => ServiceError {
+            code: ErrorCode::Conflict,
+            message: format!("{error}; nothing was stopped"),
+            retryable: false,
+        },
+        SessionError::SessionNotFound(_) => ServiceError {
+            code: ErrorCode::NotFound,
+            message: error.to_string(),
+            retryable: false,
+        },
+        _ => ServiceError {
+            code: ErrorCode::Internal,
+            message: format!(
+                "the child's parent could not be verified; nothing was stopped: {error}"
+            ),
+            retryable: true,
+        },
+    }
+}
+
 fn provider_account_removal_error(error: &SessionError) -> ServiceError {
     let (code, retryable) = match error {
         SessionError::ProviderAccountNotFound { .. } => (ErrorCode::NotFound, false),
@@ -10143,7 +10194,10 @@ mod tests {
                 IdempotencyKey::from("cancel-during-inspect"),
                 None,
                 false,
-                Command::CancelSessionWork { session_id },
+                Command::CancelSessionWork {
+                    session_id,
+                    parent_fence: None,
+                },
             ),
         )
         .await
@@ -11534,6 +11588,7 @@ mod tests {
                         false,
                         Command::CancelSessionWork {
                             session_id: id.clone(),
+                            parent_fence: None,
                         },
                     )
                     .await
@@ -11547,6 +11602,7 @@ mod tests {
                     false,
                     Command::CancelSessionWork {
                         session_id: SessionId::from("missing-session"),
+                        parent_fence: None,
                     },
                 )
                 .await
