@@ -2,6 +2,7 @@ use super::*;
 mod automatic;
 mod child_deletion;
 mod interruption;
+mod mixed_sources;
 mod relationships;
 mod self_clear;
 use crate::followups::InboxStore;
