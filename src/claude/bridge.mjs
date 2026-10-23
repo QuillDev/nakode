@@ -29,6 +29,9 @@ const approvals = new Map();
 const externalToolCalls = new Map();
 const providerToolCalls = new Map();
 const providerToolPermissions = new Map();
+// SDK wire uuid of a delivered tool-result message -> the tool_call events it produced. A refusal
+// fallback names retracted messages by this uuid, so their calls can be re-attributed.
+const providerToolResultMessages = new Map();
 const streamMessageIds = new Map();
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 
@@ -863,8 +866,13 @@ function permissionBatchHook(turnId) {
   return (input) => {
     const permissions = (input.tool_calls || []).flatMap((call) => {
       const recorded = providerToolPermissions.get(call.tool_use_id);
-      if (!recorded || recorded.turnId !== turnId || recorded.permission.decision === "allow") return [];
-      return [{ callId: call.tool_use_id, ...recorded.permission }];
+      if (recorded && recorded.turnId !== turnId) return [];
+      const attributed = recorded && recorded.permission.decision !== "allow";
+      if (attributed) return [{ callId: call.tool_use_id, ...recorded.permission }];
+      // The batch can run before the SDK delivers the tool-result message, so the generic
+      // cancellation text is checked here too. It never becomes an owner stop.
+      if (!isSdkCancellation(call.tool_response)) return [];
+      return [{ callId: call.tool_use_id, ...unattributedCancellation(turnId, recorded?.permission.mode) }];
     });
     return permissions.length === 0 ? {} : {
       hookSpecificOutput: {
@@ -950,23 +958,21 @@ function emitUserToolResults(turnId, message) {
       const started = providerToolCalls.get(block.tool_use_id);
       providerToolCalls.delete(block.tool_use_id);
       let recorded = providerToolPermissions.get(block.tool_use_id);
+      // A delivered replacement result replaces the retraction of the earlier one.
+      if (recorded?.permission.source === "sdk_retracted") {
+        recorded = undefined;
+        providerToolPermissions.delete(block.tool_use_id);
+      }
       // This exact SDK fallback is also used for internal cancellation/skipped siblings. Matching
       // it only establishes UNKNOWN provenance, never an owner stop or a policy decision.
-      if (block.is_error && block.content === SDK_CANCELLATION_TEXT &&
+      if (block.is_error && isSdkCancellation(block.content) &&
           (!recorded || recorded.permission.decision === "allow")) {
-        const runtimeSignal = runs.get(turnId)?.signal;
-        const permission = runtimeSignal?.aborted
-          ? interruptedPermission(turnId, recorded?.permission.mode)
-          : {
-              decision: "unknown", source: "sdk_unknown",
-              reason: "Claude SDK reported cancellation without an attributed Nakode stop or denial. Execution outcome is unconfirmed; do not retry automatically.",
-              mode: recorded?.permission.mode,
-            };
+        const permission = unattributedCancellation(turnId, recorded?.permission.mode);
         recorded = { name: started?.name || "Tool", turnId, permission };
         providerToolPermissions.set(block.tool_use_id, recorded);
       }
       const permission = recorded?.permission;
-      write({
+      const event = {
         event: "tool_call",
         turnId,
         callId: block.tool_use_id,
@@ -977,9 +983,113 @@ function emitUserToolResults(turnId, message) {
         denied: permission?.decision === "deny",
         denialReason: permission && permission.decision !== "allow" ? permission.reason : undefined,
         permission,
-      });
+      };
+      write(event);
+      if (message.uuid) {
+        const events = providerToolResultMessages.get(message.uuid) || [];
+        providerToolResultMessages.set(message.uuid, [...events, event]);
+      }
     }
   }
+}
+
+function isSdkCancellation(output) {
+  if (Array.isArray(output) && output.length === 1 && output[0]?.type === "text") {
+    return output[0].text === SDK_CANCELLATION_TEXT;
+  }
+  return output === SDK_CANCELLATION_TEXT;
+}
+
+// Generic SDK cancellation text proves only that the SDK did not run the call to completion.
+// A Nakode stop always aborts the runtime controller first, so only that establishes a stop.
+function unattributedCancellation(turnId, mode) {
+  if (runs.get(turnId)?.signal.aborted) return interruptedPermission(turnId, mode);
+  return {
+    decision: "unknown",
+    source: "sdk_unknown",
+    reason: "Claude SDK reported cancellation, but Nakode received no stop or denial for this call, so it is not an owner stop. Execution outcome is unconfirmed; check whether it took effect before relying on it, and do not replay it automatically.",
+    mode,
+  };
+}
+
+// A model refusal fallback discards the refused response, including tool results the SDK had
+// already delivered as cancelled. Those calls were neither denied nor stopped by anyone.
+function retractToolResults(turnId, uuids, cause) {
+  let retracted = 0;
+  for (const uuid of uuids || []) {
+    const events = providerToolResultMessages.get(uuid) || [];
+    providerToolResultMessages.delete(uuid);
+    for (const event of events) {
+      if (event.turnId !== turnId) continue;
+      const recorded = providerToolPermissions.get(event.callId);
+      const decision = recorded?.permission.decision;
+      if (decision && decision !== "allow" && recorded.permission.source !== "sdk_unknown") continue;
+      const permission = {
+        decision: "unknown",
+        source: "sdk_retracted",
+        reason: `Claude SDK retracted this call's result during ${cause}. Nobody stopped or denied it; its outcome is unconfirmed, so check whether it took effect before relying on it, and do not replay it automatically.`,
+        mode: recorded?.permission.mode,
+      };
+      providerToolPermissions.set(event.callId, { name: event.name, turnId, permission });
+      write({ ...event, denied: false, denialReason: permission.reason, permission });
+      retracted += 1;
+    }
+  }
+  return retracted;
+}
+
+const QUIET_SDK_EVENTS = new Set(["thinking_tokens", "hook_progress", "task_progress"]);
+
+// Nakode cannot see why the SDK cancels without attribution. Recording the SDK lifecycle events
+// around such a cancellation (task notifications, retries, refusals, hooks) makes the next one
+// diagnosable from the session transcript instead of private provider storage.
+function sdkLifecycleLog() {
+  const started = Date.now();
+  const events = [];
+  let cancelled = 0;
+  const note = (label) => {
+    if (!label || QUIET_SDK_EVENTS.has(label)) return;
+    events.push(`${label} +${((Date.now() - started) / 1000).toFixed(1)}s`);
+    if (events.length > 20) events.shift();
+  };
+  return {
+    note,
+    noteUnattributedCancellations(message) {
+      const content = message?.message?.content;
+      if (!Array.isArray(content)) return;
+      for (const block of content) {
+        const recorded = providerToolPermissions.get(block.tool_use_id);
+        if (block.type !== "tool_result" || recorded?.permission.source !== "sdk_unknown") continue;
+        cancelled += 1;
+        note(`unattributed cancellation of ${recorded.name}`);
+      }
+    },
+    report(turnId) {
+      if (cancelled === 0) return;
+      write({
+        event: "warning",
+        turnId,
+        message: `Claude SDK cancelled ${cancelled} tool call(s) without a Nakode stop or denial; this was not an owner stop. SDK lifecycle this turn: ${events.join(", ")}.`,
+      });
+    },
+  };
+}
+
+function sdkRefusal(turnId, message) {
+  const model = message.original_model || "Claude";
+  const category = message.api_refusal_category ? ` (${message.api_refusal_category})` : "";
+  if (message.subtype === "model_refusal_fallback") {
+    const retracted = retractToolResults(turnId, message.retracted_message_uuids, "a model refusal fallback");
+    write({
+      event: "warning",
+      message: `${model} refused this response${category}; Claude SDK retried on ${message.fallback_model || "a fallback model"} and retracted ${retracted} tool result(s). This was not an owner stop.`,
+    });
+    return;
+  }
+  write({
+    event: "warning",
+    message: `${model} refused this turn${category} and no fallback model ran, so the turn ended. This was not an owner stop.`,
+  });
 }
 
 function emitStreamEvent(turnId, message, session) {
@@ -1056,9 +1166,20 @@ function emitStreamEvent(turnId, message, session) {
   }
 }
 
-function turnPrompt(command) {
-  if (!command.images?.length) return command.prompt;
-  return (async function* () {
+// The SDK closes Claude Code's stdin at the first result of a string prompt. A background task
+// (background Bash, Monitor) can then start another turn in the same process, where every SDK
+// callback, including Nakode's PreToolUse hook, fails with "Stream closed". Claude Code reports
+// that as the generic user-cancellation text, so the agent stops with no owner stop.
+// Streaming input therefore stays open until Claude Code reports the session idle, which it does
+// only after background work can no longer start a turn. A CLI that reports no session state
+// keeps the previous close-at-first-result behaviour rather than risking a turn that never ends.
+function turnInput(command) {
+  let settle;
+  const settled = new Promise((resolve) => {
+    settle = resolve;
+  });
+  let reportsSessionState = false;
+  const prompt = (async function* () {
     yield {
       type: "user",
       session_id: command.sessionId,
@@ -1066,12 +1187,25 @@ function turnPrompt(command) {
       message: {
         role: "user",
         content: [
-          ...command.images,
+          ...(command.images || []),
           ...(command.prompt ? [{ type: "text", text: command.prompt }] : []),
         ],
       },
     };
+    await settled;
   })();
+  return {
+    prompt,
+    close: () => settle(),
+    observe(message) {
+      if (message.type === "system" && message.subtype === "session_state_changed") {
+        reportsSessionState = true;
+        if (message.state === "idle") settle();
+      } else if (message.type === "result" && !reportsSessionState) {
+        settle();
+      }
+    },
+  };
 }
 
 async function sendTurn(command) {
@@ -1122,7 +1256,12 @@ async function sendTurn(command) {
     cwd: command.workspace,
     ...claudeExecutable(),
     // The session's variables (GH_TOKEN, git credentials, account environment) for its tools.
-    env: { ...process.env, ...(command.environment || {}) },
+    env: {
+      ...process.env,
+      ...(command.environment || {}),
+      // Lets turnInput keep input open until background work can no longer start a turn.
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
+    },
     model,
     systemPrompt: {
       type: "preset",
@@ -1172,6 +1311,8 @@ async function sendTurn(command) {
 
   let completion = null;
   let turnPermissions = new Map();
+  const lifecycle = sdkLifecycleLog();
+  const input = turnInput(command);
   let timedOut = false;
   const timeout = session.timeoutSeconds
     ? setTimeout(() => {
@@ -1180,18 +1321,30 @@ async function sendTurn(command) {
       }, session.timeoutSeconds * 1000)
     : null;
   try {
-    const stream = query({ prompt: turnPrompt(command), options });
+    const stream = query({ prompt: input.prompt, options });
     await processLifecycle.started();
     write({ event: "turn_started", turnId: command.turnId });
     for await (const message of stream) {
+      input.observe(message);
+      // Retract superseded results first, so this message's replacement is the final projection.
+      if (Array.isArray(message.supersedes))
+        retractToolResults(command.turnId, message.supersedes, "a model refusal fallback");
       if (message.type === "stream_event")
         emitStreamEvent(command.turnId, message, session);
       else if (message.type === "assistant")
         emitContent(command.turnId, message);
-      else if (message.type === "user")
+      else if (message.type === "user") {
         emitUserToolResults(command.turnId, message);
-      else if (message.type === "system" && message.subtype === "permission_denied")
+        lifecycle.noteUnattributedCancellations(message);
+      } else if (message.type === "system")
+        lifecycle.note(message.subtype);
+      if (message.type === "system" && message.subtype === "permission_denied")
         sdkPermissionDenied(command.turnId, message);
+      else if (
+        message.type === "system" &&
+        (message.subtype === "model_refusal_fallback" || message.subtype === "model_refusal_no_fallback")
+      )
+        sdkRefusal(command.turnId, message);
       else if (message.type === "result") {
         await emitNativeAgentHistory(
           command.workspace,
@@ -1227,6 +1380,7 @@ async function sendTurn(command) {
           : errorMessage(error),
     };
   } finally {
+    input.close();
     if (timeout !== null) clearTimeout(timeout);
     interruptExternalToolCalls(
       (pending) => pending.turnId === command.turnId,
@@ -1237,6 +1391,10 @@ async function sendTurn(command) {
       [...providerToolPermissions].filter(([, recorded]) => recorded.turnId === command.turnId),
     );
     for (const callId of turnPermissions.keys()) providerToolPermissions.delete(callId);
+    lifecycle.report(command.turnId);
+    for (const [uuid, events] of providerToolResultMessages) {
+      if (events.some((event) => event.turnId === command.turnId)) providerToolResultMessages.delete(uuid);
+    }
     runs.delete(command.turnId);
   }
 
