@@ -50,6 +50,9 @@ only after the last background-driven turn, so follow-up turns keep their hooks 
 start. Turns with background tasks stay open while those tasks run, as Claude Code's process already
 did. A CLI that emits no session state falls back to closing at the first `result` (the old
 behaviour, still attributed as `sdk_unknown`).
+Turns that end abnormally still settle: an error result is followed by `idle` (observed with
+Claude Code 2.1.304), and a cancelled or exited process ends the SDK stream, after which the turn
+closes its input.
 
 Remaining limits: other SDK-internal cancellations (refusal fallback, ambient watchers, unknown
 CLI paths) still yield `sdk_unknown`/`sdk_retracted`. The model is told not to stop for them, but it

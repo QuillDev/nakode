@@ -358,6 +358,46 @@ test("without session state the turn still ends, and the cancellation stays attr
   assert.match(f.emitted.find((event) => event.event === "warning").message, /not an owner stop/);
 });
 
+// Models how Claude Code 2.1.304 and SDK 0.3.280 end a turn that does not finish normally, as
+// observed in isolated runs: an error result is still followed by `idle` and the SDK then throws;
+// a cancelled or killed process throws with neither a result nor `idle`.
+function endingSdk(f, ending) {
+  return async function* (prompt) {
+    const iterator = prompt[Symbol.asyncIterator]();
+    await iterator.next();
+    f.inputDrained = iterator.next();
+    yield { type: "system", subtype: "session_state_changed", state: "running" };
+    yield { type: "assistant", message: { content: [{ type: "tool_use", id: "sleep", name: "Bash", input: { command: "sleep 20" } }] } };
+    if (ending === "error") {
+      yield { type: "result", subtype: "error_max_turns", is_error: true, errors: ["Reached maximum number of turns (1)"] };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      await f.inputDrained;
+      throw new Error("Claude Code returned an error result: Reached maximum number of turns (1)");
+    }
+    if (ending === "cancel") {
+      const signal = f.sdkOptions().abortController.signal;
+      await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+      throw new Error("Claude Code process aborted by user");
+    }
+    throw new Error("Claude Code process terminated by signal SIGKILL");
+  };
+}
+
+for (const [ending, status] of [["error", "failed"], ["cancel", "cancelled"], ["exit", "failed"]]) {
+  test(`a turn that ends by ${ending} completes and closes its input`, async () => {
+    const f = fixture();
+    f.useSdk(endingSdk(f, ending));
+    const turn = f.turn();
+    if (ending === "cancel") {
+      await new Promise((resolve) => setImmediate(resolve));
+      await f.cancel();
+    }
+    await turn;
+    assert.equal(f.emitted.find((event) => event.event === "turn_completed").status, status);
+    assert.deepEqual(await f.inputDrained, { value: undefined, done: true });
+  });
+}
+
 test("refusal notices never relabel a runtime stop or a policy denial", async () => {
   const stopped = fixture("default");
   const pending = stopped.authorize();
