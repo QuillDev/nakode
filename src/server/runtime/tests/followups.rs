@@ -1,4 +1,5 @@
 use super::*;
+mod automatic;
 mod child_deletion;
 mod interruption;
 mod relationships;

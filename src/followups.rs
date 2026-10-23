@@ -468,7 +468,7 @@ impl InboxStore {
             )
             .optional()
             .map_err(failure)?;
-        let (unsettled_batch_id, blocked_reason) =
+        let (unsettled_batch_id, mut blocked_reason) =
             unresolved.map_or((None, None), |(id, state, reason)| {
                 (
                     Some(id),
@@ -480,6 +480,13 @@ impl InboxStore {
                     }),
                 )
             });
+        if blocked_reason.is_none()
+            && !child_events::authorized_child_messages(&tx, session.as_str())?
+        {
+            blocked_reason = Some(
+                "child evidence ownership is unavailable; explicit recovery required".to_owned(),
+            );
+        }
         Ok(FollowupInbox {
             session_id: session.clone(),
             items,
