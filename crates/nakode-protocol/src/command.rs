@@ -8,6 +8,14 @@ use crate::{
     OrchestratorKind, PromptId, ProviderId, RunId, SessionId, TurnId, WorkspaceId,
 };
 
+/// Durable-parent precondition for delegated child deletion.
+///
+/// `parent_session_id: None` requires the target to have no durable runtime parent.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeletionParentFence {
+    pub parent_session_id: Option<SessionId>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionBridgeIntent {
     pub kind: OrchestratorKind,
@@ -713,6 +721,10 @@ pub enum Command {
     /// both under one verb would make a cleanup command able to stop running inference.
     DeleteSession {
         session_id: SessionId,
+        /// Delegated child deletion: refuse unless the durable parent still matches when deletion
+        /// commits. `None` is ordinary owner deletion.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_fence: Option<DeletionParentFence>,
     },
     /// Exact-ID, missing-directory-only canonical deletion; never restores or cancels work.
     /// Authenticated orchestrator self-removal, never arbitrary target deletion.

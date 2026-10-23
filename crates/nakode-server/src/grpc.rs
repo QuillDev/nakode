@@ -1967,12 +1967,18 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             slug: input.slug
         }
     );
-    command_rpc!(
+    try_command_rpc!(
         prune_session,
         api::DeleteSessionRequest,
         input,
-        protocol::Command::PruneSession {
-            session_id: protocol::SessionId::from(input.session_id)
+        if input.parent_fence.is_some() {
+            Err(tonic::Status::invalid_argument(
+                "PruneSession does not accept a parent fence",
+            ))
+        } else {
+            Ok(protocol::Command::PruneSession {
+                session_id: protocol::SessionId::from(input.session_id),
+            })
         }
     );
     command_rpc!(
@@ -1980,7 +1986,12 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         api::DeleteSessionRequest,
         input,
         protocol::Command::DeleteSession {
-            session_id: protocol::SessionId::from(input.session_id)
+            session_id: protocol::SessionId::from(input.session_id),
+            parent_fence: input
+                .parent_fence
+                .map(|fence| protocol::DeletionParentFence {
+                    parent_session_id: fence.parent_session_id.map(protocol::SessionId::from),
+                }),
         }
     );
     command_rpc!(
@@ -2479,6 +2490,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 .map(|value| format!("{value:?}"))
                 .chain(self.additional_capabilities.iter().cloned())
                 .chain(std::iter::once("SessionRouting".to_owned()))
+                // DeleteSession enforces `parent_fence`; older servers silently drop the field.
+                .chain(std::iter::once("DeletionParentFence".to_owned()))
                 .collect(),
             server_id: self.server_id.clone(),
             build_revision: self.endpoint.build_revision().map(str::to_owned),
@@ -4257,6 +4270,12 @@ mod tests {
         let response = response.into_inner();
 
         assert_eq!(response.server_id, "server-test");
+        assert!(
+            response
+                .capabilities
+                .iter()
+                .any(|value| value == "DeletionParentFence")
+        );
         assert_eq!(
             response.build_revision.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")

@@ -421,6 +421,8 @@ pub enum SessionError {
     LinkedChildren,
     #[error("self-clear requires an owned open Chat with no unsettled coordination")]
     SelfClearNotReady,
+    #[error("not a current linked child of the expected parent; nothing was deleted")]
+    ParentFenceMismatch,
     #[error("session repository does not support atomic child creation")]
     ChildCreationUnsupported,
     #[error("child relationship refused: {0:?}")]
@@ -885,6 +887,14 @@ pub trait SessionRepository: Send + Sync {
     fn delete_self(&self, _id: &str) -> Result<(), SessionError> {
         Err(SessionError::ChildCreationUnsupported)
     }
+    /// Delegated child deletion verifies the exact durable parent in the deletion transaction.
+    /// `None` requires the session to have no durable parent.
+    ///
+    /// # Errors
+    /// Refuses unsupported storage, an absent session, a changed parent or a failed transaction.
+    fn delete_child(&self, _id: &str, _parent: Option<&str>) -> Result<(), SessionError> {
+        Err(SessionError::ChildCreationUnsupported)
+    }
     /// Deletes every logical session and every session-scoped persistence row.
     ///
     /// Unlike repeated single-session deletion, this also removes orphaned native runtime histories
@@ -1227,8 +1237,18 @@ fn ensure_self_clear_ready(connection: &Connection, id: &str) -> Result<(), Sess
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum DeletionGuard<'a> {
+    Owner,
+    SelfClear,
+    /// Exact id only; the durable parent link must equal `parent` when the transaction commits.
+    Child {
+        parent: Option<&'a str>,
+    },
+}
+
 impl SqliteSessionRepository {
-    fn delete_guarded(&self, id: &str, self_clear: bool) -> Result<(), SessionError> {
+    fn delete_guarded(&self, id: &str, guard: DeletionGuard<'_>) -> Result<(), SessionError> {
         // Resolve prefixes exactly as every other session operation does. A fully absent id is an
         // idempotent success, but an ambiguous prefix remains an error and must never pick a victim.
         let record = self.find(id)?;
@@ -1251,8 +1271,24 @@ impl SqliteSessionRepository {
         if linked {
             return Err(SessionError::LinkedChildren);
         }
-        if self_clear {
-            ensure_self_clear_ready(&transaction, &resolved_id)?;
+        match guard {
+            DeletionGuard::Owner => {}
+            DeletionGuard::SelfClear => ensure_self_clear_ready(&transaction, &resolved_id)?,
+            DeletionGuard::Child { parent } => {
+                if record.as_ref().is_none_or(|record| record.id != id) {
+                    return Err(SessionError::SessionNotFound(id.to_owned()));
+                }
+                let current: Option<String> = transaction
+                    .query_row(
+                        "SELECT parent_id FROM session_child_links WHERE child_id = ?1",
+                        [&resolved_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if current.as_deref() != parent {
+                    return Err(SessionError::ParentFenceMismatch);
+                }
+            }
         }
         // Bridge identity is intentionally retained for thread history, but deletion is its terminal
         // lifecycle boundary. Archive it in this transaction before deleting the session hierarchy so
@@ -4096,11 +4132,15 @@ impl SessionRepository for SqliteSessionRepository {
     }
 
     fn delete(&self, id: &str) -> Result<(), SessionError> {
-        self.delete_guarded(id, false)
+        self.delete_guarded(id, DeletionGuard::Owner)
     }
 
     fn delete_self(&self, id: &str) -> Result<(), SessionError> {
-        self.delete_guarded(id, true)
+        self.delete_guarded(id, DeletionGuard::SelfClear)
+    }
+
+    fn delete_child(&self, id: &str, parent: Option<&str>) -> Result<(), SessionError> {
+        self.delete_guarded(id, DeletionGuard::Child { parent })
     }
 
     fn purge_all(&self) -> Result<SessionPurgeReport, SessionError> {
