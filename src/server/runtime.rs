@@ -1375,6 +1375,68 @@ impl NativeServerRuntime {
             .query_retained_session(query, session, history, children, shared_context)
     }
 
+    /// Takes the deletion hold a fenced child stop or deletion needs, returning the child when this
+    /// call newly took it.
+    fn hold_child_deletion(
+        &self,
+        request: &nakode_server::ServerRequest,
+    ) -> Result<Option<nakode_protocol::SessionId>, ServiceError> {
+        let nakode_server::ServerRequest::Command {
+            command:
+                Command::CancelSessionWork {
+                    session_id,
+                    parent_fence: Some(fence),
+                }
+                | Command::DeleteSession {
+                    session_id,
+                    parent_fence: Some(fence),
+                },
+            ..
+        } = request
+        else {
+            return Ok(None);
+        };
+        let created = self
+            .effects
+            .persistence
+            .sessions
+            .hold_child_deletion(
+                session_id.as_str(),
+                fence
+                    .parent_session_id
+                    .as_ref()
+                    .map(nakode_protocol::SessionId::as_str),
+            )
+            .map_err(|error| child_deletion_hold_error(&error))?;
+        Ok(created.then(|| session_id.clone()))
+    }
+
+    /// A stale revision, replay-only miss or other rejection had no effect, so the hold it newly
+    /// took must not keep refusing claim and transfer.
+    fn release_rejected_child_deletion_hold(
+        &self,
+        outcome: &crate::server::DispatchOutcome,
+        hold: Option<nakode_protocol::SessionId>,
+    ) {
+        let Some(session_id) = hold else {
+            return;
+        };
+        let rejected = outcome.effects.is_empty()
+            && outcome
+                .command_response
+                .as_ref()
+                .is_some_and(|response| response.result.is_err());
+        if rejected
+            && let Err(error) = self
+                .effects
+                .persistence
+                .sessions
+                .release_child_deletion_hold(session_id.as_str())
+        {
+            eprintln!("nakode: a rejected child deletion hold remains until it expires: {error}");
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     // The request dispatcher keeps fencing, typed routing, persistence rollback, and response
     // completion in one exhaustive match so a newly added public request cannot bypass a guard.
@@ -2027,7 +2089,7 @@ impl NativeServerRuntime {
         };
         let stop_inbox = match &request {
             nakode_server::ServerRequest::Command {
-                command: Command::CancelSessionWork { session_id },
+                command: Command::CancelSessionWork { session_id, .. },
                 ..
             } => Some(session_id.clone()),
             _ => None,
@@ -2071,6 +2133,17 @@ impl NativeServerRuntime {
             }
             return;
         }
+        // A delegated child stop or deletion verifies and holds the durable parent link before any
+        // cancellation, shell or backend effect, so a claim or transfer cannot slip in between.
+        let new_deletion_hold = match self.hold_child_deletion(&request) {
+            Ok(hold) => hold,
+            Err(error) => {
+                if let nakode_server::ServerRequest::Command { respond, .. } = request {
+                    let _ = respond.send(Err(error));
+                }
+                return;
+            }
+        };
         let mut rollback = BridgeMutationRollback::capture(&request, &self.core);
         let mut outcome = if let Some(store) = child_question_store.as_ref() {
             self.core
@@ -2078,6 +2151,7 @@ impl NativeServerRuntime {
         } else {
             self.core.handle(&self.endpoint, request)
         };
+        self.release_rejected_child_deletion_hold(&outcome, new_deletion_hold);
         // Only a newly accepted Stop pauses the inbox. Rejected fences, replay-only misses and
         // cached retries must not mutate scheduling after an explicit later Resume.
         if outcome.changed
@@ -6732,6 +6806,32 @@ fn take_remove_provider_account_effect(effects: &mut Vec<Effect>) -> Option<(Str
     Some((provider, account_id))
 }
 
+/// A refused hold happened before any effect: the session was neither stopped nor deleted.
+fn child_deletion_hold_error(error: &SessionError) -> ServiceError {
+    match error {
+        SessionError::ParentFenceMismatch => ServiceError {
+            code: ErrorCode::Conflict,
+            // The FStack Host recognizes this refusal by "not a current linked child".
+            message:
+                "not a current linked child of the expected parent; nothing was stopped or deleted"
+                    .to_owned(),
+            retryable: false,
+        },
+        SessionError::SessionNotFound(_) => ServiceError {
+            code: ErrorCode::NotFound,
+            message: error.to_string(),
+            retryable: false,
+        },
+        _ => ServiceError {
+            code: ErrorCode::Internal,
+            message: format!(
+                "the child's parent could not be verified; nothing was stopped: {error}"
+            ),
+            retryable: true,
+        },
+    }
+}
+
 fn provider_account_removal_error(error: &SessionError) -> ServiceError {
     let (code, retryable) = match error {
         SessionError::ProviderAccountNotFound { .. } => (ErrorCode::NotFound, false),
@@ -10177,7 +10277,10 @@ mod tests {
                 IdempotencyKey::from("cancel-during-inspect"),
                 None,
                 false,
-                Command::CancelSessionWork { session_id },
+                Command::CancelSessionWork {
+                    session_id,
+                    parent_fence: None,
+                },
             ),
         )
         .await
@@ -11568,6 +11671,7 @@ mod tests {
                         false,
                         Command::CancelSessionWork {
                             session_id: id.clone(),
+                            parent_fence: None,
                         },
                     )
                     .await
@@ -11581,6 +11685,7 @@ mod tests {
                     false,
                     Command::CancelSessionWork {
                         session_id: SessionId::from("missing-session"),
+                        parent_fence: None,
                     },
                 )
                 .await

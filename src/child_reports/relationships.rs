@@ -156,6 +156,19 @@ fn apply(tx: &Transaction<'_>, request: &Reparent<'_>) -> Result<()> {
             "claim/transfer requires open, one-level sessions and fewer than 32 children; cycles and nested parents are not supported",
         ));
     }
+    let held: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_deletion_holds WHERE child_id = ?1
+         AND expires_at_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))",
+            [request.child],
+            |row| row.get(0),
+        )
+        .map_err(|error| failure(&error))?;
+    if held {
+        return Err(refuse(
+            "its current parent is stopping or deleting this session; claim/transfer is refused",
+        ));
+    }
     ensure_delivery_settled(tx, request)?;
     if request.transfer {
         tx.execute(

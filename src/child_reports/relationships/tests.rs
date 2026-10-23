@@ -372,3 +372,20 @@ fn concurrent_claim_and_parent_delete_cannot_orphan_child() {
         }
     }
 }
+
+#[test]
+fn a_child_deletion_hold_refuses_transfer_without_changing_the_parent() {
+    let f = Fixture::new();
+    f.claim();
+    SqliteSessionRepository::open(f.path())
+        .unwrap()
+        .hold_child_deletion(&f.child, Some(&f.old))
+        .unwrap();
+    let error = f
+        .apply(&f.command(&f.new, Some(&f.old), 1, "transfer"), "transfer")
+        .unwrap_err();
+    assert_eq!(error.code, nakode_protocol::ErrorCode::Conflict);
+    assert!(!error.retryable);
+    assert!(error.message.contains("stopping or deleting"));
+    assert_eq!(f.parent(), (Some(f.old.clone()), 1));
+}

@@ -517,6 +517,10 @@ pub enum Command {
     /// omit the expected revision when background progress must not invalidate the stop request.
     CancelSessionWork {
         session_id: SessionId,
+        /// Delegated child stop: refuse before any effect unless the durable parent matches, then
+        /// hold that link until the child is deleted or the hold expires. `None` is an owner stop.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_fence: Option<DeletionParentFence>,
     },
     /// Interrupts current session work without changing the coordination inbox pause state.
     /// Pending follow-ups may dispatch at the next supported idle boundary; interrupted work
@@ -972,8 +976,11 @@ mod tests {
             }),
         );
         assert_eq!(
-            serde_json::to_value(Command::CancelSessionWork { session_id })
-                .expect("serialize session cancellation"),
+            serde_json::to_value(Command::CancelSessionWork {
+                session_id,
+                parent_fence: None
+            })
+            .expect("serialize session cancellation"),
             json!({
                 "type": "cancel_session_work",
                 "session_id": "session-1"

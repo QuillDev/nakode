@@ -1617,7 +1617,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         api::CancelSessionWorkRequest,
         input,
         protocol::Command::CancelSessionWork {
-            session_id: protocol::SessionId::from(input.session_id)
+            session_id: protocol::SessionId::from(input.session_id),
+            parent_fence: input.parent_fence.map(deletion_parent_fence)
         }
     );
     command_rpc!(
@@ -2059,11 +2060,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         input,
         protocol::Command::DeleteSession {
             session_id: protocol::SessionId::from(input.session_id),
-            parent_fence: input
-                .parent_fence
-                .map(|fence| protocol::DeletionParentFence {
-                    parent_session_id: fence.parent_session_id.map(protocol::SessionId::from),
-                }),
+            parent_fence: input.parent_fence.map(deletion_parent_fence),
         }
     );
     command_rpc!(
@@ -2564,6 +2561,8 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                 .chain(std::iter::once("SessionRouting".to_owned()))
                 // DeleteSession enforces `parent_fence`; older servers silently drop the field.
                 .chain(std::iter::once("DeletionParentFence".to_owned()))
+                // CancelSessionWork enforces `parent_fence` and holds the link until deletion.
+                .chain(std::iter::once("DeletionParentHold".to_owned()))
                 .collect(),
             server_id: self.server_id.clone(),
             build_revision: self.endpoint.build_revision().map(str::to_owned),
@@ -3075,6 +3074,12 @@ fn provider(value: protocol::ProviderView) -> api::Provider {
         supported_builtin_tools: supported_builtin_tools.unwrap_or_default(),
         remote_authentication_supported: value.remote_authentication_supported,
         accounts: value.accounts.into_iter().map(provider_account).collect(),
+    }
+}
+
+fn deletion_parent_fence(fence: api::DeletionParentFence) -> protocol::DeletionParentFence {
+    protocol::DeletionParentFence {
+        parent_session_id: fence.parent_session_id.map(protocol::SessionId::from),
     }
 }
 
@@ -4373,6 +4378,12 @@ mod tests {
                 .capabilities
                 .iter()
                 .any(|value| value == "DeletionParentFence")
+        );
+        assert!(
+            response
+                .capabilities
+                .iter()
+                .any(|value| value == "DeletionParentHold")
         );
         assert_eq!(
             response.build_revision.as_deref(),

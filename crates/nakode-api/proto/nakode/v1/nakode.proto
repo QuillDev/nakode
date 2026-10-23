@@ -968,7 +968,14 @@ message CancelTurnRequest { MutationOptions mutation = 1; string turn_id = 2; }
 // current-session-work cancellation omit mutation.expected_revision so background progress cannot
 // invalidate the request. An existing session with no cancellable work is accepted as an idempotent
 // no-op, allowing stop-before-close clients to race safely with terminal replacement snapshots.
-message CancelSessionWorkRequest { MutationOptions mutation = 1; string session_id = 2; }
+message CancelSessionWorkRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
+  // Present only for a delegated child stop before fenced deletion. The durable parent must equal
+  // the fence before anything is cancelled, and the link stays held until deletion. Older servers
+  // ignore it, so callers must check for the DeletionParentHold capability first.
+  optional DeletionParentFence parent_fence = 3;
+}
 message InterruptSessionWorkRequest { MutationOptions mutation = 1; string session_id = 2; }
 message CompactContextRequest { MutationOptions mutation = 1; string agent_session_id = 2; }
 message RunShellRequest { MutationOptions mutation = 1; string session_id = 2; string command = 3; }

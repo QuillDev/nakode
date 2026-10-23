@@ -968,7 +968,7 @@ impl ServerCore {
             } => self.steer_queued_prompt_command(&session_id, prompt_id.as_str()),
             Command::SteerTurn { turn_id, text } => self.steer_turn_command(&turn_id, &text),
             Command::CancelTurn { turn_id } => self.cancel_turn_command(&turn_id),
-            Command::CancelSessionWork { session_id }
+            Command::CancelSessionWork { session_id, .. }
             | Command::InterruptSessionWork { session_id } => {
                 self.cancel_session_work_command(&session_id)
             }
@@ -4805,7 +4805,7 @@ impl ServerCore {
             | Command::EnqueuePrompt { session_id, .. }
             | Command::RemoveQueuedPrompt { session_id, .. }
             | Command::SteerQueuedPrompt { session_id, .. }
-            | Command::CancelSessionWork { session_id }
+            | Command::CancelSessionWork { session_id, .. }
             | Command::InterruptSessionWork { session_id }
             | Command::Delegate { session_id, .. }
             | Command::PublishSharedContext { session_id, .. }
@@ -12381,6 +12381,7 @@ enabled = false
             false,
             Command::CancelSessionWork {
                 session_id: session_id.clone(),
+                parent_fence: None,
             },
         );
         let accepted = result.expect("session cancellation is accepted");
@@ -12415,6 +12416,7 @@ enabled = false
                 false,
                 Command::CancelSessionWork {
                     session_id: session_id.clone(),
+                    parent_fence: None,
                 },
             );
             let accepted = result.expect("idle cancellation is a successful no-op");
@@ -12473,6 +12475,7 @@ enabled = false
             false,
             Command::CancelSessionWork {
                 session_id: session_id.clone(),
+                parent_fence: None,
             },
         );
         assert!(matches!(
@@ -12488,7 +12491,10 @@ enabled = false
             IdempotencyKey::from("priority-current-work-cancel"),
             None,
             false,
-            Command::CancelSessionWork { session_id },
+            Command::CancelSessionWork {
+                session_id,
+                parent_fence: None,
+            },
         );
         result.expect("unfenced current-work cancellation is accepted");
         assert!(changed);
@@ -12556,7 +12562,10 @@ enabled = false
             IdempotencyKey::from("cancel-current-successor"),
             None,
             false,
-            Command::CancelSessionWork { session_id },
+            Command::CancelSessionWork {
+                session_id,
+                parent_fence: None,
+            },
         );
         result.expect("current successor cancellation is accepted");
         assert!(changed);
@@ -12607,6 +12616,7 @@ enabled = false
             false,
             Command::CancelSessionWork {
                 session_id: session_id.clone(),
+                parent_fence: None,
             },
         );
 

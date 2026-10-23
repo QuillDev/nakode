@@ -78,8 +78,9 @@ pub(crate) fn relay_source(
 /// An owner Chat that instructs an agent becomes its parent, so the agent's reports return to
 /// whoever last directed it and it appears among that Chat's agents. The link row is re-pointed,
 /// never deleted, so the agent's report and question history stay attached to it. Nothing changes
-/// when either session is itself nested (a parent's child, or a child's parent) or the Chat
-/// already has the most children a parent may hold; the message is admitted either way.
+/// when either session is itself nested (a parent's child, or a child's parent), the Chat
+/// already has the most children a parent may hold, or the agent's current parent is stopping or
+/// deleting it under a deletion hold; the message is admitted either way.
 pub(super) fn adopt(connection: &Connection, chat: &str, agent: &str) -> Result<()> {
     let current: Option<String> = connection
         .query_row(
@@ -106,7 +107,15 @@ pub(super) fn adopt(connection: &Connection, chat: &str, agent: &str) -> Result<
             |row| row.get(0),
         )
         .map_err(failure)?;
-    if nested || children >= 32 {
+    let held: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_deletion_holds WHERE child_id = ?1
+             AND expires_at_ms > CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))",
+            [agent],
+            |row| row.get(0),
+        )
+        .map_err(failure)?;
+    if nested || children >= 32 || held {
         return Ok(());
     }
     if current.is_some() {

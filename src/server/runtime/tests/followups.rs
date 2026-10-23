@@ -560,6 +560,7 @@ async fn stop_rejections_and_replays_cannot_pause_after_a_later_resume() {
     h.enqueue("pending").await;
     let stop = Command::CancelSessionWork {
         session_id: h.session.clone(),
+        parent_fence: None,
     };
     assert!(
         h.command("stale", Some(u64::MAX), false, stop.clone())

@@ -1381,6 +1381,31 @@ impl NakodeClient {
             api::CancelSessionWorkRequest {
                 mutation: Some(mutation(expected_revision)),
                 session_id: session_id.into(),
+                parent_fence: None,
+            }
+        )
+    }
+
+    /// Stops a delegated child's work only while its durable parent equals `parent_session_id`
+    /// (`None`: no runtime parent), then holds that link until fenced deletion or expiry.
+    ///
+    /// Check for the `DeletionParentHold` server capability first: older servers ignore the fence
+    /// and would stop the session unconditionally.
+    ///
+    /// # Errors
+    /// Returns a non-retryable conflict when the parent differs; nothing was stopped.
+    pub async fn cancel_child_session_work(
+        &self,
+        session_id: impl Into<String>,
+        parent_session_id: Option<String>,
+    ) -> Result<api::MutationResult, SdkError> {
+        send_mutation!(
+            self,
+            cancel_session_work,
+            api::CancelSessionWorkRequest {
+                mutation: Some(mutation(None)),
+                session_id: session_id.into(),
+                parent_fence: Some(api::DeletionParentFence { parent_session_id }),
             }
         )
     }

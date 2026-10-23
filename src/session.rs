@@ -895,6 +895,23 @@ pub trait SessionRepository: Send + Sync {
     fn delete_child(&self, _id: &str, _parent: Option<&str>) -> Result<(), SessionError> {
         Err(SessionError::ChildCreationUnsupported)
     }
+    /// Before a delegated stop or deletion has any effect, verify the exact durable parent and hold
+    /// that link: relinking is refused until the deletion commits or the hold expires.
+    /// `None` requires the session to have no durable parent. Repeating it refreshes the hold.
+    /// Returns whether no unexpired hold existed before, so a rejected command can release it.
+    ///
+    /// # Errors
+    /// Refuses unsupported storage, an absent session, a changed parent or a failed transaction.
+    fn hold_child_deletion(&self, _id: &str, _parent: Option<&str>) -> Result<bool, SessionError> {
+        Err(SessionError::ChildCreationUnsupported)
+    }
+    /// Releases a hold whose stop or deletion was rejected before it had any effect.
+    ///
+    /// # Errors
+    /// Returns an error when persistence cannot be updated.
+    fn release_child_deletion_hold(&self, _id: &str) -> Result<(), SessionError> {
+        Ok(())
+    }
     /// Deletes every logical session and every session-scoped persistence row.
     ///
     /// Unlike repeated single-session deletion, this also removes orphaned native runtime histories
@@ -1237,6 +1254,10 @@ fn ensure_self_clear_ready(connection: &Connection, id: &str) -> Result<(), Sess
     Ok(())
 }
 
+/// Long enough for a delegated End to stop work and delete; short enough that an interrupted caller
+/// cannot block claim or transfer for long.
+const CHILD_DELETION_HOLD_SECONDS: i64 = 120;
+
 #[derive(Clone, Copy)]
 enum DeletionGuard<'a> {
     Owner,
@@ -1321,6 +1342,11 @@ impl SqliteSessionRepository {
             )?;
             transaction.execute(
                 "DELETE FROM accepted_owner_prompts WHERE session_id = ?1",
+                [&record.id],
+            )?;
+            // A deletion hold refuses link removal, so release it before the cascade removes the link.
+            transaction.execute(
+                "DELETE FROM session_deletion_holds WHERE child_id = ?1",
                 [&record.id],
             )?;
             // Then the session itself. `orchestration_runs` and `agent_turns` go with it by cascade, which
@@ -4143,6 +4169,64 @@ impl SessionRepository for SqliteSessionRepository {
         self.delete_guarded(id, DeletionGuard::Child { parent })
     }
 
+    fn hold_child_deletion(&self, id: &str, parent: Option<&str>) -> Result<bool, SessionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(SessionError::SessionNotFound(id.to_owned()));
+        }
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT parent_id FROM session_child_links WHERE child_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != parent {
+            return Err(SessionError::ParentFenceMismatch);
+        }
+        let now_ms = unix_timestamp().saturating_mul(1_000);
+        let already_held: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM session_deletion_holds WHERE child_id = ?1 AND expires_at_ms > ?2
+             )",
+            params![id, now_ms],
+            |row| row.get(0),
+        )?;
+        let expires_at_ms =
+            now_ms.saturating_add(CHILD_DELETION_HOLD_SECONDS.saturating_mul(1_000));
+        transaction.execute(
+            "INSERT INTO session_deletion_holds (child_id, parent_id, expires_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(child_id) DO UPDATE
+             SET parent_id = excluded.parent_id, expires_at_ms = excluded.expires_at_ms",
+            params![id, parent, expires_at_ms],
+        )?;
+        transaction.commit()?;
+        Ok(!already_held)
+    }
+
+    fn release_child_deletion_hold(&self, id: &str) -> Result<(), SessionError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("session database mutex poisoned");
+        connection.execute(
+            "DELETE FROM session_deletion_holds WHERE child_id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
     fn purge_all(&self) -> Result<SessionPurgeReport, SessionError> {
         let mut connection = self
             .connection
@@ -4164,6 +4248,7 @@ impl SessionRepository for SqliteSessionRepository {
         transaction.execute("DELETE FROM session_bridges", [])?;
         transaction.execute("DELETE FROM invocation_events", [])?;
         transaction.execute("DELETE FROM invocation_aggregates", [])?;
+        transaction.execute("DELETE FROM session_deletion_holds", [])?;
         transaction.execute("DELETE FROM sessions", [])?;
         transaction.commit()?;
         Ok(report)
