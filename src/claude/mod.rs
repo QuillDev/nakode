@@ -2862,7 +2862,7 @@ mod tests {
         };
         assert_eq!(session_owner(Some(&resume)), Some("owner"));
         assert_eq!(session_owner(None), None);
-        assert!(BRIDGE_SOURCE.contains("env: { ...process.env, ...(command.environment || {}) }"));
+        assert!(BRIDGE_SOURCE.contains("...process.env,\n      ...(command.environment || {}),"));
     }
 
     #[test]
