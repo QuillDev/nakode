@@ -884,7 +884,8 @@ message OpenSessionRequest {
   optional SessionBridgeIntent bridge = 7;
 }
 message ListActiveSessionsRequest { string workspace_id = 1; }
-// Complete current membership. Overview snapshots exclude conversation bodies; poll this for status.
+// Complete current membership. Overview snapshots exclude conversation bodies but preserve every
+// pending interaction, including question groups and option identities, for authoritative control.
 message ListActiveSessionsResponse { repeated SessionState sessions = 1; }
 message ListSessionStatusesRequest {
   // Capped at 500; complete is false if any discoverable session is omitted.

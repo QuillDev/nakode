@@ -3458,13 +3458,8 @@ fn retain_overview(state: &mut api::SessionState) {
     state
         .interactions
         .retain(|interaction| interaction.status == api::InteractionStatus::Pending as i32);
-    state.interactions.truncate(1);
-    for interaction in &mut state.interactions {
-        interaction.title.clear();
-        interaction.detail.clear();
-        interaction.questions.clear();
-        interaction.options.clear();
-    }
+    // Pending interactions are control-plane resources, not conversation previews. Preserve the
+    // complete group so inventory clients can discover and resolve the same authoritative ask.
     state.todos.clear();
     state.runs.clear();
     state.shared_context.clear();
@@ -4924,8 +4919,67 @@ mod tests {
         assert!(state.queue.is_empty());
         assert_eq!(state.interactions.len(), 1);
         assert_eq!(state.interactions[0].id, "pending");
-        assert!(state.interactions[0].title.is_empty());
-        assert!(state.interactions[0].detail.is_empty());
+        assert_eq!(state.interactions[0].title, "Private question");
+        assert_eq!(state.interactions[0].detail, "Private context");
+    }
+
+    #[test]
+    fn overview_preserves_all_pending_question_groups_and_legacy_fields() {
+        let option = api::InteractionOption {
+            id: "local".to_owned(),
+            label: "Leave committed locally".to_owned(),
+            description: Some("Do not retry".to_owned()),
+            recommended: true,
+        };
+        let grouped = api::Interaction {
+            id: "grouped-interaction".to_owned(),
+            revision: 7,
+            kind: api::InteractionKind::Question as i32,
+            status: api::InteractionStatus::Pending as i32,
+            title: "Publication".to_owned(),
+            detail: "How should publication proceed?".to_owned(),
+            options: vec![option.clone()],
+            multiple: false,
+            questions: vec![
+                api::InteractionQuestion {
+                    id: "publication".to_owned(),
+                    title: "Publication".to_owned(),
+                    detail: "How should publication proceed?".to_owned(),
+                    options: vec![option],
+                    multiple: false,
+                },
+                api::InteractionQuestion {
+                    id: "constraints".to_owned(),
+                    title: "Constraints".to_owned(),
+                    detail: "Which constraints apply?".to_owned(),
+                    options: Vec::new(),
+                    multiple: true,
+                },
+            ],
+        };
+        let legacy = api::Interaction {
+            id: "legacy-interaction".to_owned(),
+            questions: Vec::new(),
+            ..grouped.clone()
+        };
+        let expected = vec![grouped, legacy];
+        let mut state = session_with_full_paging_bodies();
+        state.interactions = expected.clone();
+        for status in [
+            api::InteractionStatus::Resolved,
+            api::InteractionStatus::Declined,
+            api::InteractionStatus::Cancelled,
+        ] {
+            state.interactions.push(api::Interaction {
+                status: status as i32,
+                ..Default::default()
+            });
+        }
+        retain_overview(&mut state);
+        assert_eq!(state.interactions, expected);
+        assert!(state.transcript.is_none());
+        assert!(state.runs.is_empty());
+        assert!(state.shared_context.is_empty());
     }
 
     #[test]

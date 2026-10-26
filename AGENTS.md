@@ -160,6 +160,8 @@ resolution status so simultaneous clients cannot resolve them inconsistently.
 
 Interactive linked-child question reads and answers reuse the original child interaction through the persistence-backed public runtime; same-runtime availability and restart limitations are documented in `docs/linked-child-questions.md`. Parent reads never create questions or restore providers.
 
+Active-session overviews preserve every pending interaction's complete question group, text, options and stable identities; they omit conversation bodies, not answer authority. `crates/nakode-server/src/grpc.rs`.
+
 The public API must expose every capability needed to build a feature-complete
 alternative frontend. SDKs own connection recovery, idempotent mutation retry,
 watch resubscription, paging, hydration, and session open/create selection so
