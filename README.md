@@ -14,6 +14,10 @@ Alternative interfaces can use the same native server through the
 the TUI is one renderer of server-owned semantic state.
 Background clients can read a bounded [scalar session status inventory](docs/session-status.md)
 through one SDK query without keeping a renderer or transcript subscription alive.
+`list_active_sessions` also preserves complete pending interactions: exact group/question/option
+identities, text and multi-select semantics, without conversation bodies. Answer those canonical
+resources through `resolve_interaction_answers`; never recover answer authority from transcripts.
+Stale/changed resolutions remain server errors, not ordinary follow-up messages.
 
 ## Explicit image handoffs
 

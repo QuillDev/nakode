@@ -1196,7 +1196,9 @@ impl NakodeClient {
 
     /// Lists all currently readable sessions, including idle sessions, in one request.
     /// Saved-only history remains in `list_session_inventory`. Overview snapshots contain status
-    /// and pending external tools, never transcript/context bodies, and must not replace details.
+    /// and pending external tools/interactions, never transcript/context bodies, and must not replace
+    /// details. Pending interactions retain their full question groups and option identities; use
+    /// those exact identities for `resolve_interaction_answers`, never transcript reconstruction.
     ///
     /// # Errors
     /// Returns a transport/server error; older servers explicitly refuse this operation.
@@ -3309,6 +3311,7 @@ mod tests {
     mod followups;
     mod hydration_cost;
     mod parent_creation;
+    mod questions;
     mod transcript_hydration;
     use nakode_telemetry::{RpcLayer, opentelemetry::trace::FutureExt};
     use std::{
