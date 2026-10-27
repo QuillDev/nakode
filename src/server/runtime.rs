@@ -2430,6 +2430,8 @@ impl NativeServerRuntime {
             }
             crate::session_environment::remove(&delete_session_id);
             crate::tools::desktop::record_discard(&delete_session_id);
+            #[cfg(unix)]
+            crate::tools::browser_control::discard(&delete_session_id);
             if let Some(service) = &background_tasks {
                 // Cleanup runs off the actor; its outcome is recorded on each task.
                 drop(

@@ -1446,6 +1446,10 @@ mod tests {
         if crate::tools::desktop::available() {
             expected.extend(["desktop_screenshot", "desktop_action", "screen_record"]);
         }
+        #[cfg(unix)]
+        if crate::tools::browser_control::available() {
+            expected.push("browser_control");
+        }
         assert_eq!(tool_names, expected);
         assert!(!tool_names.contains(&"task"));
         assert!(!tool_names.contains(&"hub"));

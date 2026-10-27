@@ -1,6 +1,8 @@
 mod ask;
 mod bash;
 mod browser;
+#[cfg(unix)]
+pub(crate) mod browser_control;
 mod edit;
 mod eval;
 mod find;
@@ -142,6 +144,9 @@ impl ToolRegistry {
                 Arc::new(desktop::DesktopScreenshotTool),
                 Arc::new(desktop::DesktopActionTool),
                 Arc::new(desktop::ScreenRecordTool),
+                // Offered only where a Chromium-family browser is installed.
+                #[cfg(unix)]
+                Arc::new(browser_control::BrowserControlTool),
             ],
         }
     }
@@ -653,6 +658,10 @@ mod tests {
         ];
         if crate::tools::desktop::available() {
             expected.extend(["desktop_screenshot", "desktop_action", "screen_record"]);
+        }
+        #[cfg(unix)]
+        if crate::tools::browser_control::available() {
+            expected.push("browser_control");
         }
         assert_eq!(names, expected);
     }
