@@ -87,18 +87,19 @@ function delegationOutcome(toolResult) {
 function nakodeServer(
   session,
   turn,
-  { delegate: withDelegate, returnImage, desktop, backgroundTasks },
+  { delegate: withDelegate, returnImage, desktop, browser, backgroundTasks },
 ) {
   const tools = [];
   if (returnImage) tools.push(returnImageTool(session, turn));
   if (backgroundTasks) tools.push(backgroundTasksTool(session, turn));
   for (const name of desktop) tools.push(desktopTool(name, session, turn));
+  if (browser) tools.push(browserControlTool(session, turn));
   if (withDelegate) tools.push(delegateTool(session, turn));
   return createSdkMcpServer({
     name: "nakode",
     version: "1.0.0",
     instructions:
-      "Nakode tools: delegate bounded work to configured archetypes, attach images from this machine to the transcript, manage runtime-supervised background processes, and use and record this agent's private desktop when it has one.",
+      "Nakode tools: delegate bounded work to configured archetypes, attach images from this machine to the transcript, manage runtime-supervised background processes, drive this agent's private browser, and use and record this agent's private desktop when it has one.",
     tools,
   });
 }
@@ -150,6 +151,64 @@ function desktopTool(name, session, turn) {
         arguments: args,
       });
     }),
+  );
+}
+
+/** Keep in step with `definition()` in src/tools/browser_control.rs. */
+const BROWSER_CONTROL_DESCRIPTION =
+  "Drive this agent's own private browser on the execution machine: a headless Chromium (visible on the agent desktop where one exists) with a fresh profile. It is not the owner's browser or the dashboard browser pane, which cannot be controlled. `navigate` opens a URL (starting the browser when needed) and waits for load; `open` starts the browser or adds a tab; `tabs`, `select_tab`, `close_tab`, `back`, `forward`, `reload`, `close`. Every result is compact JSON page state: tab, URL, title, loading, CSS-pixel viewport, device scale and an `observation` id. `screenshot` saves a viewport PNG whose pixels are CSS pixels and shows it; any action takes one afterwards only with `screenshot: true`. `wait` blocks (bounded) for load, network idle, or URL/title text; `diagnostics` returns and clears recent console errors, page exceptions and failed requests. `click`/`scroll` take viewport CSS-pixel x/y plus the `observation` they were aimed from and are refused if the tab, page or viewport changed since; `type` inserts text into the focused element; `key` presses keys such as Enter, Tab, ctrl+a. Input is not retried: on an uncertain result, observe before acting again.";
+
+function browserControlTool(session, turn) {
+  return tool(
+    "browser_control",
+    BROWSER_CONTROL_DESCRIPTION,
+    {
+      action: z.enum([
+        "open", "navigate", "tabs", "select_tab", "close_tab", "back", "forward", "reload",
+        "state", "screenshot", "wait", "diagnostics", "click", "scroll", "type", "key", "close",
+      ]),
+      url: z.string().optional().describe("navigate/open: http(s) URL; bare hosts get https, localhost gets http"),
+      tab: z.number().int().min(1).optional().describe("select_tab/close_tab: tab number from tabs"),
+      observation: z.string().optional().describe("click/scroll: the observation id the coordinates were read from"),
+      x: z.number().min(0).optional().describe("click/scroll: viewport CSS pixels from the left"),
+      y: z.number().min(0).optional().describe("click/scroll: viewport CSS pixels from the top"),
+      button: z.enum(["left", "right", "middle"]).optional().describe("click: default left"),
+      clicks: z.number().int().min(1).max(2).optional().describe("click: 2 for double click"),
+      delta_x: z.number().optional().describe("scroll: CSS pixels, positive is right"),
+      delta_y: z.number().optional().describe("scroll: CSS pixels, positive is down"),
+      text: z.string().max(4000).optional().describe("type: text to insert; wait: URL or title text"),
+      keys: z.string().max(200).optional().describe("key: space-separated chords such as Enter, Tab, ctrl+a, shift+ArrowLeft"),
+      until: z.enum(["load", "idle", "url", "title"]).optional().describe("wait: condition; url/title wait until they contain `text`"),
+      wait: z.enum(["none", "load", "idle"]).optional().describe("navigate/back/forward/reload: default load"),
+      timeout_ms: z.number().int().min(0).max(30000).optional().describe("wait bound, default 10000"),
+      screenshot: z.boolean().optional().describe("take a viewport screenshot after the action"),
+    },
+    async (args, extra) =>
+      new Promise((resolve) => {
+        const id = randomUUID();
+        externalToolCalls.set(id, { resolve, sessionId: session.sessionId, turnId: turn.turnId });
+        const abort = () => {
+          if (!externalToolCalls.has(id)) return;
+          write({ event: "browser_cancelled", id });
+          resolveExternalToolCall(
+            id,
+            "browser action cancelled; its outcome is unknown, observe before acting again",
+            true,
+          );
+        };
+        if (extra?.signal?.aborted) {
+          abort();
+          return;
+        }
+        extra?.signal?.addEventListener("abort", abort, { once: true });
+        write({
+          event: "browser_request",
+          id,
+          turnId: turn.turnId,
+          workspace: turn.workspace,
+          arguments: args,
+        });
+      }),
   );
 }
 
@@ -359,6 +418,7 @@ const NAKODE_MCP_TOOLS = new Set([
   "mcp__nakode__desktop_screenshot",
   "mcp__nakode__desktop_action",
   "mcp__nakode__screen_record",
+  "mcp__nakode__browser_control",
 ]);
 
 function effectiveAllowedTools(session) {
@@ -1285,11 +1345,17 @@ async function sendTurn(command) {
   const desktop = process.env.DISPLAY
     ? Object.keys(DESKTOP_TOOLS).filter((name) => allows(`mcp__nakode__${name}`))
     : [];
-  if (withDelegate || returnImage || backgroundTasks || desktop.length > 0) {
+  // The browser belongs to the logical owner, which the supervisor binds; without one it is absent.
+  const browser = Boolean(
+    process.env.NAKODE_BROWSER_CONTROL === "1" &&
+      session.ownerSessionId &&
+      allows("mcp__nakode__browser_control"),
+  );
+  if (withDelegate || returnImage || backgroundTasks || desktop.length > 0 || browser) {
     mcpServers.nakode = nakodeServer(
       session,
       { turnId: command.turnId, workspace: command.workspace },
-      { delegate: withDelegate, returnImage, desktop, backgroundTasks },
+      { delegate: withDelegate, returnImage, desktop, browser, backgroundTasks },
     );
   }
   if (session.externalTools.length > 0) {
@@ -1623,6 +1689,7 @@ async function handle(command) {
       );
       break;
     case "resolve_desktop":
+    case "resolve_browser":
       resolveExternalToolCall(command.id, command.output, command.failed === true, command.image);
       break;
     case "cancel": {

@@ -473,6 +473,16 @@ fn bridge_command(directory: &std::path::Path) -> Command {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The bridge offers browser_control only where this machine can run a browser for it.
+    #[cfg(unix)]
+    let browser = crate::tools::browser_control::available();
+    #[cfg(not(unix))]
+    let browser = false;
+    if browser {
+        command.env("NAKODE_BROWSER_CONTROL", "1");
+    } else {
+        command.env_remove("NAKODE_BROWSER_CONTROL");
+    }
     command
 }
 
@@ -566,6 +576,7 @@ async fn run_supervisor(
     let mut deferred_command = None;
     let mut delegation_scope = DelegationScope::default();
     let mut delegations = ClaudeDelegations::new(config.native_delegation.clone());
+    let mut browser_calls = BrowserCalls::default();
     // Background task calls may wait on process termination, so they run off this loop.
     let (background_replies_tx, mut background_replies) = mpsc::channel::<Value>(16);
     let mut authentication_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -584,6 +595,7 @@ async fn run_supervisor(
                 // Interrupts, unsubscribes and shutdown cancel pending delegations even when the
                 // command itself cannot reach the bridge.
                 delegations.observe_command(&command);
+                browser_calls.observe_command(&command);
                 if matches!(command, BackendCommand::Shutdown) {
                     if let Some(task) = authentication_task.take() {
                         task.abort();
@@ -664,6 +676,9 @@ async fn run_supervisor(
                 handle_command(command, &config, credential.as_ref(), bridge.as_mut(), &events, owner).await;
             }
             Some(reply) = background_replies.recv() => {
+                if reply["method"] == "resolve_browser" {
+                    browser_calls.finished(&string(&reply, "id"));
+                }
                 if let Some(bridge) = bridge.as_mut() {
                     let _ = send(bridge, reply).await;
                 }
@@ -682,6 +697,7 @@ async fn run_supervisor(
                 let Some(mut message) = message else {
                     // The exited bridge's tool calls can no longer receive a result.
                     delegations.cancel_all();
+                    browser_calls.cancel_all();
                     let _ = events.send(BackendEvent::Disconnected { reason: "Claude SDK bridge exited".to_owned() }).await;
                     if let Some(stopped) = bridge.take() {
                         stopped.task.abort();
@@ -747,6 +763,21 @@ async fn run_supervisor(
                             .send(json!({"method": "resolve_background_task", "id": string(&message, "id"), "output": output, "failed": failed}))
                             .await;
                     });
+                    continue;
+                }
+                if event_name == Some("browser_request") {
+                    // The owner comes from control-plane attachment, never from the payload.
+                    let owner = session_owner(attachment.as_ref()).map(str::to_owned);
+                    let replies = background_replies_tx.clone();
+                    let cancellation = browser_calls.start(&message);
+                    tokio::spawn(async move {
+                        let reply = browser_request(&message, owner.as_deref(), &cancellation).await;
+                        let _ = replies.send(reply).await;
+                    });
+                    continue;
+                }
+                if event_name == Some("browser_cancelled") {
+                    browser_calls.cancel(&string(&message, "id"));
                     continue;
                 }
                 if event_name == Some(DELEGATION_REQUEST_EVENT) {
@@ -1871,7 +1902,7 @@ fn without_context_window(name: &str) -> &str {
 
 /// Runs one desktop tool call from the bridge. Screenshots, including the one taken after each
 /// action, come back as an image the model sees.
-async fn desktop_request(message: &Value, owner: Option<&str>) -> Value {
+pub(crate) async fn desktop_request(message: &Value, owner: Option<&str>) -> Value {
     use crate::tools::desktop;
     use base64::Engine as _;
     let workspace = PathBuf::from(string(message, "workspace"));
@@ -1920,6 +1951,98 @@ async fn desktop_request(message: &Value, owner: Option<&str>) -> Value {
         Err(error) => (error, true, None),
     };
     json!({"method": "resolve_desktop", "id": string(message, "id"), "output": output, "failed": failed, "image": image})
+}
+
+/// In-flight `browser_control` calls from the bridge, so an interrupted turn, a cancelled tool
+/// call or an exited bridge stops them instead of letting queued input run afterwards.
+#[derive(Default)]
+struct BrowserCalls {
+    pending: HashMap<String, (String, tokio_util::sync::CancellationToken)>,
+}
+
+impl BrowserCalls {
+    fn start(&mut self, message: &Value) -> tokio_util::sync::CancellationToken {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        self.pending.insert(
+            string(message, "id"),
+            (string(message, "turnId"), cancellation.clone()),
+        );
+        cancellation
+    }
+
+    fn finished(&mut self, id: &str) {
+        self.pending.remove(id);
+    }
+
+    fn cancel(&mut self, id: &str) {
+        if let Some((_, cancellation)) = self.pending.remove(id) {
+            cancellation.cancel();
+        }
+    }
+
+    fn cancel_all(&mut self) {
+        for (_, (_, cancellation)) in self.pending.drain() {
+            cancellation.cancel();
+        }
+    }
+
+    fn observe_command(&mut self, command: &BackendCommand) {
+        match command {
+            BackendCommand::InterruptTurn { turn_id, .. } => {
+                self.pending.retain(|_, (turn, cancellation)| {
+                    let interrupted = turn == turn_id;
+                    if interrupted {
+                        cancellation.cancel();
+                    }
+                    !interrupted
+                });
+            }
+            BackendCommand::UnsubscribeSession { .. } | BackendCommand::Shutdown => {
+                self.cancel_all();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Runs one `browser_control` call from the bridge. A screenshot comes back as an image the
+/// model sees; other actions return only their compact page state.
+async fn browser_request(
+    message: &Value,
+    owner: Option<&str>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Value {
+    use base64::Engine as _;
+    let id = string(message, "id");
+    let Some(owner) = owner else {
+        return json!({"method": "resolve_browser", "id": id, "output": "browser_control needs an owning Nakode session", "failed": true});
+    };
+    let workspace = PathBuf::from(string(message, "workspace"));
+    #[cfg(unix)]
+    let outcome =
+        crate::tools::browser_control::run(owner, &workspace, &message["arguments"], cancellation)
+            .await
+            .map(|outcome| (outcome.text, outcome.image));
+    #[cfg(not(unix))]
+    let outcome: Result<(String, Option<Vec<u8>>), String> = Err(format!(
+        "browser_control is not supported on this machine (session {owner}, {})",
+        workspace.display()
+    ));
+    match outcome {
+        Ok((text, image)) => json!({
+            "method": "resolve_browser",
+            "id": id,
+            "output": text,
+            "failed": false,
+            "image": image.map(|png| json!({
+                "data": base64::engine::general_purpose::STANDARD.encode(png),
+                "mimeType": "image/png",
+            })),
+        }),
+        Err(error) => {
+            json!({"method": "resolve_browser", "id": id, "output": error, "failed": true})
+        }
+    }
 }
 
 /// Keeps the bridge's latest history for a session. The Claude SDK owns the transcript itself;

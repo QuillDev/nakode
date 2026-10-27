@@ -306,6 +306,8 @@ Local tools must:
 - Preserve one-writer workspace policy unless isolation is deliberate.
 - Keep interactive questions in the shared question/event path.
 
+`browser_control` drives an agent-private Chromium per logical owner session over a DevTools pipe: no port, no script evaluation, sandbox kept, web URLs only, coordinate input refused on stale observations, screenshots opt-in. It is never the owner's or a client's browser and never a fallback for one. `docs/browser-control.md`.
+
 The base tool registry intentionally excludes unrestricted recursive
 orchestration tools. Delegation is a control-plane capability and must remain
 bounded and attributable.

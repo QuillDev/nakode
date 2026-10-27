@@ -34,6 +34,7 @@ pub const CANONICAL_AGENT_TOOLS: &[&str] = &[
     "list_child_materials",
     "vision",
     "browser",
+    "browser_control",
     NAKODE_AGENT_TOOL_NAME,
 ];
 
@@ -373,6 +374,12 @@ impl AgentDefinition {
             if tools.iter().any(|tool| tool == "browser") {
                 warnings.push(
                     "browser can reach network resources through the configured browser runtime."
+                        .to_owned(),
+                );
+            }
+            if tools.iter().any(|tool| tool == "browser_control") {
+                warnings.push(
+                    "browser_control drives a private browser that can reach network resources."
                         .to_owned(),
                 );
             }
@@ -803,7 +810,7 @@ pub fn required_capability(tool: &str) -> Option<&'static str> {
         "write" | "edit" => Some("filesystem_write"),
         "bash" | BACKGROUND_TASKS_TOOL_NAME => Some("command_execution"),
         "eval" | "ask" => Some("interaction"),
-        "browser" => Some("network"),
+        "browser" | "browser_control" => Some("network"),
         "memory_store" | "memory_search" => Some("memory"),
         "vision" => Some("vision"),
         // Installed skills are Nakode-owned instruction context. These tools accept only exact

@@ -183,7 +183,7 @@ pub(crate) async fn act(arguments: &Value) -> Result<String, String> {
     let done = match action {
         "click" | "double_click" | "right_click" | "move" => {
             let [x, y] = point(arguments, size)?;
-            xdotool.args(["mousemove", "--sync", &x, &y]);
+            xdotool.args(["mousemove", &x, &y]);
             match action {
                 "click" => xdotool.args(["click", "1"]),
                 "double_click" => xdotool.args(["click", "--repeat", "2", "1"]),
@@ -196,8 +196,8 @@ pub(crate) async fn act(arguments: &Value) -> Result<String, String> {
             let [x, y] = point(arguments, size)?;
             let to_x = coordinate(arguments, "to_x", size.0)?;
             let to_y = coordinate(arguments, "to_y", size.1)?;
-            xdotool.args(["mousemove", "--sync", &x, &y, "mousedown", "1"]);
-            xdotool.args(["mousemove", "--sync", &to_x, &to_y, "mouseup", "1"]);
+            xdotool.args(["mousemove", &x, &y, "mousedown", "1"]);
+            xdotool.args(["mousemove", &to_x, &to_y, "mouseup", "1"]);
             format!("dragged from ({x}, {y}) to ({to_x}, {to_y})")
         }
         "scroll" => {
@@ -216,7 +216,7 @@ pub(crate) async fn act(arguments: &Value) -> Result<String, String> {
                 .to_string();
             if arguments.get("x").is_some() {
                 let [x, y] = point(arguments, size)?;
-                xdotool.args(["mousemove", "--sync", &x, &y]);
+                xdotool.args(["mousemove", &x, &y]);
             }
             xdotool.args(["click", "--repeat", &amount, "--delay", "40", button]);
             format!("scrolled {amount} steps")

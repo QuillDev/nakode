@@ -114,6 +114,11 @@ const PROVIDER_TOOL_IDENTITIES: &[(&str, &str, &str)] = &[
         "screen_record",
         "mcp__nakode__screen_record",
     ),
+    (
+        CLAUDE_PROVIDER,
+        "browser_control",
+        "mcp__nakode__browser_control",
+    ),
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
