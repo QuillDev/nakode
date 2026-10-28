@@ -705,6 +705,7 @@ async fn run_supervisor(
                     // The exited bridge's tool calls can no longer receive a result.
                     delegations.cancel_all();
                     browser_calls.cancel_all();
+                    returned_images.external_calls.clear();
                     let _ = events.send(BackendEvent::Disconnected { reason: "Claude SDK bridge exited".to_owned() }).await;
                     if let Some(stopped) = bridge.take() {
                         stopped.task.abort();
@@ -809,6 +810,10 @@ async fn run_supervisor(
                         let _ = send(bridge, json!({"method":"resolve_image_return","id":string(&message, "id"),"output":output,"failed":failed})).await;
                     }
                     continue;
+                }
+                // An ended turn's unresolved external calls (interrupted, say) never return images.
+                if matches!(event_name, Some("turn_completed" | "turn_start_failed")) {
+                    returned_images.forget_turn_calls(&string(&message, "turnId"));
                 }
                 if event_name == Some("external_tool_request") {
                     returned_images.external_calls.insert(
@@ -1554,6 +1559,12 @@ struct ReturnedImages {
     turns: HashMap<String, (usize, usize)>,
     /// Pending external tool calls by bridge id: their turn and model, for any images they return.
     external_calls: HashMap<String, (String, String)>,
+}
+
+impl ReturnedImages {
+    fn forget_turn_calls(&mut self, turn_id: &str) {
+        self.external_calls.retain(|_, (turn, _)| turn != turn_id);
+    }
 }
 
 /// An external tool result for the bridge. Claude sees its images as MCP image content.
@@ -3310,6 +3321,40 @@ process.stdout.write(output);
                 input_schema_json: r#"{"type":"object","properties":{"stageId":{"type":"string","format":"uuid"}},"required":["stageId"],"additionalProperties":false}"#.to_owned(),
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn claude_external_tool_images_are_retained_once_per_live_call() {
+        let (events, mut received) = mpsc::channel(4);
+        let mut returned = ReturnedImages::default();
+        let image = crate::backend::PromptImage {
+            mime_type: "image/png".to_owned(),
+            data: b"\x89PNG\r\n\x1a\n".to_vec(),
+        };
+        let track = |returned: &mut ReturnedImages, id: &str, turn: &str| {
+            returned
+                .external_calls
+                .insert(id.to_owned(), (turn.to_owned(), "model".to_owned()));
+        };
+
+        track(&mut returned, "live", "turn-1");
+        let mut images = vec![image.clone()];
+        let note = retain_external_tool_images("live", &mut images, &mut returned, &events).await;
+        assert!(note.is_none());
+        let Some(BackendEvent::ImageReturned(retained)) = received.recv().await else {
+            panic!("expected a retained image");
+        };
+        assert_eq!(retained.id, "turn-1:image:live");
+        assert!(returned.external_calls.is_empty());
+
+        track(&mut returned, "interrupted", "turn-2");
+        returned.forget_turn_calls("turn-2");
+        assert!(returned.external_calls.is_empty());
+        let mut images = vec![image];
+        let note =
+            retain_external_tool_images("interrupted", &mut images, &mut returned, &events).await;
+        assert!(note.is_none());
+        assert!(received.try_recv().is_err());
     }
 
     #[test]
