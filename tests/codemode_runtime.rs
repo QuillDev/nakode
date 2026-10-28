@@ -269,7 +269,11 @@ async fn code_mode_worker_composes_native_mutation_client_and_mcp_callbacks() {
             .expect("native mutation output"),
         "native mutation"
     );
-    // A nested client screenshot reaches the model on the outer Code Mode result.
+    assert_outer_result_carries_screenshot(&session);
+}
+
+/// A nested client screenshot reaches the model on the outer Code Mode result.
+fn assert_outer_result_carries_screenshot(session: &RuntimeSession) {
     let images = session.history.iter().find_map(|item| match item {
         ConversationItem::ToolResult {
             name: Some(name),
