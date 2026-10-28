@@ -47,6 +47,27 @@ impl ServiceEngine {
         projection::bootstrap(&self.state, self.revision, providers, sessions)
     }
 
+    /// The workspace snapshot without this engine's own session view.
+    #[must_use]
+    pub fn workspace_view(
+        &self,
+        providers: &[ProviderRecord],
+        sessions: &[SessionRecord],
+    ) -> nakode_protocol::BootstrapView {
+        projection::workspace_bootstrap(&self.state, providers, sessions)
+    }
+
+    #[must_use]
+    pub fn session_view(&self, sessions: &[SessionRecord]) -> nakode_protocol::SessionView {
+        projection::session_view(&self.state, self.revision, sessions)
+    }
+
+    /// This engine's session view without transcript pages.
+    #[must_use]
+    pub fn session_overview(&self, sessions: &[SessionRecord]) -> nakode_protocol::SessionView {
+        projection::session_overview(&self.state, self.revision, sessions)
+    }
+
     /// Advances the revision after one semantic state change.
     ///
     /// # Panics

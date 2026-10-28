@@ -58,8 +58,23 @@ pub fn bootstrap(
     providers: &[ProviderRecord],
     sessions: &[SessionRecord],
 ) -> BootstrapView {
+    let mut bootstrap = workspace_bootstrap(state, providers, sessions);
+    bootstrap.active_session = Some(session_view(state, revision, sessions));
+    bootstrap
+}
+
+/// The workspace snapshot without this engine's own session view.
+///
+/// Workspace publications and catalogue reads never use that view, and building it projects a
+/// full transcript page; on the serialized runtime that cost delayed every other request.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn workspace_bootstrap(
+    state: &DomainState,
+    providers: &[ProviderRecord],
+    sessions: &[SessionRecord],
+) -> BootstrapView {
     let workspace_id = workspace_id(&state.workspace);
-    let active_session = session_view(state, revision, &workspace_id, sessions);
     let mut session_summaries = sessions
         .iter()
         .map(|session| session_summary(session, &workspace_id))
@@ -73,11 +88,11 @@ pub fn bootstrap(
             SessionSummary {
                 parent_session_id: None,
                 relationship_revision: Some(0),
-                first_prompt_preview: active_session.first_prompt_preview.clone(),
+                first_prompt_preview: first_prompt_preview(state, sessions),
                 id: SessionId::from(state.nakode_session_id.clone()),
                 workspace_id: workspace_id.clone(),
                 working_directory: state.working_directory.clone(),
-                title: active_session.title.clone(),
+                title: session_title(state, sessions),
                 active_provider_id: provider_id(&state.backend_provider),
                 active_model_id: state.selected_model.clone().map(ModelId::from),
                 updated_at_ms: 0,
@@ -182,7 +197,7 @@ pub fn bootstrap(
             .collect(),
         settings: settings_view(state, providers),
         sessions: session_summaries,
-        active_session: Some(active_session),
+        active_session: None,
     }
 }
 
@@ -216,15 +231,52 @@ pub(crate) fn model_configuration(
     configuration
 }
 
-fn session_view(
+/// The complete session view, including its recent transcript page.
+#[must_use]
+pub fn session_view(state: &DomainState, revision: u64, sessions: &[SessionRecord]) -> SessionView {
+    projected_session_view(
+        state,
+        revision,
+        sessions,
+        transcript_page(&state.transcript),
+    )
+}
+
+/// The session view with empty transcript pages, for callers that read only status, identity,
+/// interactions, queue or runs. Every other field matches [`session_view`].
+#[must_use]
+pub fn session_overview(
     state: &DomainState,
     revision: u64,
-    workspace_id: &WorkspaceId,
     sessions: &[SessionRecord],
 ) -> SessionView {
+    let transcript = TranscriptPage {
+        prefix_before: String::new(),
+        prefix_through: String::new(),
+        next_before_entry_id: None,
+        entries: Vec::new(),
+        has_earlier: false,
+        stream_active: false,
+        stream_label: String::new(),
+        current_owner_entry: None,
+        current_owner_omitted_tool_calls: 0,
+    };
+    projected_session_view(state, revision, sessions, transcript)
+}
+
+fn projected_session_view(
+    state: &DomainState,
+    revision: u64,
+    sessions: &[SessionRecord],
+    transcript: TranscriptPage,
+) -> SessionView {
+    let workspace_id = workspace_id(&state.workspace);
     let session_id = SessionId::from(state.nakode_session_id.clone());
     let provider = provider_id(&state.backend_provider);
-    let agent_session = agent_session_view(state, &session_id, provider.as_ref());
+    // The agent session and the session share one projected page; projecting it costs a digest
+    // and an audit parse per entry, so it is built once.
+    let agent_session =
+        agent_session_view(state, &session_id, provider.as_ref(), transcript.clone());
     let active_turn = turn_view(state, &session_id, agent_session.as_ref());
     let last_turn = last_turn_view(state, &session_id, agent_session.as_ref());
     let (runs, runs_has_earlier) = run_views(state);
@@ -272,7 +324,7 @@ fn session_view(
         next_turn_configuration_pending: next_turn_configuration_pending(state),
         next_turn_transition: next_turn_transition(state),
         context_usage: context_usage_view(state),
-        transcript: transcript_page(&state.transcript),
+        transcript,
         recoverable_prompt: recoverable_prompt_view(state),
         queue: queue_views(state),
         interactions: interactions(state, revision),
@@ -445,6 +497,7 @@ fn agent_session_view(
     state: &DomainState,
     session_id: &SessionId,
     provider_id: Option<&ProviderId>,
+    transcript: TranscriptPage,
 ) -> Option<AgentSessionView> {
     let provider_id = provider_id?;
     Some(AgentSessionView {
@@ -459,7 +512,7 @@ fn agent_session_view(
         capabilities: capabilities_view(&state.backend_capabilities),
         connection: connection_view(&state.connection),
         native_session_id: state.provider_session_id.clone(),
-        transcript: transcript_page(&state.transcript),
+        transcript,
         usage: token_usage_view(state.provider_usage),
     })
 }
