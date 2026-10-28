@@ -2290,7 +2290,15 @@ impl NakodeClient {
     /// Watches one already-attached logical session. This reconnects transport streams but does not
     /// mutate server attachment state; use [`Self::watch_attached_session`] across service cutovers.
     pub fn watch_session(&self, session_id: impl Into<String>) -> Watch<api::SessionState> {
-        self.watch_session_with_attachment(session_id.into(), None, false, false)
+        self.watch_session_with_attachment(session_id.into(), None, false, false, false)
+    }
+
+    /// Like [`Self::watch_session`], but the server sends only the transcript entries that changed
+    /// after its first snapshot, and this watch rebuilds each complete state from them. Cheaper for
+    /// both sides on long streaming transcripts; servers without the option send complete snapshots.
+    #[must_use]
+    pub fn watch_session_changes(&self, session_id: impl Into<String>) -> Watch<api::SessionState> {
+        self.watch_session_with_attachment(session_id.into(), None, false, false, true)
     }
 
     /// Watches launch-critical replacements without transcript or detail-body hydration.
@@ -2299,7 +2307,7 @@ impl NakodeClient {
         &self,
         session_id: impl Into<String>,
     ) -> Watch<api::SessionState> {
-        self.watch_session_with_attachment(session_id.into(), None, true, false)
+        self.watch_session_with_attachment(session_id.into(), None, true, false, false)
     }
 
     /// Watches complete parent presentation while delegated-run bodies remain demand-loaded.
@@ -2308,7 +2316,7 @@ impl NakodeClient {
         &self,
         session_id: impl Into<String>,
     ) -> Watch<api::SessionState> {
-        self.watch_session_with_attachment(session_id.into(), None, false, true)
+        self.watch_session_with_attachment(session_id.into(), None, false, true, false)
     }
 
     /// Watches one logical session and re-establishes its exact client-owned attachment if a new
@@ -2319,7 +2327,7 @@ impl NakodeClient {
         session_id: impl Into<String>,
         attachment: SessionAttachment,
     ) -> Watch<api::SessionState> {
-        self.watch_session_with_attachment(session_id.into(), Some(attachment), false, false)
+        self.watch_session_with_attachment(session_id.into(), Some(attachment), false, false, false)
     }
 
     /// Watches launch-critical replacements and restores the exact retained attachment after a
@@ -2330,7 +2338,7 @@ impl NakodeClient {
         session_id: impl Into<String>,
         attachment: SessionAttachment,
     ) -> Watch<api::SessionState> {
-        self.watch_session_with_attachment(session_id.into(), Some(attachment), true, false)
+        self.watch_session_with_attachment(session_id.into(), Some(attachment), true, false, false)
     }
 
     /// Watches complete parent presentation and restores the exact retained attachment while child
@@ -2341,15 +2349,17 @@ impl NakodeClient {
         session_id: impl Into<String>,
         attachment: SessionAttachment,
     ) -> Watch<api::SessionState> {
-        self.watch_session_with_attachment(session_id.into(), Some(attachment), false, true)
+        self.watch_session_with_attachment(session_id.into(), Some(attachment), false, true, false)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn watch_session_with_attachment(
         &self,
         session_id: String,
         attachment: Option<SessionAttachment>,
         launch_critical_only: bool,
         parent_presentation_only: bool,
+        transcript_changes: bool,
     ) -> Watch<api::SessionState> {
         let client = self.clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(WATCH_BUFFER);
@@ -2362,16 +2372,33 @@ impl NakodeClient {
                     after: after.clone(),
                     launch_critical_only,
                     parent_presentation_only,
+                    transcript_changes,
                 };
                 match client.transport.clone().watch_session(request).await {
                     Ok(response) => {
                         let mut stream = response.into_inner();
+                        // Transcript changes apply to the previous state on this same stream only.
+                        let mut previous: Option<api::SessionState> = None;
                         while let Some(update) = stream.next().await {
                             match update {
                                 Ok(snapshot) => {
                                     reconnect_reported = false;
                                     after = snapshot.cursor;
-                                    let Some(state) = snapshot.state else {
+                                    let has_changes = snapshot.transcript_changes.is_some();
+                                    let state = match snapshot.state {
+                                        Some(state) => apply_transcript_changes(
+                                            previous.as_ref(),
+                                            state,
+                                            snapshot.transcript_changes,
+                                        ),
+                                        None => None,
+                                    };
+                                    let Some(state) = state else {
+                                        if has_changes {
+                                            // Changes this stream cannot apply: reconnect, which
+                                            // starts again from a complete snapshot.
+                                            break;
+                                        }
                                         if sender
                                             .send(Err(SdkError::MissingState("session")))
                                             .await
@@ -2389,6 +2416,9 @@ impl NakodeClient {
                                             ))))
                                             .await;
                                         return;
+                                    }
+                                    if transcript_changes {
+                                        previous = Some(state.clone());
                                     }
                                     if sender.send(Ok(state)).await.is_err() {
                                         return;
@@ -3305,6 +3335,55 @@ impl NakodeClient {
     }
 }
 
+/// Rebuilds a complete session state from one snapshot of a transcript-changes watch. Without
+/// changes the snapshot is already complete. With them, its entries are only those created or
+/// changed since `previous`, and the window keeps `previous`'s order unless a new one is given.
+/// `None` when the changes cannot be applied to `previous`.
+fn apply_transcript_changes(
+    previous: Option<&api::SessionState>,
+    mut state: api::SessionState,
+    changes: Option<api::TranscriptChanges>,
+) -> Option<api::SessionState> {
+    let Some(changes) = changes else {
+        return Some(state);
+    };
+    let previous_entries = &previous?.transcript.as_ref()?.entries;
+    let transcript = state.transcript.as_mut()?;
+    let sent = std::mem::take(&mut transcript.entries);
+
+    transcript.entries = match changes.order {
+        None => {
+            let mut entries = previous_entries.clone();
+            for entry in sent {
+                // Changes are almost always at the live end of the window.
+                let index = entries.iter().rposition(|held| held.id == entry.id)?;
+                entries[index] = entry;
+            }
+            entries
+        }
+        Some(order) => {
+            let mut sent: HashMap<String, api::TranscriptEntry> = sent
+                .into_iter()
+                .map(|entry| (entry.id.clone(), entry))
+                .collect();
+            let held: HashMap<&str, &api::TranscriptEntry> = previous_entries
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry))
+                .collect();
+            let mut entries = Vec::with_capacity(order.entry_ids.len());
+            for id in &order.entry_ids {
+                let entry = match sent.remove(id) {
+                    Some(entry) => entry,
+                    None => (*held.get(id.as_str())?).clone(),
+                };
+                entries.push(entry);
+            }
+            entries
+        }
+    };
+    Some(state)
+}
+
 #[cfg(test)]
 mod tests {
     mod bridge_adoption;
@@ -3312,6 +3391,7 @@ mod tests {
     mod hydration_cost;
     mod parent_creation;
     mod questions;
+    mod transcript_changes;
     mod transcript_hydration;
     use nakode_telemetry::{RpcLayer, opentelemetry::trace::FutureExt};
     use std::{

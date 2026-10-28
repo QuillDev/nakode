@@ -918,7 +918,8 @@ fn originating_owner_entry(state: &DomainState, run: &SubagentRun) -> Option<Tra
         })
         .map(|entry| {
             let body = bounded_text(&entry.body).value;
-            transcript_entry_view(&state.transcript, entry, &body, false, false)
+            let digest = entry_digest(&state.transcript, entry);
+            transcript_entry_view(&state.transcript, entry, &digest, &body, false, false)
         })
 }
 
@@ -1913,15 +1914,22 @@ pub(crate) fn transcript_entry_body<'a>(
     run_id: Option<&RunId>,
     entry_id: &EntryId,
 ) -> Option<&'a str> {
-    let transcript = match run_id {
-        Some(run_id) => &state.subagent_chats.get(run_id.as_str())?.transcript,
-        None => &state.transcript,
-    };
-    transcript
+    owner_transcript(state, run_id)?
         .entries()
         .iter()
         .find(|entry| entry.id == entry_id.as_str())
         .map(|entry| entry.body.as_str())
+}
+
+/// The session's transcript, or one delegated run's.
+pub(crate) fn owner_transcript<'a>(
+    state: &'a DomainState,
+    run_id: Option<&RunId>,
+) -> Option<&'a DomainTranscript> {
+    match run_id {
+        Some(run_id) => Some(&state.subagent_chats.get(run_id.as_str())?.transcript),
+        None => Some(&state.transcript),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2016,62 +2024,111 @@ fn entry_digest(
 
 /// A proof per visible prefix: each chains the previous one with the next entry's digest, its
 /// image count and its code-mode parent. Only entries that changed are serialized and hashed
-/// again; the chain itself costs one small hash per entry.
+/// again, and the chain is reused up to the first entry changed since it was last proven, so a
+/// streamed token re-proves the tail rather than the whole history.
+/// The digest of each visible entry, in order, from the proof chain. `None` unless the chain covers
+/// every entry, as it does once `transcript_prefixes` has run since the last change.
+fn visible_entry_digests(
+    transcript: &DomainTranscript,
+) -> Option<Vec<std::sync::Arc<crate::domain_transcript::EntryDigest>>> {
+    let entries = transcript.entries();
+    let proven = transcript.proven_chain();
+    if proven.unchanged != entries.len() || proven.steps.len() != entries.len() {
+        return None;
+    }
+    Some(
+        entries
+            .iter()
+            .zip(&proven.steps)
+            .filter(|(entry, _)| visible_transcript_entry(entry))
+            .map(|(_, step)| std::sync::Arc::clone(&step.digest))
+            .collect(),
+    )
+}
+
 fn transcript_prefixes(transcript: &DomainTranscript) -> Option<Vec<String>> {
     use sha2::{Digest, Sha256};
-    let hex = |bytes: &[u8]| {
-        bytes
-            .iter()
-            .fold(String::with_capacity(64), |mut out, byte| {
-                use std::fmt::Write as _;
-                let _ = write!(out, "{byte:02x}");
-                out
-            })
-    };
-    let digests = transcript
-        .entries()
+    let entries = transcript.entries();
+    let mut proven = transcript.proven_chain();
+    let mut reusable = proven.unchanged.min(proven.steps.len()).min(entries.len());
+    proven.steps.truncate(reusable);
+
+    let digests = proven
+        .steps
         .iter()
-        .map(|entry| (entry, entry_digest(transcript, entry)))
+        .map(|step| std::sync::Arc::clone(&step.digest))
+        .chain(
+            entries[reusable..]
+                .iter()
+                .map(|entry| entry_digest(transcript, entry)),
+        )
         .collect::<Vec<_>>();
     transcript.prune_entry_digests();
-    let codemode_tools = digests
+    let codemode_tools = entries
         .iter()
+        .zip(&digests)
         .filter(|(_, digest)| digest.codemode_tool)
-        .map(|(entry, _)| entry.id.as_str())
+        .map(|(entry, _)| entry.id.clone())
         .collect::<std::collections::HashSet<_>>();
+    // Any entry may name a code-mode parent, so a changed set re-proves the whole chain.
+    if codemode_tools != proven.codemode_tools {
+        reusable = 0;
+        proven.steps.clear();
+    }
+
     let mut start = Sha256::new();
     start.update(b"nakode.transcript.prefix.v3");
     start.update([u8::from(transcript.has_earlier_entries())]);
-    let mut current: [u8; 32] = start.finalize().into();
-    let mut prefixes = vec![hex(&current)];
-    for (entry, digest) in digests
-        .iter()
-        .filter(|(entry, _)| visible_transcript_entry(entry))
-    {
-        let mut step = Sha256::new();
-        step.update(current);
-        step.update(digest.content);
-        step.update(
-            u64::try_from(transcript.image_artifacts(entry).count())
-                .ok()?
-                .to_le_bytes(),
-        );
-        match digest
-            .parent_item_id
-            .as_deref()
-            .filter(|parent| codemode_tools.contains(parent))
-        {
-            Some(parent) => {
-                step.update([1]);
-                step.update(u64::try_from(parent.len()).ok()?.to_le_bytes());
-                step.update(parent.as_bytes());
+    let start: [u8; 32] = start.finalize().into();
+    let mut current = proven.steps.last().map_or(start, |step| step.chain);
+    for (entry, digest) in entries[reusable..].iter().zip(&digests[reusable..]) {
+        let mut prefix = None;
+        if visible_transcript_entry(entry) {
+            let mut step = Sha256::new();
+            step.update(current);
+            step.update(digest.content);
+            step.update(
+                u64::try_from(transcript.image_artifacts(entry).count())
+                    .ok()?
+                    .to_le_bytes(),
+            );
+            match digest
+                .parent_item_id
+                .as_deref()
+                .filter(|parent| codemode_tools.contains(*parent))
+            {
+                Some(parent) => {
+                    step.update([1]);
+                    step.update(u64::try_from(parent.len()).ok()?.to_le_bytes());
+                    step.update(parent.as_bytes());
+                }
+                None => step.update([0]),
             }
-            None => step.update([0]),
+            current = step.finalize().into();
+            prefix = Some(hex_digest(&current));
         }
-        current = step.finalize().into();
-        prefixes.push(hex(&current));
+        proven.steps.push(crate::domain_transcript::ProvenStep {
+            digest: std::sync::Arc::clone(digest),
+            chain: current,
+            prefix,
+        });
     }
+    proven.codemode_tools = codemode_tools;
+    proven.unchanged = entries.len();
+
+    let mut prefixes = vec![hex_digest(&start)];
+    prefixes.extend(proven.steps.iter().filter_map(|step| step.prefix.clone()));
     Some(prefixes)
+}
+
+fn hex_digest(bytes: &[u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 fn visible_transcript_entry(entry: &TranscriptEntry) -> bool {
@@ -2098,6 +2155,7 @@ fn aligned_newest_window(len: usize, limit: usize) -> usize {
     len - start
 }
 
+#[allow(clippy::too_many_lines)]
 fn projected_transcript_page(
     transcript: &DomainTranscript,
     before: Option<&EntryId>,
@@ -2150,8 +2208,20 @@ fn projected_transcript_page(
         });
     let mut remaining_body_bytes =
         body_budget.saturating_sub(reserved_owner_body.map_or(0, str::len));
+
+    // Proving the prefixes brings every entry's digest up to date. Reading them from that chain
+    // saves comparing each whole entry against the digest cache again.
+    let prefixes = transcript.cached_prefixes(|| transcript_prefixes(transcript))?;
+    let digests = visible_entry_digests(transcript);
+    let digest_of = |index: usize, entry: &TranscriptEntry| {
+        digests
+            .as_ref()
+            .and_then(|digests| digests.get(index).cloned())
+            .unwrap_or_else(|| entry_digest(transcript, entry))
+    };
+
     let mut projected = Vec::with_capacity(limit.min(entries.len()));
-    for entry in entries[..end].iter().rev().take(limit) {
+    for (index, entry) in entries[..end].iter().enumerate().rev().take(limit) {
         // Tool audit envelopes share the same IPC/memory budget as transcript bodies. Providers bound
         // each payload field before it reaches here; the page keeps an envelope whole so a client is
         // never handed valid-looking partial JSON.
@@ -2174,6 +2244,7 @@ fn projected_transcript_page(
         projected.push(transcript_entry_view(
             transcript,
             entry,
+            &digest_of(index, entry),
             body,
             include_audit,
             include_audit,
@@ -2184,7 +2255,6 @@ fn projected_transcript_page(
     let current_owner_omitted_tool_calls =
         omitted_owner_tool_calls(&entries, current_owner, &projected);
     let start = end - projected.len();
-    let prefixes = transcript.cached_prefixes(|| transcript_prefixes(transcript))?;
     let prefix_before = prefixes.get(start)?.clone();
     let prefix_through = prefixes.get(end)?.clone();
     let next_before_entry_id = (start > 0)
@@ -2250,6 +2320,7 @@ fn projected_current_owner(
                     transcript_entry_view(
                         transcript,
                         entry,
+                        &entry_digest(transcript, entry),
                         reserved_owner_body.unwrap_or(""),
                         false,
                         include_coordination,
@@ -2297,12 +2368,13 @@ fn parent_tool_entry_id(transcript: &DomainTranscript, entry: &TranscriptEntry) 
 fn transcript_entry_view(
     transcript: &DomainTranscript,
     entry: &TranscriptEntry,
+    digest: &crate::domain_transcript::EntryDigest,
     body: &str,
     include_audit: bool,
     include_coordination: bool,
 ) -> TranscriptEntryView {
     let mut view = TranscriptEntryView {
-        body_sha256: entry_digest(transcript, entry).body_sha256.clone(),
+        body_sha256: digest.body_sha256.clone(),
         id: EntryId::from(entry.id.clone()),
         kind: entry_kind(entry.kind),
         title: entry.title.clone(),
@@ -2863,6 +2935,57 @@ mod tests {
         let removed = super::projected_transcript_page(&transcript, Some(before), 3, 1024)
             .expect("removed prefix");
         assert_ne!(removed.prefix_through, changed.prefix_through);
+    }
+
+    #[test]
+    fn reused_prefix_proofs_match_proofs_built_from_scratch() {
+        let mut transcript = DomainTranscript::new(1);
+        for index in 0..40 {
+            transcript.upsert(
+                format!("row-{index}"),
+                EntryKind::Tool,
+                "bash",
+                format!("output {index}"),
+                EntryStatus::Complete,
+            );
+        }
+        // A clone keeps the entries but not the proven chain, so it proves them from scratch.
+        let assert_fresh = |transcript: &DomainTranscript, step: &str| {
+            assert_eq!(
+                super::transcript_prefixes(transcript),
+                super::transcript_prefixes(&transcript.clone()),
+                "{step}"
+            );
+        };
+        assert_fresh(&transcript, "initial");
+        for token in 0..3 {
+            transcript.append_delta("stream", EntryKind::Assistant, "Nakode", "token ");
+            assert_fresh(&transcript, &format!("streamed token {token}"));
+        }
+        transcript.set_status("row-5", EntryStatus::Failed);
+        assert_fresh(&transcript, "edit deep in history");
+        transcript.upsert(
+            "late",
+            EntryKind::Reasoning,
+            "REASONING",
+            "late",
+            EntryStatus::Running,
+        );
+        transcript.move_before("late", "row-10");
+        assert_fresh(&transcript, "move into history");
+        transcript.remove("row-3");
+        assert_fresh(&transcript, "removal");
+        transcript.set_tool_audit(
+            "row-20",
+            Some(r#"{"name":"codemode","parentItemId":null}"#.to_owned()),
+        );
+        transcript.set_tool_audit(
+            "row-30",
+            Some(r#"{"name":"bash","parentItemId":"row-20"}"#.to_owned()),
+        );
+        assert_fresh(&transcript, "code-mode parent");
+        transcript.mark_history_truncated();
+        assert_fresh(&transcript, "truncated history");
     }
 
     #[test]

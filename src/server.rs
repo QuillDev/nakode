@@ -79,6 +79,14 @@ struct PublishedSessionProjection {
     view: SessionView,
     transcript_lengths: HashMap<EntryId, usize>,
     run_transcript_lengths: HashMap<RunId, HashMap<EntryId, usize>>,
+    /// Which publication this is; zero until `track_changes` has run.
+    generation: u64,
+    /// The generation each transcript entry last changed in, aligned with `view.transcript.entries`.
+    entry_generations: Vec<u64>,
+    /// The generation the window's entry order last changed in.
+    order_generation: u64,
+    /// The first generation this session's tracking covers. Older generations get a complete view.
+    tracked_since: u64,
 }
 
 struct PendingPublication {
@@ -111,6 +119,8 @@ pub struct ServerCore {
     command_order: VecDeque<IdempotencyKey>,
     published_workspace: Option<nakode_protocol::BootstrapView>,
     published_sessions: HashMap<SessionId, PublishedSessionProjection>,
+    /// Counts session publications across every session, so a generation is never reused.
+    publication_generation: u64,
     session_histories: session_sync::SessionHistories,
     soul_store: Option<SoulStore>,
 }
@@ -136,6 +146,17 @@ fn retained_entry_digests(session_id: &str) -> crate::domain_transcript::EntryDi
 }
 
 impl ServerCore {
+    /// A new session's engine from the template. Its transcript gets its own digest cache: one
+    /// shared through the template clone is pruned to each session's entries in turn, so streaming
+    /// sessions evicted each other's digests and rehashed their whole history on every token.
+    fn engine_from_template(&self) -> ServiceEngine {
+        let mut state = self.session_template.clone();
+        state
+            .transcript
+            .share_entry_digests(crate::domain_transcript::EntryDigests::default());
+        ServiceEngine::new(state)
+    }
+
     #[must_use]
     pub fn new(
         engine: ServiceEngine,
@@ -160,6 +181,7 @@ impl ServerCore {
             command_order: VecDeque::new(),
             published_workspace: None,
             published_sessions: HashMap::new(),
+            publication_generation: 0,
             session_histories: session_sync::SessionHistories::default(),
             soul_store: SoulStore::user_default().ok(),
         };
@@ -445,11 +467,20 @@ impl ServerCore {
                 let _ = respond.send(result);
                 DispatchOutcome::unchanged()
             }
-            ServerRequest::Subscribe { scope, respond, .. } => {
+            ServerRequest::Subscribe {
+                scope,
+                changes_since,
+                respond,
+                ..
+            } => {
                 let cursor = endpoint.cursor();
-                let result = self
-                    .subscription_view(&scope)
-                    .map(|value| Snapshot { cursor, value });
+                let result = match (&scope, changes_since) {
+                    (SubscriptionScope::Session { session_id }, Some(since)) => self
+                        .session_changes_view(session_id, since)
+                        .map(|view| SubscriptionView::SessionChanges(Box::new(view))),
+                    _ => self.subscription_view(&scope),
+                }
+                .map(|value| Snapshot { cursor, value });
                 let _ = respond.send(result);
                 DispatchOutcome::unchanged()
             }
@@ -1451,7 +1482,7 @@ impl ServerCore {
             .session_template
             .skill_catalogue()
             .without_ids(disabled_skill_ids);
-        let mut engine = ServiceEngine::new(self.session_template.clone());
+        let mut engine = self.engine_from_template();
         engine.state_mut().set_working_directory(working_directory);
         engine.state_mut().set_skill_profile(profile_id);
         engine.state_mut().install_skill_snapshot(skills, None);
@@ -2404,7 +2435,7 @@ impl ServerCore {
             || self.session_template.skill_catalogue(),
             |ids| self.session_template.skill_catalogue().only_ids(ids),
         );
-        let mut engine = ServiceEngine::new(self.session_template.clone());
+        let mut engine = self.engine_from_template();
         engine.state_mut().set_working_directory(working_directory);
         engine.state_mut().set_skill_profile(profile_id);
         engine
@@ -2899,7 +2930,7 @@ impl ServerCore {
     /// Installs the successor for a closed initial session before its engine is removed.
     fn replace_default_session(&mut self) -> Result<(), DomainCommandError> {
         self.refresh_session_template_addenda()?;
-        let mut successor = ServiceEngine::new(self.session_template.clone());
+        let mut successor = self.engine_from_template();
         // `new` clones workspace configuration only in production, but tests and legacy callers may
         // provide a template carrying an old native id. `create_logical_session` clears it; any
         // unsubscribe effect belongs to that template snapshot, not to the fresh successor.
@@ -4010,6 +4041,60 @@ impl ServerCore {
         }
     }
 
+    /// The published session with only the transcript entries changed since generation `since`.
+    /// Reuses the view the last publication already projected instead of projecting the window
+    /// again. Falls back to a complete view when `since` predates this session's tracking, and to
+    /// a freshly projected one (generation zero) when the session changed without publishing.
+    fn session_changes_view(
+        &mut self,
+        session_id: &SessionId,
+        since: u64,
+    ) -> Result<nakode_protocol::SessionChangesView, ServiceError> {
+        let revision = self.engine_for(session_id).map(ServiceEngine::revision);
+        let Some(published) = self
+            .published_sessions
+            .get_mut(session_id)
+            .filter(|published| {
+                published.generation != 0 && Some(published.view.revision) == revision
+            })
+        else {
+            return Ok(nakode_protocol::SessionChangesView {
+                generation: 0,
+                changes: None,
+                session: self.session_view(session_id)?,
+            });
+        };
+
+        // Copy everything but the entries, then only the entries the caller lacks.
+        let entries = std::mem::take(&mut published.view.transcript.entries);
+        let mut session = published.view.clone();
+        published.view.transcript.entries = entries;
+        let entries = &published.view.transcript.entries;
+
+        let changes_only = since != 0 && since >= published.tracked_since;
+        if !changes_only {
+            session.transcript.entries.clone_from(entries);
+            return Ok(nakode_protocol::SessionChangesView {
+                generation: published.generation,
+                changes: None,
+                session,
+            });
+        }
+        session.transcript.entries = entries
+            .iter()
+            .zip(&published.entry_generations)
+            .filter(|(_, generation)| **generation > since)
+            .map(|(entry, _)| entry.clone())
+            .collect();
+        let entry_ids = (published.order_generation > since)
+            .then(|| entries.iter().map(|entry| entry.id.clone()).collect());
+        Ok(nakode_protocol::SessionChangesView {
+            generation: published.generation,
+            changes: Some(nakode_protocol::TranscriptChanges { entry_ids }),
+            session,
+        })
+    }
+
     fn publish_state(&mut self, endpoint: &ServerEndpoint, session_id: &SessionId) {
         let workspace = self.workspace_bootstrap();
         let publications =
@@ -4024,9 +4109,16 @@ impl ServerCore {
 
     fn publish_session_state(&mut self, endpoint: &ServerEndpoint, session_id: &SessionId) {
         let mut publications = Vec::new();
-        if let Some(session) = self.published_session(session_id) {
+        if let Some(mut session) = self.published_session(session_id) {
             let previous = self.published_sessions.get(session_id);
             publications.extend(self.session_publications(previous, &session));
+            self.publication_generation += 1;
+            track_changes(
+                &mut session,
+                previous,
+                &publications,
+                self.publication_generation,
+            );
             // Record the entire authoritative revision before broadcasting any invalidation.
             // Only explicitly established experimental observers retain history. Legacy watches
             // still receive exactly their existing events and replacement snapshots.
@@ -4388,6 +4480,10 @@ impl ServerCore {
             view,
             transcript_lengths: session_transcript_lengths,
             run_transcript_lengths,
+            generation: 0,
+            entry_generations: Vec::new(),
+            order_generation: 0,
+            tracked_since: 0,
         })
     }
 
@@ -5558,13 +5654,101 @@ fn transcript_lengths(
     run_id: Option<&RunId>,
     page: &TranscriptPage,
 ) -> HashMap<EntryId, usize> {
-    page.entries
+    let Some(transcript) = crate::state::projection::owner_transcript(state, run_id) else {
+        return HashMap::new();
+    };
+    let wanted = page
+        .entries
         .iter()
-        .filter_map(|entry| {
-            crate::state::projection::transcript_entry_body(state, run_id, &entry.id)
-                .map(|body| (entry.id.clone(), body.len()))
-        })
-        .collect()
+        .map(|entry| entry.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    // One pass from the newest entry, where a published page lives, instead of a search of the
+    // whole history for each of its entries.
+    let mut lengths = HashMap::with_capacity(wanted.len());
+    for entry in transcript.entries().iter().rev() {
+        if lengths.len() == wanted.len() {
+            break;
+        }
+        if wanted.contains(entry.id.as_str()) {
+            lengths.insert(EntryId::from(entry.id.clone()), entry.body.len());
+        }
+    }
+    lengths
+}
+
+/// Records which transcript entries `publications` changed, so a watch can read only those.
+fn track_changes(
+    current: &mut PublishedSessionProjection,
+    previous: Option<&PublishedSessionProjection>,
+    publications: &[PendingPublication],
+    generation: u64,
+) {
+    current.generation = generation;
+    let entries = &current.view.transcript.entries;
+    let Some(previous) = previous.filter(|previous| previous.generation != 0) else {
+        current.tracked_since = generation;
+        current.order_generation = generation;
+        current.entry_generations = vec![generation; entries.len()];
+        return;
+    };
+    current.tracked_since = previous.tracked_since;
+
+    // The window event is published exactly when the entry order (or its stream flags) changed.
+    let window_changed = publications
+        .iter()
+        .any(|publication| matches!(publication.event, ViewEvent::TranscriptWindowChanged { .. }));
+    if window_changed || previous.entry_generations.len() != entries.len() {
+        current.order_generation = generation;
+        current.entry_generations = carried_generations(previous, entries, generation);
+    } else {
+        current.order_generation = previous.order_generation;
+        current
+            .entry_generations
+            .clone_from(&previous.entry_generations);
+    }
+
+    for publication in publications {
+        let changed = match &publication.event {
+            ViewEvent::TranscriptEntryCreated { entry, .. }
+            | ViewEvent::TranscriptEntryPatched { entry, .. } => &entry.id,
+            ViewEvent::TranscriptEntryDelta { entry_id, .. } => entry_id,
+            _ => continue,
+        };
+        // Changes are almost always at the live end of the window.
+        if let Some(index) = entries.iter().rposition(|entry| &entry.id == changed) {
+            current.entry_generations[index] = generation;
+        }
+    }
+}
+
+/// Entries keep their generations when the window only dropped older entries or appended newer
+/// ones. Any other reordering marks the whole window changed.
+fn carried_generations(
+    previous: &PublishedSessionProjection,
+    entries: &[nakode_protocol::TranscriptEntryView],
+    generation: u64,
+) -> Vec<u64> {
+    let mut generations = vec![generation; entries.len()];
+    let previous_entries = &previous.view.transcript.entries;
+    let Some(first) = entries.first() else {
+        return generations;
+    };
+    let Some(offset) = previous_entries
+        .iter()
+        .position(|entry| entry.id == first.id)
+    else {
+        return generations;
+    };
+    let kept = previous_entries.len() - offset;
+    let kept_in_order = kept <= entries.len()
+        && previous_entries[offset..]
+            .iter()
+            .zip(entries)
+            .all(|(before, after)| before.id == after.id);
+    if kept_in_order {
+        generations[..kept].copy_from_slice(&previous.entry_generations[offset..]);
+    }
+    generations
 }
 
 fn transcript_events(
@@ -13115,5 +13299,136 @@ enabled = false
             .expect("bootstrap query");
         assert!(matches!(response.value, QueryResult::Bootstrap(_)));
         runtime.abort();
+    }
+
+    /// What a watch holds after applying `view` to the entries it held before.
+    fn apply_session_changes(
+        held: &[nakode_protocol::TranscriptEntryView],
+        view: nakode_protocol::SessionChangesView,
+    ) -> Vec<nakode_protocol::TranscriptEntryView> {
+        let sent = view.session.transcript.entries;
+        let Some(changes) = view.changes else {
+            return sent;
+        };
+        let order = changes
+            .entry_ids
+            .unwrap_or_else(|| held.iter().map(|entry| entry.id.clone()).collect());
+        order
+            .iter()
+            .map(|id| {
+                sent.iter()
+                    .chain(held)
+                    .find(|entry| &entry.id == id)
+                    .expect("every ordered entry is changed or held")
+                    .clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn session_changes_rebuild_the_published_window() {
+        type Step = Box<dyn Fn(&mut DomainTranscript)>;
+        use crate::domain_transcript::{DomainTranscript, EntryKind, EntryStatus};
+        let state = AppState::new_unconfigured("/tmp/project", None, 100);
+        let id = SessionId::from(state.nakode_session_id.clone());
+        let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+        let (endpoint, _requests) =
+            ServerEndpoint::channel("test", ServiceCapabilities::default(), 16);
+        let edit = |core: &mut ServerCore, change: &dyn Fn(&mut DomainTranscript)| {
+            change(
+                &mut core
+                    .engine_for_mut(&id)
+                    .expect("engine")
+                    .state_mut()
+                    .transcript,
+            );
+            core.commit_and_publish_session_delta(&endpoint, &id);
+        };
+        edit(&mut core, &|transcript| {
+            for index in 0..300 {
+                transcript.upsert(
+                    format!("tool-{index}"),
+                    EntryKind::Tool,
+                    "bash",
+                    format!("output {index}"),
+                    EntryStatus::Complete,
+                );
+            }
+            transcript.upsert(
+                "stream",
+                EntryKind::Assistant,
+                "Nakode",
+                "Streaming",
+                EntryStatus::Running,
+            );
+        });
+
+        let first = core.session_changes_view(&id, 0).expect("first view");
+        assert!(first.changes.is_none(), "the first view is complete");
+        let mut generation = first.generation;
+        let mut held = first.session.transcript.entries;
+
+        let steps: Vec<(&str, Step)> = vec![
+            (
+                "streamed token",
+                Box::new(|t| t.append_delta("stream", EntryKind::Assistant, "Nakode", " more")),
+            ),
+            (
+                "deep status change",
+                Box::new(|t| t.set_status("tool-250", EntryStatus::Failed)),
+            ),
+            (
+                "appended entry",
+                Box::new(|t| {
+                    t.upsert(
+                        "tool-new",
+                        EntryKind::Tool,
+                        "bash",
+                        "new",
+                        EntryStatus::Running,
+                    );
+                }),
+            ),
+            (
+                "moved entry",
+                Box::new(|t| t.move_before("tool-new", "stream")),
+            ),
+            ("removed entry", Box::new(|t| t.remove("tool-260"))),
+            (
+                "window slides",
+                Box::new(|t| {
+                    for index in 0..100 {
+                        t.push(
+                            EntryKind::Assistant,
+                            "Nakode",
+                            format!("later {index}"),
+                            EntryStatus::Complete,
+                        );
+                    }
+                }),
+            ),
+        ];
+        for (step, change) in steps {
+            edit(&mut core, change.as_ref());
+            let view = core.session_changes_view(&id, generation).expect("changes");
+            assert!(
+                view.changes.is_some(),
+                "{step}: a tracked watch reads changes"
+            );
+            let sent = view.session.transcript.entries.len();
+            generation = view.generation;
+            held = apply_session_changes(&held, view);
+            let expected = core.session_view(&id).expect("view").transcript.entries;
+            assert_eq!(held, expected, "{step}");
+            if step == "streamed token" {
+                assert_eq!(sent, 1, "a token sends only its entry");
+            }
+        }
+
+        let unchanged = core
+            .session_changes_view(&id, generation)
+            .expect("unchanged");
+        assert_eq!(unchanged.generation, generation);
+        assert!(unchanged.session.transcript.entries.is_empty());
     }
 }

@@ -65,6 +65,9 @@ pub enum ServerRequest {
         request_id: RequestId,
         subscription_id: SubscriptionId,
         scope: SubscriptionScope,
+        /// For a session scope, asks for `SubscriptionView::SessionChanges` since this generation
+        /// (zero for a complete first view) instead of a freshly projected session.
+        changes_since: Option<u64>,
         respond: oneshot::Sender<Result<Snapshot<SubscriptionView>, ServiceError>>,
     },
 }
@@ -930,6 +933,32 @@ impl ServerEndpoint {
                 request_id: RequestId::new(uuid::Uuid::now_v7().to_string()),
                 subscription_id: self.next_subscription_id(),
                 scope,
+                changes_since: None,
+                respond,
+            },
+        )
+        .await
+    }
+
+    /// The published session with only the transcript entries changed since `since`, a generation
+    /// from a previous answer (zero for a complete view). Not shared between watches: each holds
+    /// its own generation.
+    pub async fn execute_session_changes_timed(
+        &self,
+        client_id: ClientId,
+        session_id: nakode_protocol::SessionId,
+        since: u64,
+    ) -> TimedServerResponse<Snapshot<SubscriptionView>> {
+        self.submit(
+            &self.inner.subscription_requests,
+            RequestLane::Subscription,
+            |timing, respond| ServerRequest::Subscribe {
+                timing,
+                client_id,
+                request_id: RequestId::new(uuid::Uuid::now_v7().to_string()),
+                subscription_id: self.next_subscription_id(),
+                scope: SubscriptionScope::Session { session_id },
+                changes_since: Some(since),
                 respond,
             },
         )
