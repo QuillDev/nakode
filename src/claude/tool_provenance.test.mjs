@@ -7,6 +7,7 @@ import {
   nativeDelegationDecision,
   preToolUseOutput,
   permissionContext,
+  RUNTIME_INTERRUPTION_NOTICE,
   SDK_CANCELLATION_TEXT,
 } from "./tool_policy.mjs";
 
@@ -219,12 +220,23 @@ test("batch context explains SDK cancellation even before the tool result is del
   const context = f.batch(SDK_CANCELLATION_TEXT).hookSpecificOutput.additionalContext;
   assert.match(context, /"source":"sdk_unknown"/);
   assert.doesNotMatch(context, /"decision":"deny"/);
+  assert.ok(context.startsWith(RUNTIME_INTERRUPTION_NOTICE));
+  assert.match(RUNTIME_INTERRUPTION_NOTICE, /interrupted by the Claude runtime, not by the user/);
   assert.deepEqual(f.batch("clean"), {}); // an ordinary allowed result gets no context
 
+  // A real stop or denial keeps its own provenance and is never relabelled a runtime interruption.
   const stopped = fixture();
   await stopped.authorize();
   await stopped.cancel();
-  assert.match(stopped.batch(SDK_CANCELLATION_TEXT).hookSpecificOutput.additionalContext, /"source":"runtime_interrupt"/);
+  const stopContext = stopped.batch(SDK_CANCELLATION_TEXT).hookSpecificOutput.additionalContext;
+  assert.match(stopContext, /"source":"runtime_interrupt"/);
+  assert.equal(stopContext.includes(RUNTIME_INTERRUPTION_NOTICE), false);
+
+  const denied = fixture();
+  await denied.authorize([]);
+  const denialContext = denied.batch(SDK_CANCELLATION_TEXT).hookSpecificOutput.additionalContext;
+  assert.match(denialContext, /"source":"policy"/);
+  assert.equal(denialContext.includes(RUNTIME_INTERRUPTION_NOTICE), false);
 });
 
 test("refusal fallback retracts a cancelled tool result without attributing a stop", async () => {
@@ -303,7 +315,8 @@ test("a runtime stop during a turn is never reported as unattributed", async () 
 
 // Models Claude Code 2.1.304's observed input lifetime: once the SDK finishes the prompt iterable
 // it closes stdin, and a later hook-gated tool call fails with the generic cancellation text
-// ("Stream closed"). With session state events, `idle` follows only the last background turn.
+// ("Stream closed"). Claude Code reports `idle` at the end of every turn, including the one that
+// leaves a background Bash task running; the task's completion then starts another turn.
 function backgroundTaskSdk(f, { sessionState = true } = {}) {
   const pause = () => new Promise((resolve) => setImmediate(resolve));
   return async function* (prompt) {
@@ -320,9 +333,11 @@ function backgroundTaskSdk(f, { sessionState = true } = {}) {
     yield { type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "ci", task_type: "local_bash" }] };
     yield* toolTurn("first", "gh pr checks 202");
     yield { type: "result", subtype: "success", result: "waiting on CI" };
+    if (sessionState) yield { type: "system", subtype: "session_state_changed", state: "idle" };
     await pause();
     yield { type: "system", subtype: "task_notification", task_id: "ci", status: "completed" };
     yield { type: "system", subtype: "background_tasks_changed", tasks: [] };
+    if (sessionState) yield { type: "system", subtype: "session_state_changed", state: "running" };
     await pause();
     yield* toolTurn("after-notification", "gh pr checks 202");
     yield { type: "result", subtype: "success", result: "checks passed" };
@@ -346,6 +361,26 @@ test("originating path: a background-task turn keeps its tool calls instead of S
   assert.equal(f.inputClosedAtEnd, true); // input still closes once the session is idle
   assert.equal(f.emitted.at(-2).status, "finished");
   assert.equal(f.sdkOptions().env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, "1");
+});
+
+test("a background task that ends without a follow-up turn still lets the turn end", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture();
+  f.useSdk(async function* (prompt) {
+    const iterator = prompt[Symbol.asyncIterator]();
+    await iterator.next();
+    const drained = iterator.next();
+    yield { type: "system", subtype: "session_state_changed", state: "running" };
+    yield { type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "ci", task_type: "local_bash" }] };
+    yield { type: "result", subtype: "success", result: "waiting on CI" };
+    yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    yield { type: "system", subtype: "background_tasks_changed", tasks: [] };
+    await new Promise((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(30_000);
+    await drained;
+  });
+  await f.turn();
+  assert.equal(f.emitted.find((event) => event.event === "turn_completed").status, "finished");
 });
 
 test("without session state the turn still ends, and the cancellation stays attributed as unknown", async () => {

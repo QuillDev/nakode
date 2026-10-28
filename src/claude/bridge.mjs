@@ -1110,7 +1110,7 @@ function unattributedCancellation(turnId, mode) {
   return {
     decision: "unknown",
     source: "sdk_unknown",
-    reason: "Claude SDK reported cancellation, but Nakode received no stop or denial for this call, so it is not an owner stop. Execution outcome is unconfirmed; check whether it took effect before relying on it, and do not replay it automatically.",
+    reason: "Interrupted by the Claude runtime, not by the user: Nakode received no stop or denial for this call. Its effect is unconfirmed; check whether it took effect before retrying it.",
     mode,
   };
 }
@@ -1273,15 +1273,33 @@ function emitStreamEvent(turnId, message, session) {
 // (background Bash, Monitor) can then start another turn in the same process, where every SDK
 // callback, including Nakode's PreToolUse hook, fails with "Stream closed". Claude Code reports
 // that as the generic user-cancellation text, so the agent stops with no owner stop.
-// Streaming input therefore stays open until Claude Code reports the session idle, which it does
-// only after background work can no longer start a turn. A CLI that reports no session state
-// keeps the previous close-at-first-result behaviour rather than risking a turn that never ends.
+// Streaming input therefore stays open until background work can no longer start a turn.
+// Claude Code reports `idle` at the end of every turn, even while a background Bash or Monitor
+// task is still running (only background agents delay it), so `idle` alone is not enough: input
+// closes once the session is idle and no non-ambient background task is live.
+// A CLI that reports no session state keeps the previous close-at-first-result behaviour rather
+// than risking a turn that never ends.
+const BACKGROUND_FOLLOW_UP_GRACE_MS = 30_000;
+
 function turnInput(command) {
   let settle;
   const settled = new Promise((resolve) => {
     settle = resolve;
   });
   let reportsSessionState = false;
+  let idle = false;
+  let liveBackgroundTasks = 0;
+  // A finished task normally starts its follow-up turn at once (`running`). If none starts, the
+  // grace still lets the turn end instead of holding input open forever.
+  let followUpGrace = null;
+  const clearFollowUpGrace = () => {
+    if (followUpGrace !== null) clearTimeout(followUpGrace);
+    followUpGrace = null;
+  };
+  const close = () => {
+    clearFollowUpGrace();
+    settle();
+  };
   const prompt = (async function* () {
     yield {
       type: "user",
@@ -1299,13 +1317,20 @@ function turnInput(command) {
   })();
   return {
     prompt,
-    close: () => settle(),
+    close,
     observe(message) {
       if (message.type === "system" && message.subtype === "session_state_changed") {
         reportsSessionState = true;
-        if (message.state === "idle") settle();
+        idle = message.state === "idle";
+        clearFollowUpGrace();
+        if (idle && liveBackgroundTasks === 0) close();
+      } else if (message.type === "system" && message.subtype === "background_tasks_changed") {
+        liveBackgroundTasks = (message.tasks || []).filter((task) => !task.ambient).length;
+        if (idle && liveBackgroundTasks === 0 && followUpGrace === null) {
+          followUpGrace = setTimeout(close, BACKGROUND_FOLLOW_UP_GRACE_MS);
+        }
       } else if (message.type === "result" && !reportsSessionState) {
-        settle();
+        close();
       }
     },
   };
