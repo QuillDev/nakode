@@ -14,7 +14,7 @@ The server rejects the whole result as invalid when:
 
 ## Retention
 
-Accepted images become one returned transcript image for the call (`ImageReturned`, id `<turn>:image:<call>`, labels `Tool image N`), so clients and history see them like `return_image` output. The per-turn limits of `return_image` still apply: eight images and 20 MiB per turn, counted together. When a result would exceed them, the text result is still delivered with a note that its images were not attached.
+Accepted images become one returned transcript image for the call (`ImageReturned`, id `<turn>:image:<call>`, labels `Tool image N`), so clients and history see them like `return_image` output. The per-turn limits of `return_image` still apply: eight images and 20 MiB per turn, counted together. Past them the images are not kept, and the text result says so; Claude still sees them in that result.
 
 The tool result text gains a short "attached to the assistant transcript" note when images are kept.
 

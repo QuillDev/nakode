@@ -1592,11 +1592,11 @@ fn external_tool_result_payload(command: BackendCommand) -> Value {
 }
 
 /// Retains an external tool result's images for every client, as one reply, under the same
-/// per-turn bounds as `return_image`. Claude itself sees them in the tool result. Returns the
-/// note to append to the result text when they could not be kept.
+/// per-turn bounds as `return_image`. Claude always sees them in the tool result; past those
+/// bounds they are only not kept. Returns the note to append to the result text then.
 async fn retain_external_tool_images(
     call_id: &str,
-    images: &mut Vec<crate::backend::PromptImage>,
+    images: &[crate::backend::PromptImage],
     returned: &mut ReturnedImages,
     events: &mpsc::Sender<BackendEvent>,
 ) -> Option<String> {
@@ -1610,9 +1610,8 @@ async fn retain_external_tool_images(
     if count + images.len() > MAX_IMAGES_PER_TURN
         || bytes.saturating_add(added) > MAX_BYTES_PER_TURN
     {
-        images.clear();
         return Some(
-            "Its images were not attached: this turn already returned the most images it may."
+            "Its images were not kept in the transcript: this turn already kept the most images it may."
                 .to_owned(),
         );
     }
@@ -3338,8 +3337,8 @@ process.stdout.write(output);
         };
 
         track(&mut returned, "live", "turn-1");
-        let mut images = vec![image.clone()];
-        let note = retain_external_tool_images("live", &mut images, &mut returned, &events).await;
+        let images = vec![image.clone()];
+        let note = retain_external_tool_images("live", &images, &mut returned, &events).await;
         assert!(note.is_none());
         let Some(BackendEvent::ImageReturned(retained)) = received.recv().await else {
             panic!("expected a retained image");
@@ -3350,9 +3349,9 @@ process.stdout.write(output);
         track(&mut returned, "interrupted", "turn-2");
         returned.forget_turn_calls("turn-2");
         assert!(returned.external_calls.is_empty());
-        let mut images = vec![image];
+        let images = vec![image];
         let note =
-            retain_external_tool_images("interrupted", &mut images, &mut returned, &events).await;
+            retain_external_tool_images("interrupted", &images, &mut returned, &events).await;
         assert!(note.is_none());
         assert!(received.try_recv().is_err());
     }
