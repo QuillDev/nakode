@@ -1559,6 +1559,8 @@ impl AgentRuntime {
         let mut frame = String::new();
         let deadline = tokio::time::Instant::now() + crate::codemode_worker::EXECUTION_TIMEOUT;
         let mut sequence = 0_usize;
+        // Nested results stay out of model history, so their images travel on this call's result.
+        let mut nested_images = Vec::new();
         let final_result = loop {
             frame.clear();
             let mut limited_output =
@@ -1657,7 +1659,7 @@ impl AgentRuntime {
                             }
                         }
                     };
-                    let executed = tokio::select! {
+                    let mut executed = tokio::select! {
                         result = execution => result?,
                         () = cancellation.cancelled() => {
                             execution_cancellation.cancel();
@@ -1675,6 +1677,7 @@ impl AgentRuntime {
                         failed: executed.failed,
                         invocation_identity: executed.invocation_identity.clone(),
                     };
+                    nested_images.append(&mut executed.images);
                     record_nested_tool_result(session, executed, turn_id, backend_events).await?;
                     let encoded = encode_code_mode_host_response(result.output, result.failed)?;
                     child_input.write_all(&encoded).await.map_err(|error| {
@@ -1711,14 +1714,16 @@ impl AgentRuntime {
         };
         let _ = child.start_kill();
         let _ = child.wait().await;
-        Ok(ExecutedTool::new(
+        let mut executed = ExecutedTool::new(
             "codemode",
             tool_call,
             title,
             final_result,
             started_at_ms,
             duration_ms(started.elapsed()),
-        ))
+        );
+        executed.images = nested_images;
+        Ok(executed)
     }
 
     async fn execute_external_tool(
