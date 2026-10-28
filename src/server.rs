@@ -2770,8 +2770,8 @@ impl ServerCore {
         }
         let engine = self.session_engine_mut(session_id)?;
         engine.state().validate_self_clear(call_id)?;
-        // The authenticated suspended caller is the only permitted active work. Backend teardown
-        // is awaited by the ordinary deletion effect before durable history removal is acknowledged.
+        // The authenticated suspended caller is the only permitted active work. The ordinary deletion
+        // effect detaches its backends before durable history removal and supervises their teardown.
         let mut effects = vec![Effect::ReleaseSessionBackends(session_id.to_string())];
         if *session_id == self.default_session {
             self.replace_default_session()?;

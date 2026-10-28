@@ -583,6 +583,11 @@ impl NativeServerRuntime {
                     Box::pin(nakode_telemetry::operation("nakode.execute", self.handle_request(request)).with_context(context)).await;
                 }
                 _ = self.path_inspections.join_next(), if !self.path_inspections.is_empty() => {}
+                teardown = self.effects.backends.teardowns.join_next(), if !self.effects.backends.teardowns.is_empty() => {
+                    if let Some(Ok(BackendTeardown { label, result: Err(error) })) = teardown {
+                        eprintln!("nakode: backend teardown for {label} was forced: {error}");
+                    }
+                }
                 completion = self.agent_browser_checks.join_next(), if !self.agent_browser_checks.is_empty() => {
                     if let Some(Ok((generation, session_id, status))) = completion
                         && generation == self.agent_browser_check_generation
@@ -2336,33 +2341,26 @@ impl NativeServerRuntime {
             if let Some(service) = &background_tasks {
                 service.begin_owner_deletion(&delete_session_id).await;
             }
-            // Provider tasks can persist native history during their terminal path. Fence and await
-            // every backend before the repository transaction so a successful deletion cannot be
-            // repopulated by a completion racing behind its acknowledgement.
-            if let Err(error) = self.effects.backends.stop_session(&canonical_id).await {
-                match rollback.take() {
-                    Some(rollback) => rollback.restore(&mut self.core),
-                    None => self.accepting_work = false,
-                }
-                self.fail_terminated_session_shells(
-                    &canonical_id,
-                    &terminated_shell_ids,
-                    "session deletion stopped the shell before backend teardown failed",
-                );
-                if let Some(service) = &background_tasks {
-                    service
-                        .finish_owner_deletion(&delete_session_id, false)
-                        .await;
-                }
-                outcome.respond_with_error(ServiceError {
-                    code: ErrorCode::Internal,
-                    message: format!(
-                        "session backends did not stop cleanly; retry the operation: {error}"
-                    ),
-                    retryable: true,
-                });
-                return;
-            }
+            // Detach every backend before the repository transaction so nothing can route to the
+            // session again, then stop them off the actor: waiting here would stall every other
+            // session's queries for the whole grace period. Provider tasks can persist native
+            // history on their terminal path, so the teardown removes what lands after the delete.
+            let native_history = self
+                .effects
+                .persistence
+                .sessions
+                .find(&delete_session_id)
+                .ok()
+                .flatten()
+                .map(|record| {
+                    let mut owned = record.owned_provider_sessions;
+                    owned.push((record.provider, record.provider_session_id));
+                    owned
+                })
+                .unwrap_or_default();
+            self.effects
+                .backends
+                .release_session(&canonical_id, native_history);
             let sessions = &self.effects.persistence.sessions;
             let deletion = if self_clear {
                 sessions.delete_self(&delete_session_id)
@@ -3286,11 +3284,9 @@ impl NativeServerRuntime {
                     // DeleteSession removes a non-default engine before runtime effects execute. Backend
                     // release therefore cannot depend on finding that engine's DomainState; doing so
                     // would discard the shutdown effect and orphan its provider processes.
-                    let _ = self
-                        .effects
+                    self.effects
                         .backends
-                        .stop_session(&nakode_protocol::SessionId::from(id))
-                        .await;
+                        .release_session(&nakode_protocol::SessionId::from(id), Vec::new());
                 }
                 effect => ordinary.push(effect),
             }
@@ -3673,6 +3669,108 @@ struct SessionBackendTasks {
     event_forwarder: tokio::task::JoinHandle<()>,
 }
 
+/// Provider backends removed from the registry, still to be shut down and joined.
+struct DetachedBackends {
+    label: String,
+    commands: Vec<mpsc::Sender<BackendCommand>>,
+    tasks: Vec<SessionBackendTasks>,
+}
+
+impl DetachedBackends {
+    fn new(label: String) -> Self {
+        Self {
+            label,
+            commands: Vec::new(),
+            tasks: Vec::new(),
+        }
+    }
+
+    fn add(
+        &mut self,
+        commands: Option<mpsc::Sender<BackendCommand>>,
+        tasks: Vec<SessionBackendTasks>,
+    ) {
+        self.commands.extend(commands);
+        for tasks in tasks {
+            // The event forwarder can be blocked sending into the runtime actor. Abort it now; the
+            // provider then observes its receiver closing in addition to the explicit Shutdown.
+            tasks.event_forwarder.abort();
+            self.tasks.push(tasks);
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.commands.extend(other.commands);
+        self.tasks.extend(other.tasks);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.commands.is_empty() && self.tasks.is_empty()
+    }
+
+    /// Asks every backend to shut down and joins it. A backend that does not stop within the grace
+    /// period is aborted, which drops its kill-on-drop provider child, and is reported as an error.
+    async fn stop(self) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for commands in self.commands {
+            if tokio::time::timeout(
+                SESSION_BACKEND_STOP_TIMEOUT,
+                commands.send(BackendCommand::Shutdown),
+            )
+            .await
+            .is_err()
+            {
+                failures.push("timed out sending shutdown");
+            }
+        }
+        for mut tasks in self.tasks {
+            if tokio::time::timeout(SESSION_BACKEND_STOP_TIMEOUT, &mut tasks.backend)
+                .await
+                .is_err()
+            {
+                failures.push("a backend did not stop in time and was aborted");
+                tasks.backend.abort();
+                let _ = tasks.backend.await;
+            }
+            let _ = tasks.event_forwarder.await;
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("{}: {}", self.label, failures.join("; ")))
+        }
+    }
+}
+
+/// The outcome of one backend teardown that ran off the runtime actor.
+pub(crate) struct BackendTeardown {
+    pub(crate) label: String,
+    pub(crate) result: Result<(), String>,
+}
+
+/// Removes native transcripts a provider persisted after its session was deleted. A session row
+/// that exists again keeps them.
+fn purge_late_native_history(
+    database: &Path,
+    session_id: &str,
+    native_history: &[(String, String)],
+) -> Result<(), String> {
+    let purge = || -> rusqlite::Result<()> {
+        let connection = rusqlite::Connection::open(database)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        for (provider, provider_session_id) in native_history {
+            connection.execute(
+                "DELETE FROM native_runtime_sessions
+                 WHERE provider = ?1 AND session_id = ?2
+                   AND NOT EXISTS (SELECT 1 FROM sessions WHERE id = ?3)",
+                rusqlite::params![provider, provider_session_id, session_id],
+            )?;
+        }
+        Ok(())
+    };
+    purge().map_err(|error| format!("late native history purge failed: {error}"))
+}
+
 pub(crate) struct BackendRegistry {
     /// Provider-scoped handles own authentication, readiness, and model catalogs.
     pub(crate) commands: HashMap<String, mpsc::Sender<BackendCommand>>,
@@ -3690,7 +3788,7 @@ pub(crate) struct BackendRegistry {
     session_account_cells:
         HashMap<(nakode_protocol::SessionId, String), Arc<std::sync::Mutex<String>>>,
     /// Backend and event-forwarding tasks retained by canonical session/provider identity so a
-    /// destructive delete can await provider termination before removing durable history.
+    /// destructive delete can supervise provider termination; see `release_session`.
     session_tasks: HashMap<(nakode_protocol::SessionId, String), Vec<SessionBackendTasks>>,
     pub(crate) subagent_commands: HashMap<String, mpsc::Sender<BackendCommand>>,
     pub(crate) subagent_providers: HashMap<String, String>,
@@ -3698,6 +3796,8 @@ pub(crate) struct BackendRegistry {
     subagent_accounts: HashMap<String, Option<String>>,
     subagent_parents: HashMap<String, nakode_protocol::SessionId>,
     subagent_tasks: HashMap<String, Vec<SessionBackendTasks>>,
+    /// Supervised backend teardowns running off the runtime actor; see `release_session`.
+    pub(crate) teardowns: tokio::task::JoinSet<BackendTeardown>,
     pub(crate) events: mpsc::Receiver<(BackendSource, BackendEvent)>,
     pub(crate) event_tx: mpsc::Sender<(BackendSource, BackendEvent)>,
     pub(crate) tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -3881,6 +3981,7 @@ impl BackendRegistry {
             codex_test_origin: None,
             subagent_parents: HashMap::new(),
             subagent_tasks: HashMap::new(),
+            teardowns: tokio::task::JoinSet::new(),
             events,
             event_tx: event_tx.clone(),
             tasks: Vec::new(),
@@ -4193,16 +4294,52 @@ impl BackendRegistry {
         }
     }
 
-    /// Shuts down every provider backend supervising one logical session.
+    /// Shuts down every provider backend supervising one logical session and waits for them.
     ///
     /// Keyed on the session alone, across providers: a session may have been served by more than one
     /// adapter over its life, and a delete that left either behind would leave a provider child
     /// writing to history that has gone. Idempotent — a session with no backend attached is the
-    /// normal case for a dead one, and finding nothing to stop is a success.
+    /// normal case for a dead one, and finding nothing to stop is a success. Backends that do not
+    /// stop within the grace period are aborted, which also reports an error.
     pub(crate) async fn stop_session(
         &mut self,
         session_id: &nakode_protocol::SessionId,
     ) -> Result<(), String> {
+        self.detach_session(session_id).stop().await
+    }
+
+    /// Stops one session's backends without waiting for them on the runtime actor.
+    ///
+    /// The backends are detached synchronously, so nothing can route to them again, and a
+    /// supervised teardown task stops them. Its outcome arrives through `teardowns`. When
+    /// `native_history` is given, the task then removes those native transcripts again unless the
+    /// session row has come back: a provider can persist history on its terminal path, after the
+    /// deleting transaction has already removed it.
+    pub(crate) fn release_session(
+        &mut self,
+        session_id: &nakode_protocol::SessionId,
+        native_history: Vec<(String, String)>,
+    ) {
+        let detached = self.detach_session(session_id);
+        let label = detached.label.clone();
+        let session_id = session_id.to_string();
+        let database = self.session_database.clone();
+        self.teardowns.spawn(async move {
+            let mut result = detached.stop().await;
+            if !native_history.is_empty() {
+                let purge = tokio::task::spawn_blocking(move || {
+                    purge_late_native_history(&database, &session_id, &native_history)
+                })
+                .await
+                .unwrap_or_else(|error| Err(format!("native history purge task failed: {error}")));
+                result = result.and(purge);
+            }
+            BackendTeardown { label, result }
+        });
+    }
+
+    /// Removes every backend of one session, and of the subagents it parents, from the registry.
+    fn detach_session(&mut self, session_id: &nakode_protocol::SessionId) -> DetachedBackends {
         let mut keys = self
             .session_commands
             .keys()
@@ -4214,8 +4351,9 @@ impl BackendRegistry {
                 keys.push(key.clone());
             }
         }
+        let mut detached = DetachedBackends::new(format!("session {session_id}"));
         for key in keys {
-            self.stop_session_backend(key).await?;
+            detached.extend(self.detach_session_backend(&key));
         }
         let run_ids = self
             .subagent_parents
@@ -4224,65 +4362,37 @@ impl BackendRegistry {
             .map(|(run_id, _)| run_id.clone())
             .collect::<Vec<_>>();
         for run_id in run_ids {
-            self.stop_subagent(&run_id).await?;
+            detached.extend(self.detach_subagent(&run_id));
         }
-        Ok(())
+        detached
     }
 
     async fn stop_session_backend(
         &mut self,
         key: (nakode_protocol::SessionId, String),
     ) -> Result<(), String> {
-        if let Some(commands) = self.session_commands.get(&key).cloned() {
-            match tokio::time::timeout(
-                SESSION_BACKEND_STOP_TIMEOUT,
-                commands.send(BackendCommand::Shutdown),
-            )
-            .await
-            {
-                Ok(_) => {
-                    self.session_commands.remove(&key);
-                }
-                Err(_) => {
-                    return Err(format!(
-                        "timed out sending shutdown to {} backend for session {}",
-                        key.1, key.0
-                    ));
-                }
-            }
-        }
-        self.session_accounts.remove(&key);
-        self.session_account_cells.remove(&key);
-        let Some(task_sets) = self.session_tasks.remove(&key) else {
-            return Ok(());
-        };
-        let mut task_sets = task_sets.into_iter();
-        while let Some(mut tasks) = task_sets.next() {
-            // The event forwarder can be blocked sending into the runtime that is currently awaiting
-            // this teardown. Abort it first; the provider then observes its receiver closing in
-            // addition to the explicit Shutdown command.
-            tasks.event_forwarder.abort();
-            if tokio::time::timeout(SESSION_BACKEND_STOP_TIMEOUT, &mut tasks.backend)
-                .await
-                .is_err()
-            {
-                let mut retained = vec![tasks];
-                retained.extend(task_sets);
-                self.session_tasks.insert(key.clone(), retained);
-                return Err(format!(
-                    "timed out waiting for {} backend to stop for session {}",
-                    key.1, key.0
-                ));
-            }
-            let _ = tasks.event_forwarder.await;
-        }
-        Ok(())
+        self.detach_session_backend(&key).stop().await
+    }
+
+    fn detach_session_backend(
+        &mut self,
+        key: &(nakode_protocol::SessionId, String),
+    ) -> DetachedBackends {
+        let mut detached =
+            DetachedBackends::new(format!("{} backend for session {}", key.1, key.0));
+        self.session_accounts.remove(key);
+        self.session_account_cells.remove(key);
+        detached.add(
+            self.session_commands.remove(key),
+            self.session_tasks.remove(key).unwrap_or_default(),
+        );
+        detached
     }
 
     /// Drops the join handles of provider-control and subagent supervisors that have already exited.
     ///
-    /// Session handles are retained separately by identity and are removed synchronously by
-    /// `stop_session`, so destructive deletion can await them rather than merely reaping them later.
+    /// Session handles are retained separately by identity and are detached synchronously by
+    /// `release_session`, so destructive deletion can supervise them rather than merely reaping them.
     fn reap_finished_tasks(&mut self) {
         self.tasks.retain(|task| !task.is_finished());
     }
@@ -5158,46 +5268,35 @@ impl BackendRegistry {
         })
     }
 
+    /// Stops one subagent's backend and waits for it; see `stop_session`.
     pub(crate) async fn stop_subagent(&mut self, run_id: &str) -> Result<(), String> {
-        if let Some(commands) = self.subagent_commands.get(run_id).cloned() {
-            match tokio::time::timeout(
-                SESSION_BACKEND_STOP_TIMEOUT,
-                commands.send(BackendCommand::Shutdown),
-            )
-            .await
-            {
-                Ok(_) => {
-                    self.subagent_commands.remove(run_id);
-                }
-                Err(_) => {
-                    return Err(format!("timed out sending shutdown to subagent {run_id}"));
-                }
-            }
+        self.detach_subagent(run_id).stop().await
+    }
+
+    /// Stops one subagent's backend without waiting for it on the runtime actor; see
+    /// `release_session`.
+    pub(crate) fn release_subagent(&mut self, run_id: &str) {
+        let detached = self.detach_subagent(run_id);
+        if detached.is_empty() {
+            return;
         }
-        let Some(task_sets) = self.subagent_tasks.remove(run_id) else {
-            self.subagent_providers.remove(run_id);
-            self.subagent_accounts.remove(run_id);
-            self.subagent_parents.remove(run_id);
-            return Ok(());
-        };
-        let mut task_sets = task_sets.into_iter();
-        while let Some(mut tasks) = task_sets.next() {
-            tasks.event_forwarder.abort();
-            if tokio::time::timeout(SESSION_BACKEND_STOP_TIMEOUT, &mut tasks.backend)
-                .await
-                .is_err()
-            {
-                let mut retained = vec![tasks];
-                retained.extend(task_sets);
-                self.subagent_tasks.insert(run_id.to_owned(), retained);
-                return Err(format!("timed out waiting for subagent {run_id} to stop"));
-            }
-            let _ = tasks.event_forwarder.await;
-        }
+        let label = detached.label.clone();
+        self.teardowns.spawn(async move {
+            let result = detached.stop().await;
+            BackendTeardown { label, result }
+        });
+    }
+
+    fn detach_subagent(&mut self, run_id: &str) -> DetachedBackends {
+        let mut detached = DetachedBackends::new(format!("subagent {run_id}"));
+        detached.add(
+            self.subagent_commands.remove(run_id),
+            self.subagent_tasks.remove(run_id).unwrap_or_default(),
+        );
         self.subagent_providers.remove(run_id);
         self.subagent_accounts.remove(run_id);
         self.subagent_parents.remove(run_id);
-        Ok(())
+        detached
     }
 
     pub(crate) async fn clear_provider_credential(&mut self, provider: &str) -> io::Result<()> {
@@ -5222,7 +5321,7 @@ impl BackendRegistry {
             .map(|(run_id, _)| run_id.clone())
             .collect::<Vec<_>>();
         for run_id in run_ids {
-            let _ = self.stop_subagent(&run_id).await;
+            self.release_subagent(&run_id);
         }
         self.provider_credentials.remove(provider);
         if let Some(account_id) = self.configured_default_account_id(provider) {
@@ -5257,17 +5356,6 @@ impl BackendRegistry {
         for session_id in session_ids {
             let _ = self.stop_session(&session_id).await;
         }
-        // Process shutdown cannot leave a timed-out session task detached. Cancellation drops the
-        // provider future and its supervised child resources even when graceful shutdown did not
-        // finish inside the mutation-oriented deadline.
-        for (_, task_sets) in self.session_tasks.drain() {
-            for tasks in task_sets {
-                tasks.event_forwarder.abort();
-                tasks.backend.abort();
-                let _ = tasks.event_forwarder.await;
-                let _ = tasks.backend.await;
-            }
-        }
         let mut run_ids = self.subagent_commands.keys().cloned().collect::<Vec<_>>();
         for run_id in self.subagent_tasks.keys() {
             if !run_ids.contains(run_id) {
@@ -5277,14 +5365,9 @@ impl BackendRegistry {
         for run_id in run_ids {
             let _ = self.stop_subagent(&run_id).await;
         }
-        for (_, task_sets) in self.subagent_tasks.drain() {
-            for tasks in task_sets {
-                tasks.event_forwarder.abort();
-                tasks.backend.abort();
-                let _ = tasks.event_forwarder.await;
-                let _ = tasks.backend.await;
-            }
-        }
+        // Stopping aborts any backend that outlives its grace period, so no provider child is left
+        // detached. Released backends are bounded the same way; wait for those too.
+        while self.teardowns.join_next().await.is_some() {}
         for task in self.tasks {
             let _ = task.await;
         }
@@ -5350,13 +5433,11 @@ impl EffectExecutor {
                 send_subagent_command(state, &self.backends, pending, &run_id, command).await;
             }
             Effect::StopSubagent(run_id) => {
-                let _ = self.backends.stop_subagent(&run_id).await;
+                self.backends.release_subagent(&run_id);
             }
             Effect::ReleaseSessionBackends(id) => {
-                let _ = self
-                    .backends
-                    .stop_session(&nakode_protocol::SessionId::from(id))
-                    .await;
+                self.backends
+                    .release_session(&nakode_protocol::SessionId::from(id), Vec::new());
             }
             Effect::CompleteAgentRequest { .. } => {
                 // Run completion is projected through RunView.
@@ -11141,7 +11222,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn stalled_backend_teardown_fails_delete_boundedly_and_retry_converges() {
+    async fn stalled_backend_teardown_does_not_block_the_delete_or_other_queries() {
         let workspace = tempfile::tempdir().expect("workspace");
         let (persistence, _credentials) = test_persistence(workspace.path());
         let sessions = Arc::clone(&persistence.sessions);
@@ -11169,13 +11250,15 @@ mod tests {
 
         let (commands, mut command_rx) = mpsc::channel(1);
         let (_event_tx, events) = mpsc::channel(1);
-        let (release, released) = tokio::sync::oneshot::channel();
+        // Acknowledges Shutdown and then never exits, like a provider stuck on its terminal path.
+        let (aborted_tx, aborted) = tokio::sync::oneshot::channel::<()>();
         let stalled_task = tokio::spawn(async move {
+            let _aborted = aborted_tx;
             assert!(matches!(
                 command_rx.recv().await,
                 Some(BackendCommand::Shutdown)
             ));
-            let _ = released.await;
+            std::future::pending::<()>().await;
         });
         let mut registry = empty_registry(workspace.path()).await;
         registry.insert_session(
@@ -11194,58 +11277,55 @@ mod tests {
         );
         let endpoint = handle.endpoint().clone();
         let runtime = tokio::spawn(runtime.run());
-        let key = IdempotencyKey::from("stalled-delete-retry");
         let command = Command::DeleteSession {
             session_id: session_id.clone(),
             parent_fence: None,
         };
 
         let started = Instant::now();
-        let failure = endpoint
-            .execute_command(
-                ClientId::from("stalled-delete-test"),
-                key.clone(),
-                None,
-                false,
-                command.clone(),
-            )
-            .await
-            .expect_err("stalled backend prevents durable deletion");
-        assert_eq!(failure.code, ErrorCode::Internal);
-        assert!(failure.retryable);
-        assert!(failure.message.contains("did not stop cleanly"));
-        assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(
-            sessions
-                .find(session_id.as_str())
-                .expect("durable session lookup")
-                .is_some()
-        );
+        let delete = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move {
+                endpoint
+                    .execute_command(
+                        ClientId::from("stalled-delete-test"),
+                        IdempotencyKey::from("stalled-delete"),
+                        None,
+                        false,
+                        command,
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status_started = Instant::now();
         endpoint
             .execute_query(
                 ClientId::from("stalled-delete-test"),
-                Query::GetSession {
-                    session_id: session_id.clone(),
-                },
+                Query::ListSessionStatuses { limit: 20 },
             )
             .await
-            .expect("runtime continues serving after bounded teardown failure");
-
-        release.send(()).expect("release stalled backend");
-        endpoint
-            .execute_command(
-                ClientId::from("stalled-delete-test"),
-                key,
-                None,
-                false,
-                command,
-            )
+            .expect("status query during teardown");
+        assert!(
+            status_started.elapsed() < Duration::from_secs(1),
+            "an unrelated status query waited {:?} behind backend teardown",
+            status_started.elapsed()
+        );
+        delete
             .await
-            .expect("same-key retry waits for termination and deletes");
+            .expect("delete task")
+            .expect("delete commits without waiting for the backend");
+        assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(
             sessions.find(session_id.as_str()).expect("session lookup"),
             None
         );
+
+        // The supervisor aborts the stalled backend once the grace period runs out.
+        tokio::time::timeout(super::SESSION_BACKEND_STOP_TIMEOUT * 3, aborted)
+            .await
+            .expect("stalled backend is aborted after its grace period")
+            .expect_err("aborting drops the backend future");
 
         handle.shutdown().await;
         runtime.await.expect("runtime task");
@@ -11253,7 +11333,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn session_delete_waits_for_backend_terminal_persistence_before_durable_purge() {
+    async fn session_delete_purges_native_history_persisted_during_backend_teardown() {
         let workspace = tempfile::tempdir().expect("workspace");
         let database = workspace.path().join("sessions.sqlite3");
         let (persistence, _credentials) = test_persistence(workspace.path());
@@ -11389,12 +11469,15 @@ mod tests {
                 },
             )
             .await
-            .expect("delete waits for backend termination then commits");
+            .expect("delete commits");
 
         assert_eq!(
             sessions.find(session_id.as_str()).expect("session lookup"),
             None
         );
+        // Teardown runs off the actor; shutting down waits for it to finish.
+        handle.shutdown().await;
+        runtime.await.expect("runtime task");
         let connection = rusqlite::Connection::open(&database).expect("verification connection");
         let native_rows = |provider_session_id: &str| {
             connection
@@ -11409,16 +11492,13 @@ mod tests {
         assert_eq!(
             native_rows(provider_session_id),
             0,
-            "primary terminal persistence must land before the deleting transaction purges native history"
+            "primary terminal persistence written after the delete must be purged"
         );
         assert_eq!(
             native_rows(subagent_provider_session_id),
             0,
-            "subagent terminal persistence must land before the deleting transaction purges owned native history"
+            "subagent terminal persistence written after the delete must be purged"
         );
-
-        handle.shutdown().await;
-        runtime.await.expect("runtime task");
     }
 
     async fn retained_history_runtime(
