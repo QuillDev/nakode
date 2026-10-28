@@ -73,6 +73,7 @@ async fn returned_image_is_durable_and_does_not_put_bytes_in_provider_tool_outpu
         denied: false,
         denial_reason: None,
         duration_ms: None,
+        images: Vec::new(),
     });
 
     let database = workspace.path().join("history.sqlite");

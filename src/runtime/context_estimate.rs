@@ -33,7 +33,12 @@ pub(super) fn item_tokens(item: &ConversationItem, provider: &str, model: &str) 
 }
 
 fn item_image_tokens(item: &ConversationItem, provider: &str, model: &str) -> usize {
-    let ConversationItem::User { attachments, .. } = item else {
+    let (ConversationItem::User { attachments, .. }
+    | ConversationItem::ToolResult {
+        images: attachments,
+        ..
+    }) = item
+    else {
         return 0;
     };
     attachments
