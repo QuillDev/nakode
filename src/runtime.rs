@@ -76,6 +76,9 @@ pub enum ConversationItem {
         denial_reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        /// Images the tool returned for the model to see, such as a client's screenshot.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<PromptAttachment>,
     },
     Compaction {
         summary: String,
@@ -963,6 +966,7 @@ impl AgentRuntime {
                             "protected finalization reserve denies new tool use".to_owned(),
                         ),
                         duration_ms: Some(0),
+                        images: Vec::new(),
                     });
                 }
                 self.checkpoint(session)?;
@@ -1000,7 +1004,7 @@ impl AgentRuntime {
             session_id: session.id.clone(),
             model: session.model.clone(),
             instructions: session.instructions.clone(),
-            history: session.history.clone(),
+            history: model_history(&session.history),
             tools: if tools_allowed {
                 self.inference_tools(&session.id).await
             } else {
@@ -1555,6 +1559,8 @@ impl AgentRuntime {
         let mut frame = String::new();
         let deadline = tokio::time::Instant::now() + crate::codemode_worker::EXECUTION_TIMEOUT;
         let mut sequence = 0_usize;
+        // Nested results stay out of model history, so their images travel on this call's result.
+        let mut nested_images = Vec::new();
         let final_result = loop {
             frame.clear();
             let mut limited_output =
@@ -1653,7 +1659,7 @@ impl AgentRuntime {
                             }
                         }
                     };
-                    let executed = tokio::select! {
+                    let mut executed = tokio::select! {
                         result = execution => result?,
                         () = cancellation.cancelled() => {
                             execution_cancellation.cancel();
@@ -1671,6 +1677,7 @@ impl AgentRuntime {
                         failed: executed.failed,
                         invocation_identity: executed.invocation_identity.clone(),
                     };
+                    nested_images.append(&mut executed.images);
                     record_nested_tool_result(session, executed, turn_id, backend_events).await?;
                     let encoded = encode_code_mode_host_response(result.output, result.failed)?;
                     child_input.write_all(&encoded).await.map_err(|error| {
@@ -1707,14 +1714,16 @@ impl AgentRuntime {
         };
         let _ = child.start_kill();
         let _ = child.wait().await;
-        Ok(ExecutedTool::new(
+        let mut executed = ExecutedTool::new(
             "codemode",
             tool_call,
             title,
             final_result,
             started_at_ms,
             duration_ms(started.elapsed()),
-        ))
+        );
+        executed.images = nested_images;
+        Ok(executed)
     }
 
     async fn execute_external_tool(
@@ -1761,12 +1770,13 @@ impl AgentRuntime {
             () = cancellation.cancelled() => (crate::tools::ToolResult::failure("external tool call interrupted"), Vec::new()),
         };
         self.external_tools.pending.lock().await.remove(&request_id);
+        let mut model_images = Vec::new();
         if !images.is_empty() {
             let note = match retain_external_tool_images(
                 session,
                 turn_id,
                 &tool_call.id,
-                images,
+                images.clone(),
                 backend_events,
             )
             .await
@@ -1775,15 +1785,62 @@ impl AgentRuntime {
                 Err(error) => format!("Its images were not attached: {error}"),
             };
             result.output = format!("{}\n\n{note}", result.output);
+            model_images = self
+                .show_tool_images_to_model(images, &mut result.output, cancellation)
+                .await;
         }
-        Ok(ExecutedTool::new(
+        let mut executed = ExecutedTool::new(
             runtime_tool_kind(&tool_call.name, true),
             tool_call,
             title,
             result,
             started_at_ms,
             duration_ms(started.elapsed()),
-        ))
+        );
+        executed.images = model_images;
+        Ok(executed)
+    }
+
+    /// Lets the model see a tool's images: directly when it reads images, otherwise through the
+    /// vision add-on's description in the result text. Returns the images to keep on the result.
+    async fn show_tool_images_to_model(
+        &self,
+        images: Vec<crate::backend::PromptImage>,
+        output: &mut String,
+        cancellation: &CancellationToken,
+    ) -> Vec<PromptAttachment> {
+        if self.direct_image_input {
+            return images
+                .into_iter()
+                .enumerate()
+                .map(|(index, image)| PromptAttachment {
+                    label: format!("Tool image {}", index + 1),
+                    path: None,
+                    image: Some(image),
+                })
+                .collect();
+        }
+        let vision_enabled = self
+            .vision_config
+            .as_ref()
+            .is_some_and(|config| config.read().is_ok_and(|config| config.is_enabled()));
+        let description = match (&self.vision, vision_enabled) {
+            (Some(service), true) => service
+                .analyze(
+                    "Describe these tool result images precisely for the coding agent. Focus on visible text, layout, state, errors, and implementation-relevant details.",
+                    images,
+                    cancellation,
+                )
+                .await
+                .map_or_else(
+                    |error| format!("The tool images could not be described: {error}"),
+                    |description| format!("Vision add-on analysis of the tool images:\n{description}"),
+                ),
+            _ => "This model cannot view the tool images.".to_owned(),
+        };
+        output.push_str("\n\n");
+        output.push_str(&description);
+        Vec::new()
     }
 
     async fn execute_read_only_tool(
@@ -1859,6 +1916,49 @@ impl AgentRuntime {
     }
 }
 
+/// The history a provider sees. Providers take images in user messages, not in tool results, so
+/// the images of a run of tool results follow it as one user message.
+fn model_history(history: &[ConversationItem]) -> Vec<ConversationItem> {
+    let mut model = Vec::with_capacity(history.len());
+    let mut sources = Vec::new();
+    let mut images = Vec::new();
+    for item in history {
+        let is_tool_result = matches!(item, ConversationItem::ToolResult { .. });
+        if !is_tool_result && !images.is_empty() {
+            model.push(tool_images_message(&sources, std::mem::take(&mut images)));
+            sources.clear();
+        }
+        let mut item = item.clone();
+        if let ConversationItem::ToolResult {
+            call_id,
+            name,
+            images: returned,
+            ..
+        } = &mut item
+            && !returned.is_empty()
+        {
+            let tool = name.as_deref().unwrap_or("tool");
+            sources.push(format!("{tool} call {call_id} ({} images)", returned.len()));
+            images.append(returned);
+        }
+        model.push(item);
+    }
+    if !images.is_empty() {
+        model.push(tool_images_message(&sources, images));
+    }
+    model
+}
+
+fn tool_images_message(sources: &[String], images: Vec<PromptAttachment>) -> ConversationItem {
+    ConversationItem::User {
+        text: format!(
+            "Images returned by the tool results above, in order: {}.",
+            sources.join(", ")
+        ),
+        attachments: images,
+    }
+}
+
 /// Keeps a client's external tool images as one returned-image reply under the same per-turn
 /// bounds as `return_image`, so every client and later history shows them.
 async fn retain_external_tool_images(
@@ -1927,6 +2027,7 @@ struct ExecutedTool {
     denial_reason: Option<String>,
     started_at_ms: u64,
     duration_ms: u64,
+    images: Vec<PromptAttachment>,
 }
 
 impl ExecutedTool {
@@ -1955,6 +2056,7 @@ impl ExecutedTool {
             denial_reason: None,
             started_at_ms,
             duration_ms,
+            images: Vec::new(),
         }
     }
 
@@ -2274,6 +2376,7 @@ async fn retain_tool_result(
             denied: executed.denied,
             denial_reason: executed.denial_reason,
             duration_ms: Some(executed.duration_ms),
+            images: executed.images,
         });
     }
     Ok(())
@@ -2477,6 +2580,7 @@ impl RuntimeSession {
                 denied: false,
                 denial_reason: None,
                 duration_ms: None,
+                images: Vec::new(),
             });
         }
         self.interrupted_turns.push(InterruptedRuntimeTurn {
@@ -3011,7 +3115,11 @@ fn estimate_history_bytes(history: &[ConversationItem]) -> usize {
 
 fn estimate_item_bytes(item: &ConversationItem) -> usize {
     let image_bytes = match item {
-        ConversationItem::User { attachments, .. } => attachments
+        ConversationItem::User { attachments, .. }
+        | ConversationItem::ToolResult {
+            images: attachments,
+            ..
+        } => attachments
             .iter()
             .filter_map(|attachment| attachment.image.as_ref())
             .map(|image| image.data.len())
@@ -3346,11 +3454,11 @@ mod tests {
         AgentRuntime, ConversationItem, ExecutedTool, InferenceEvent, InferenceFailure,
         InferenceFuture, InferenceOutput, InferenceProvider, InferenceRequest, QuestionBroker,
         RuntimeSession, RuntimeSessionStore, RuntimeToolAudit, ToolCall,
-        encode_code_mode_host_response, normalize_history_item, record_tool_result,
+        encode_code_mode_host_response, model_history, normalize_history_item, record_tool_result,
         runtime_tool_audit,
     };
     use crate::backend::{
-        BackendEvent, CompactionReason, ItemKind, NativeAgentRequest,
+        BackendEvent, CompactionReason, ItemKind, NativeAgentRequest, PromptAttachment,
         ProviderFailureClassification, QuestionOption, QuestionRequest,
     };
     use crate::session::SqliteSessionRepository;
@@ -3486,6 +3594,7 @@ mod tests {
                 denied: false,
                 denial_reason: None,
                 duration_ms: Some(8),
+                images: Vec::new(),
             },
         );
         let restored: serde_json::Value = serde_json::from_str(
@@ -4446,6 +4555,95 @@ mod tests {
             ConversationItem::ToolResult { output, .. }
                 if output == "dashboard result\n\nImage attached to the assistant transcript."
         )));
+        let model = model_history(&session.history);
+        let shown = model.iter().find_map(|item| match item {
+            ConversationItem::User { text, attachments } if text.starts_with("Images returned") => {
+                Some(attachments)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            shown.and_then(|attachments| attachments[0].image.as_ref()),
+            Some(&screenshot)
+        );
+    }
+
+    #[test]
+    fn tool_images_follow_their_whole_run_of_tool_results() {
+        let image = |label: &str| PromptAttachment {
+            label: label.to_owned(),
+            path: None,
+            image: Some(crate::backend::PromptImage {
+                mime_type: "image/png".to_owned(),
+                data: label.as_bytes().to_vec(),
+            }),
+        };
+        let result = |call_id: &str, images: Vec<PromptAttachment>| ConversationItem::ToolResult {
+            call_id: call_id.to_owned(),
+            name: Some("EmbeddedBrowserRun".to_owned()),
+            arguments: None,
+            audit_kind: None,
+            title: None,
+            output: "ok".to_owned(),
+            model_output: None,
+            failed: false,
+            denied: false,
+            denial_reason: None,
+            duration_ms: None,
+            images,
+        };
+        let history = vec![
+            result("a", vec![image("first")]),
+            result("b", Vec::new()),
+            result("c", vec![image("second")]),
+        ];
+
+        let model = model_history(&history);
+
+        assert_eq!(model.len(), 4);
+        assert!(model[..3].iter().all(|item| matches!(
+            item,
+            ConversationItem::ToolResult { images, .. } if images.is_empty()
+        )));
+        let ConversationItem::User { text, attachments } = &model[3] else {
+            panic!("expected the images after the tool results");
+        };
+        assert_eq!(
+            text,
+            "Images returned by the tool results above, in order: EmbeddedBrowserRun call a (1 images), EmbeddedBrowserRun call c (1 images)."
+        );
+        let labels = attachments
+            .iter()
+            .map(|attachment| attachment.label.as_str());
+        assert_eq!(labels.collect::<Vec<_>>(), ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn tool_images_are_named_unseen_for_a_model_without_image_input() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(ExternalToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let vision = Arc::new(std::sync::RwLock::new(
+            crate::vision::VisionConfig::default(),
+        ));
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider)
+            .with_vision(vision, None, false);
+        let mut output = "dashboard result".to_owned();
+        let screenshot = crate::backend::PromptImage {
+            mime_type: "image/png".to_owned(),
+            data: b"\x89PNG\r\n\x1a\nscreenshot".to_vec(),
+        };
+
+        let kept = runtime
+            .show_tool_images_to_model(vec![screenshot], &mut output, &CancellationToken::new())
+            .await;
+
+        assert!(kept.is_empty());
+        assert_eq!(
+            output,
+            "dashboard result\n\nThis model cannot view the tool images."
+        );
     }
 
     #[tokio::test]
@@ -5423,6 +5621,7 @@ mod tests {
                 arguments: None,
                 audit_kind: None,
                 duration_ms: None,
+                images: Vec::new(),
             },
         ];
 
@@ -5628,6 +5827,7 @@ mod tests {
             arguments: None,
             audit_kind: None,
             duration_ms: None,
+            images: Vec::new(),
         });
 
         let history = session.normalized_history();

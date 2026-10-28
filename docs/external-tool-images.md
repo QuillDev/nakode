@@ -21,4 +21,5 @@ The tool result text gains a short "attached to the assistant transcript" note w
 ## Model visibility
 
 - **Claude:** the images also reach the model as MCP image content in the tool result.
-- **Native runtime providers:** tool results are text-only, so the model sees only the note. The images are retained for the owner, but the model cannot inspect them.
+- **Native runtime providers that read images directly (Codex, Kimi, GLM):** the images are kept on the tool result in session history. Providers take images in user messages, not tool results, so each request carries them as one user message right after the run of tool results they came with, naming the calls in order. Context accounting counts them like prompt images, and compaction drops them with the rest of the compacted history.
+- **Native runtime providers without direct image input (Devin):** with the vision add-on configured, its description of the images is appended to the tool result text; otherwise the text says the model cannot view them.

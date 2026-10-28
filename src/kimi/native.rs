@@ -1403,6 +1403,7 @@ mod tests {
                     arguments: None,
                     audit_kind: None,
                     duration_ms: None,
+                    images: Vec::new(),
                 },
             ],
             tools: Vec::new(),

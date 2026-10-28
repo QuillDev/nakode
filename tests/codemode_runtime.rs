@@ -242,14 +242,14 @@ async fn code_mode_worker_composes_native_mutation_client_and_mcp_callbacks() {
                 }
             }
             BackendEvent::ExternalToolRequested(request) => {
-                let output = match request.name.as_str() {
-                    "client_lookup" => "client-result",
-                    "mcp__catalogue__lookup" => "mcp-result",
+                let (output, images) = match request.name.as_str() {
+                    "client_lookup" => ("client-result", vec![screenshot()]),
+                    "mcp__catalogue__lookup" => ("mcp-result", Vec::new()),
                     name => panic!("unexpected external tool request: {name}"),
                 };
                 assert!(
                     runtime
-                        .resolve_external_tool(&request.id, ToolResult::success(output), Vec::new())
+                        .resolve_external_tool(&request.id, ToolResult::success(output), images)
                         .await
                 );
                 callbacks += 1;
@@ -269,8 +269,27 @@ async fn code_mode_worker_composes_native_mutation_client_and_mcp_callbacks() {
             .expect("native mutation output"),
         "native mutation"
     );
-    assert!(session.history.iter().any(|item| matches!(
-        item,
-        ConversationItem::ToolResult { name: Some(name), .. } if name == "codemode"
-    )));
+    assert_outer_result_carries_screenshot(&session);
+}
+
+/// A nested client screenshot reaches the model on the outer Code Mode result.
+fn assert_outer_result_carries_screenshot(session: &RuntimeSession) {
+    let images = session.history.iter().find_map(|item| match item {
+        ConversationItem::ToolResult {
+            name: Some(name),
+            images,
+            ..
+        } if name == "codemode" => Some(images),
+        _ => None,
+    });
+    let images = images.expect("Code Mode result in history");
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].image.as_ref(), Some(&screenshot()));
+}
+
+fn screenshot() -> nakode::backend::PromptImage {
+    nakode::backend::PromptImage {
+        mime_type: "image/png".to_owned(),
+        data: b"\x89PNG\r\n\x1a\nscreenshot".to_vec(),
+    }
 }

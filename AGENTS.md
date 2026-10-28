@@ -187,7 +187,7 @@ Client-owned tools use the session-scoped public external-tool contract. The
 server owns pending calls and turn suspension; clients only execute a call and
 submit its result.
 
-- External tool results may carry up to eight sniffed PNG/JPEG/GIF/WebP images (capability `ExternalToolResultImages`); they are retained as transcript images under `return_image` limits. `docs/external-tool-images.md`.
+- External tool results may carry up to eight sniffed PNG/JPEG/GIF/WebP images (capability `ExternalToolResultImages`); they are retained as transcript images under `return_image` limits, and models see them: Claude as MCP image content, native runtimes as a user message after the tool results (or the vision add-on description when the model has no image input). `docs/external-tool-images.md`.
 
 - Guarded orchestrator `ClearSelf` authenticates its exact pending external call; public `OpenSession` can establish missing profile/bridge intent only on an attached live session without overriding established identity or lifecycle. Individual canonical deletion never detaches retained children. `docs/chat-self-clear.md`.
 
