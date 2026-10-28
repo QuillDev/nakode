@@ -1045,7 +1045,11 @@ message SubmitExternalToolResultRequest {
   string call_id = 3;
   string output = 4;
   bool failed = 5;
+  // Screenshots or other evidence the client attaches to this result. Requires
+  // `ExternalToolResultImages`; the runtime validates, retains and shows them like `return_image`.
+  repeated ExternalToolResultImage images = 6;
 }
+message ExternalToolResultImage { string mime_type = 1; bytes data = 2; }
 
 enum McpSessionSurface {
   MCP_SESSION_SURFACE_UNSPECIFIED = 0;

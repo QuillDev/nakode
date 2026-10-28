@@ -1085,12 +1085,13 @@ impl ServerCore {
                 call_id,
                 output,
                 failed,
+                images,
             } => {
                 self.ensure_session(&session_id)?;
                 let effects = self
                     .session_engine_mut(&session_id)?
                     .state_mut()
-                    .submit_external_tool_result(&call_id, output, failed)?;
+                    .submit_external_tool_result(&call_id, output, failed, images)?;
                 Ok(Self::accepted(Some(session_id.to_string()), effects))
             }
             Command::Delegate {

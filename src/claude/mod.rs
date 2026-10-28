@@ -596,6 +596,13 @@ async fn run_supervisor(
                 // command itself cannot reach the bridge.
                 delegations.observe_command(&command);
                 browser_calls.observe_command(&command);
+                let mut command = command;
+                if let BackendCommand::ResolveExternalTool { id, output, images, .. } = &mut command
+                    && let Some(note) = retain_external_tool_images(id, images, &mut returned_images, &events).await
+                {
+                    output.push_str("\n\n");
+                    output.push_str(&note);
+                }
                 if matches!(command, BackendCommand::Shutdown) {
                     if let Some(task) = authentication_task.take() {
                         task.abort();
@@ -802,6 +809,12 @@ async fn run_supervisor(
                         let _ = send(bridge, json!({"method":"resolve_image_return","id":string(&message, "id"),"output":output,"failed":failed})).await;
                     }
                     continue;
+                }
+                if event_name == Some("external_tool_request") {
+                    returned_images.external_calls.insert(
+                        string(&message, "id"),
+                        (string(&message, "turnId"), string(&message, "model")),
+                    );
                 }
                 if event_name == Some("session_created")
                     && let Some(command) = attachment.take()
@@ -1511,9 +1524,9 @@ fn bridge_request(command: BackendCommand) -> Result<Option<BridgeRequest>, Unsu
                 }
             }),
         ),
-        BackendCommand::ResolveExternalTool { id, output, failed } => (
+        command @ BackendCommand::ResolveExternalTool { .. } => (
             "resolve_external_tool",
-            json!({"id":id,"output":output,"failed":failed}),
+            external_tool_result_payload(command),
         ),
         BackendCommand::ResolveQuestion { .. }
         | BackendCommand::SetSessionCodeMode { .. }
@@ -1539,6 +1552,85 @@ async fn send(bridge: &mut Bridge, value: Value) -> Result<(), String> {
 #[derive(Default)]
 struct ReturnedImages {
     turns: HashMap<String, (usize, usize)>,
+    /// Pending external tool calls by bridge id: their turn and model, for any images they return.
+    external_calls: HashMap<String, (String, String)>,
+}
+
+/// An external tool result for the bridge. Claude sees its images as MCP image content.
+fn external_tool_result_payload(command: BackendCommand) -> Value {
+    use base64::Engine as _;
+    let BackendCommand::ResolveExternalTool {
+        id,
+        output,
+        failed,
+        images,
+    } = command
+    else {
+        unreachable!("only external tool results have this payload");
+    };
+    let images: Vec<Value> = images
+        .iter()
+        .map(|image| {
+            json!({
+                "data": base64::engine::general_purpose::STANDARD.encode(&image.data),
+                "mimeType": image.mime_type,
+            })
+        })
+        .collect();
+    json!({"id": id, "output": output, "failed": failed, "images": images})
+}
+
+/// Retains an external tool result's images for every client, as one reply, under the same
+/// per-turn bounds as `return_image`. Claude itself sees them in the tool result. Returns the
+/// note to append to the result text when they could not be kept.
+async fn retain_external_tool_images(
+    call_id: &str,
+    images: &mut Vec<crate::backend::PromptImage>,
+    returned: &mut ReturnedImages,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Option<String> {
+    use crate::tools::return_image::{MAX_BYTES_PER_TURN, MAX_IMAGES_PER_TURN};
+    let (turn_id, model_id) = returned.external_calls.remove(call_id)?;
+    if images.is_empty() {
+        return None;
+    }
+    let (count, bytes) = returned.turns.get(&turn_id).copied().unwrap_or_default();
+    let added: usize = images.iter().map(|image| image.data.len()).sum();
+    if count + images.len() > MAX_IMAGES_PER_TURN
+        || bytes.saturating_add(added) > MAX_BYTES_PER_TURN
+    {
+        images.clear();
+        return Some(
+            "Its images were not attached: this turn already returned the most images it may."
+                .to_owned(),
+        );
+    }
+    returned
+        .turns
+        .insert(turn_id.clone(), (count + images.len(), bytes + added));
+    let mut attachments =
+        images
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, image)| crate::backend::PromptAttachment {
+                label: format!("Tool image {}", index + 1),
+                path: None,
+                image: Some(image),
+            });
+    let first = attachments.next()?;
+    let image = crate::runtime::ReturnedImage {
+        id: format!("{turn_id}:image:{call_id}"),
+        turn_id,
+        provider_id: CLAUDE_PROVIDER.to_owned(),
+        model_id,
+        history_index: 0,
+        sequence: count,
+        attachment: first,
+        more_attachments: attachments.collect(),
+    };
+    let _ = events.send(BackendEvent::ImageReturned(image)).await;
+    None
 }
 
 /// Claude's `return_image`: the bridge names a file, and Nakode reads, validates and attaches it
@@ -3318,11 +3410,19 @@ process.stdout.write(output);
             id: "external-1".to_owned(),
             output: "ticket".to_owned(),
             failed: false,
+            images: vec![crate::backend::PromptImage {
+                mime_type: "image/png".to_owned(),
+                data: vec![1, 2, 3],
+            }],
         })
         .expect("Claude supports external tool results")
         .expect("bridge request");
         assert_eq!(resolve.method, "resolve_external_tool");
         assert_eq!(resolve.payload["id"], "external-1");
+        assert_eq!(
+            resolve.payload["images"],
+            json!([{"data": "AQID", "mimeType": "image/png"}])
+        );
         assert!(capabilities().external_tools.is_supported());
         assert!(BRIDGE_SOURCE.contains("createSdkMcpServer"));
         assert!(BRIDGE_SOURCE.contains("event: \"external_tool_request\""));

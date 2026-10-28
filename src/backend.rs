@@ -1183,6 +1183,8 @@ pub enum BackendCommand {
         id: String,
         output: String,
         failed: bool,
+        /// Validated client images; the adapter retains them and shows them to the model when it can.
+        images: Vec<PromptImage>,
     },
     Shutdown,
 }

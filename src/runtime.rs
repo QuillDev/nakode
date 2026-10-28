@@ -337,10 +337,12 @@ struct ExternalToolConfiguration {
 #[derive(Default)]
 struct ExternalToolBroker {
     sessions: tokio::sync::Mutex<std::collections::HashMap<String, ExternalToolConfiguration>>,
-    pending: tokio::sync::Mutex<
-        std::collections::HashMap<String, tokio::sync::oneshot::Sender<crate::tools::ToolResult>>,
-    >,
+    pending: tokio::sync::Mutex<std::collections::HashMap<String, ExternalToolResolution>>,
 }
+
+/// A client's answer to one external call: its result and any images it attached.
+type ExternalToolResolution =
+    tokio::sync::oneshot::Sender<(crate::tools::ToolResult, Vec<crate::backend::PromptImage>)>;
 
 pub type InferenceFuture<'a> =
     Pin<Box<dyn Future<Output = Result<InferenceOutput, InferenceFailure>> + Send + 'a>>;
@@ -532,13 +534,18 @@ impl AgentRuntime {
         Ok(())
     }
 
-    pub async fn resolve_external_tool(&self, id: &str, result: crate::tools::ToolResult) -> bool {
+    pub async fn resolve_external_tool(
+        &self,
+        id: &str,
+        result: crate::tools::ToolResult,
+        images: Vec<crate::backend::PromptImage>,
+    ) -> bool {
         self.external_tools
             .pending
             .lock()
             .await
             .remove(id)
-            .is_some_and(|sender| sender.send(result).is_ok())
+            .is_some_and(|sender| sender.send((result, images)).is_ok())
     }
 
     async fn inference_tools(&self, session_id: &str) -> Vec<DynamicToolDefinition> {
@@ -1712,7 +1719,7 @@ impl AgentRuntime {
 
     async fn execute_external_tool(
         &self,
-        session: &RuntimeSession,
+        session: &mut RuntimeSession,
         turn_id: &str,
         tool_call: ToolCall,
         backend_events: &mpsc::Sender<BackendEvent>,
@@ -1749,12 +1756,26 @@ impl AgentRuntime {
             .send(BackendEvent::ExternalToolRequested(request))
             .await
             .map_err(|_| "backend event receiver closed".to_owned())?;
-        let result = tokio::select! {
+        let (mut result, images) = tokio::select! {
             result = result_rx => result.map_err(|_| "external tool result was dismissed".to_owned())?,
-            () = cancellation.cancelled() => crate::tools::ToolResult::failure("external tool call interrupted"),
+            () = cancellation.cancelled() => (crate::tools::ToolResult::failure("external tool call interrupted"), Vec::new()),
         };
         self.external_tools.pending.lock().await.remove(&request_id);
-        let _ = session;
+        if !images.is_empty() {
+            let note = match retain_external_tool_images(
+                session,
+                turn_id,
+                &tool_call.id,
+                images,
+                backend_events,
+            )
+            .await
+            {
+                Ok(count) => crate::tools::return_image::returned_images_output(count),
+                Err(error) => format!("Its images were not attached: {error}"),
+            };
+            result.output = format!("{}\n\n{note}", result.output);
+        }
         Ok(ExecutedTool::new(
             runtime_tool_kind(&tool_call.name, true),
             tool_call,
@@ -1836,6 +1857,58 @@ impl AgentRuntime {
             duration_ms(started.elapsed()),
         ))
     }
+}
+
+/// Keeps a client's external tool images as one returned-image reply under the same per-turn
+/// bounds as `return_image`, so every client and later history shows them.
+async fn retain_external_tool_images(
+    session: &mut RuntimeSession,
+    turn_id: &str,
+    call_id: &str,
+    images: Vec<crate::backend::PromptImage>,
+    backend_events: &mpsc::Sender<BackendEvent>,
+) -> Result<usize, String> {
+    use crate::tools::return_image::{MAX_BYTES_PER_TURN, MAX_IMAGES_PER_TURN};
+    let turn_images = session
+        .returned_images
+        .values()
+        .filter(|image| image.turn_id == turn_id)
+        .collect::<Vec<_>>();
+    let returned: usize = turn_images.iter().map(|image| image.image_count()).sum();
+    if returned + images.len() > MAX_IMAGES_PER_TURN {
+        return Err("at most eight images may be returned per turn".to_owned());
+    }
+    let retained_bytes: usize = turn_images.iter().map(|image| image.image_bytes()).sum();
+    let added: usize = images.iter().map(|image| image.data.len()).sum();
+    if retained_bytes.saturating_add(added) > MAX_BYTES_PER_TURN {
+        return Err("returned images exceed 20 MiB per turn".to_owned());
+    }
+    let count = images.len();
+    let mut attachments = images
+        .into_iter()
+        .enumerate()
+        .map(|(index, image)| PromptAttachment {
+            label: format!("Tool image {}", index + 1),
+            path: None,
+            image: Some(image),
+        });
+    let first = attachments.next().ok_or("no image to return")?;
+    let image = ReturnedImage {
+        id: format!("{turn_id}:image:{call_id}"),
+        turn_id: turn_id.to_owned(),
+        provider_id: session.provider_id.clone(),
+        model_id: session.model.clone(),
+        history_index: session.history_position(),
+        sequence: session.returned_images.len(),
+        attachment: first,
+        more_attachments: attachments.collect(),
+    };
+    backend_events
+        .send(BackendEvent::ImageReturned(image.clone()))
+        .await
+        .map_err(|_| "session event receiver closed".to_owned())?;
+    session.returned_images.insert(call_id.to_owned(), image);
+    Ok(count)
 }
 
 struct ExecutedTool {
@@ -3623,7 +3696,7 @@ mod tests {
                 }
                 assert!(request.history.iter().any(|item| matches!(
                     item,
-                    ConversationItem::ToolResult { output, failed: false, .. } if output == "dashboard result"
+                    ConversationItem::ToolResult { output, failed: false, .. } if output.starts_with("dashboard result")
                 )));
                 Ok(InferenceOutput {
                     text: "done".to_owned(),
@@ -4009,6 +4082,7 @@ mod tests {
                                 .resolve_external_tool(
                                     &request.id,
                                     crate::tools::ToolResult::success(format!("{name}-result")),
+                                    Vec::new(),
                                 )
                                 .await
                         );
@@ -4243,11 +4317,11 @@ mod tests {
             request.arguments_json,
             r#"{"stageId":"33333333-3333-4333-8333-333333333333"}"#
         );
-        assert!(
-            runtime
-                .resolve_external_tool(&request.id, ToolResult::success("dashboard result"))
-                .await
-        );
+        let dashboard = ToolResult::success("dashboard result");
+        let resolved = runtime
+            .resolve_external_tool(&request.id, dashboard, Vec::new())
+            .await;
+        assert!(resolved);
         let (session, result) = turn.await.expect("turn task");
         result.expect("turn completes");
         let tool_result = session
@@ -4284,6 +4358,94 @@ mod tests {
             session.history.last(),
             Some(ConversationItem::Assistant { text, .. }) if text == "done"
         ));
+    }
+
+    #[tokio::test]
+    async fn external_tool_result_images_are_retained_for_the_transcript() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let provider = Arc::new(ExternalToolProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = AgentRuntime::new(directory.path().to_path_buf(), provider);
+        let session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        runtime
+            .configure_external_tools(
+                &session.id,
+                vec![nakode_protocol::ExternalToolDefinition {
+                    name: "MoveAssociatedTicketToStage".to_owned(),
+                    description: "Move the attached ticket to an exact authoritative stage id."
+                        .to_owned(),
+                    input_schema_json: json!({
+                        "type": "object",
+                        "properties": { "stageId": { "type": "string", "format": "uuid" } },
+                        "required": ["stageId"],
+                        "additionalProperties": false
+                    })
+                    .to_string(),
+                }],
+                true,
+                false,
+                None,
+                None,
+                0,
+                None,
+            )
+            .await
+            .expect("tool configuration");
+        let (events, mut receiver) = mpsc::channel(32);
+        let running = runtime.clone();
+        let turn = tokio::spawn(async move {
+            let mut session = session;
+            let result = running
+                .run_turn(
+                    &mut session,
+                    "turn-images",
+                    "Look.".to_owned(),
+                    Vec::new(),
+                    &events,
+                    CancellationToken::new(),
+                )
+                .await;
+            (session, result)
+        });
+        let request = loop {
+            if let BackendEvent::ExternalToolRequested(request) =
+                receiver.recv().await.expect("external tool request")
+            {
+                break request;
+            }
+        };
+        let screenshot = crate::backend::PromptImage {
+            mime_type: "image/png".to_owned(),
+            data: b"\x89PNG\r\n\x1a\nscreenshot".to_vec(),
+        };
+        assert!(
+            runtime
+                .resolve_external_tool(
+                    &request.id,
+                    ToolResult::success("dashboard result"),
+                    vec![screenshot.clone()],
+                )
+                .await
+        );
+        let returned = loop {
+            if let BackendEvent::ImageReturned(image) =
+                receiver.recv().await.expect("returned image")
+            {
+                break image;
+            }
+        };
+        assert_eq!(returned.turn_id, "turn-images");
+        assert_eq!(returned.attachment.image.as_ref(), Some(&screenshot));
+
+        let (session, result) = turn.await.expect("turn task");
+        result.expect("turn completes");
+        assert_eq!(session.returned_images.len(), 1);
+        assert!(session.history.iter().any(|item| matches!(
+            item,
+            ConversationItem::ToolResult { output, .. }
+                if output == "dashboard result\n\nImage attached to the assistant transcript."
+        )));
     }
 
     #[tokio::test]

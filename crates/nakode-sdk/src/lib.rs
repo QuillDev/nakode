@@ -1585,6 +1585,41 @@ impl NakodeClient {
                 call_id,
                 output: output.into(),
                 failed,
+                images: Vec::new(),
+            }
+        )
+    }
+
+    /// Resolves one external tool request with images the runtime retains like `return_image`.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error; servers without `ExternalToolResultImages`
+    /// are refused before any mutation is sent.
+    pub async fn submit_external_tool_result_with_images(
+        &self,
+        session_id: impl Into<String>,
+        call_id: impl Into<String>,
+        output: impl Into<String>,
+        failed: bool,
+        images: Vec<api::ExternalToolResultImage>,
+        expected_revision: Option<u64>,
+    ) -> Result<api::MutationResult, SdkError> {
+        if !images.is_empty() {
+            self.require_capability("ExternalToolResultImages").await?;
+        }
+        let session_id = session_id.into();
+        let call_id = call_id.into();
+        let options = external_tool_result_mutation(&session_id, &call_id, expected_revision);
+        send_mutation!(
+            self,
+            submit_external_tool_result,
+            api::SubmitExternalToolResultRequest {
+                mutation: Some(options),
+                session_id,
+                call_id,
+                output: output.into(),
+                failed,
+                images,
             }
         )
     }

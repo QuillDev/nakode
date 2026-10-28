@@ -21,6 +21,8 @@ pub enum ServiceCapability {
     /// Bounded, parent-authorized transcript image discovery and retrieval in this runtime.
     ChildMaterials,
     ExternalTools,
+    /// `SubmitExternalToolResult` accepts bounded images that are retained like `return_image`.
+    ExternalToolResultImages,
     /// `CreateSession` and `OpenSession` atomically install client-owned tools before provider work.
     InitialSessionTools,
     /// Session tool configuration supports canonical builtin allowlists and provider projection validation.

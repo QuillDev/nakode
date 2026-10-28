@@ -189,6 +189,13 @@ pub struct ExternalToolDefinition {
     pub input_schema_json: String,
 }
 
+/// An image a client attaches to its external tool result. Validated and retained by the runtime.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExternalToolResultImage {
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionToolConfiguration {
     pub tools: Vec<ExternalToolDefinition>,
@@ -566,6 +573,8 @@ pub enum Command {
         call_id: String,
         output: String,
         failed: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ExternalToolResultImage>,
     },
     Delegate {
         session_id: SessionId,
