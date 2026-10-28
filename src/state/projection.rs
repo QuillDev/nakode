@@ -1866,10 +1866,15 @@ fn interaction_option(id: &str, label: &str) -> InteractionOptionView {
 }
 
 fn transcript_page(transcript: &DomainTranscript) -> TranscriptPage {
+    let visible = transcript
+        .entries()
+        .iter()
+        .filter(|entry| visible_transcript_entry(entry))
+        .count();
     projected_transcript_page(
         transcript,
         None,
-        MAX_TRANSCRIPT_SNAPSHOT_ENTRIES,
+        aligned_newest_window(visible, MAX_TRANSCRIPT_SNAPSHOT_ENTRIES),
         MAX_TRANSCRIPT_SNAPSHOT_BODY_BYTES,
     )
     .expect("an unbounded recent transcript page always exists")
@@ -2064,6 +2069,23 @@ fn visible_transcript_entry(entry: &TranscriptEntry) -> bool {
         .key
         .as_deref()
         .is_some_and(|key| key.starts_with("subagent:"))
+}
+
+/// Clients page older history backward from a window's first entry, typically this many entries at
+/// a time.
+const TRANSCRIPT_WINDOW_ALIGNMENT: usize = 64;
+
+/// How many of `len` entries the live session snapshot holds so that it starts on a multiple of
+/// [`TRANSCRIPT_WINDOW_ALIGNMENT`]. A window that slid by one entry per append moved its start, and
+/// every page boundary behind it, to positions a client held no prefix proof for, so the client
+/// re-read all of history for each new entry. Aligned, the start and the boundaries behind it stay
+/// put until a whole page of entries has been appended.
+fn aligned_newest_window(len: usize, limit: usize) -> usize {
+    if len <= limit || limit <= TRANSCRIPT_WINDOW_ALIGNMENT {
+        return limit;
+    }
+    let start = (len - limit).div_ceil(TRANSCRIPT_WINDOW_ALIGNMENT) * TRANSCRIPT_WINDOW_ALIGNMENT;
+    len - start
 }
 
 fn projected_transcript_page(
@@ -2831,6 +2853,54 @@ mod tests {
         let removed = super::projected_transcript_page(&transcript, Some(before), 3, 1024)
             .expect("removed prefix");
         assert_ne!(removed.prefix_through, changed.prefix_through);
+    }
+
+    #[test]
+    fn newest_window_keeps_its_history_boundary_while_entries_are_appended() {
+        let mut transcript = DomainTranscript::new(1);
+        let push = |transcript: &mut DomainTranscript, index: usize| {
+            transcript.upsert(
+                format!("row-{index}"),
+                EntryKind::Assistant,
+                "Nakode",
+                format!("row-{index}"),
+                EntryStatus::Complete,
+            );
+        };
+        for index in 0..300 {
+            push(&mut transcript, index);
+        }
+        let page = super::transcript_page(&transcript);
+        // 300 entries: the window starts at entry 64 rather than 44.
+        assert_eq!(page.entries.len(), 236);
+        assert_eq!(page.entries[0].body, "row-64");
+        let older = super::projected_transcript_page(
+            &transcript,
+            page.next_before_entry_id.as_ref(),
+            64,
+            1 << 20,
+        )
+        .expect("older page");
+        assert_eq!(older.prefix_through, page.prefix_before);
+        assert!(older.next_before_entry_id.is_none());
+
+        // Appending keeps the boundary a client already proved, until a whole page is appended.
+        push(&mut transcript, 300);
+        let appended = super::transcript_page(&transcript);
+        assert_eq!(appended.prefix_before, page.prefix_before);
+        for index in 301..365 {
+            push(&mut transcript, index);
+        }
+        let advanced = super::transcript_page(&transcript);
+        assert_eq!(advanced.entries[0].body, "row-128");
+        let bridge = super::projected_transcript_page(
+            &transcript,
+            advanced.next_before_entry_id.as_ref(),
+            64,
+            1 << 20,
+        )
+        .expect("bridging page");
+        assert_eq!(bridge.prefix_before, page.prefix_before);
     }
 
     #[test]
