@@ -231,4 +231,24 @@ pub enum SubscriptionView {
     Workspace(Box<BootstrapView>),
     Session(Box<SessionView>),
     Run(Box<RunView>),
+    SessionChanges(Box<SessionChangesView>),
+}
+
+/// A published session view whose transcript may hold only the entries changed since a watch's
+/// previous generation, so a streaming token never costs the whole window.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionChangesView {
+    /// Pass back as the next `changes_since`. Zero means nothing to continue from: the next read is
+    /// complete again.
+    pub generation: u64,
+    /// Present when `session.transcript.entries` holds only the entries created or changed since
+    /// the requested generation. Absent means the transcript is complete.
+    pub changes: Option<TranscriptChanges>,
+    pub session: SessionView,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TranscriptChanges {
+    /// The complete window order, when it changed since the requested generation.
+    pub entry_ids: Option<Vec<crate::EntryId>>,
 }

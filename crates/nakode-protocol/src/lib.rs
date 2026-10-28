@@ -54,9 +54,9 @@ pub use mcp::{
 };
 pub use service::{
     BridgeContinuationDisposition, CommandAccepted, Cursor, ManageableSkillView, QueryResult,
-    ServiceCapabilities, ServiceCapability, SessionInventory, SessionStatusInventory,
-    SkillCatalogueView, Snapshot, SoulDocumentView, SubscriptionScope, SubscriptionView,
-    WorkspacePathInspectionView,
+    ServiceCapabilities, ServiceCapability, SessionChangesView, SessionInventory,
+    SessionStatusInventory, SkillCatalogueView, Snapshot, SoulDocumentView, SubscriptionScope,
+    SubscriptionView, TranscriptChanges, WorkspacePathInspectionView,
 };
 pub use view::{
     AgentBrowserView, AgentDefinitionView, AgentSessionView, ArtifactView, BootstrapView,

@@ -100,6 +100,45 @@ pub struct DomainTranscript {
     prefix_fingerprints: OnceLock<Option<Vec<String>>>,
     /// Per-entry digests behind those proofs, reused while an entry is unchanged.
     entry_digests: EntryDigests,
+    /// The proof chain last computed, reused up to the first entry changed since.
+    proven: ProvenChainCell,
+}
+
+/// The prefix proof chain as last computed, kept across mutations. Each mutator lowers `unchanged`
+/// to the first entry it touched, so a streamed token re-proves only the tail of a long history
+/// instead of comparing and re-chaining every entry.
+#[derive(Default)]
+pub(crate) struct ProvenChain {
+    /// Leading entries no mutation has touched since `steps` was recorded.
+    pub unchanged: usize,
+    /// One step per entry, in transcript order.
+    pub steps: Vec<ProvenStep>,
+    /// The code-mode tool ids the steps were chained against.
+    pub codemode_tools: HashSet<String>,
+}
+
+pub(crate) struct ProvenStep {
+    pub digest: Arc<EntryDigest>,
+    /// The chain after this entry; an entry that is not visible leaves it unchanged.
+    pub chain: [u8; 32],
+    /// The proof after this entry, present only for visible entries.
+    pub prefix: Option<String>,
+}
+
+/// A clone starts without a proven chain and proves its first read from scratch.
+#[derive(Default)]
+struct ProvenChainCell(Mutex<ProvenChain>);
+
+impl Clone for ProvenChainCell {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for ProvenChainCell {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProvenChainCell")
+    }
 }
 
 /// What an entry contributes to transcript proofs, derived from the entry alone.
@@ -143,14 +182,17 @@ impl EntryDigests {
     }
 
     fn retain(&self, entries: &[TranscriptEntry]) {
+        let mut cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        // Entry ids are unique, so a cache no larger than the transcript has nothing to forget
+        // unless it lost entries it never computed; either way skipping costs only memory.
+        if cache.len() <= entries.len() {
+            return;
+        }
         let live = entries
             .iter()
             .map(|entry| entry.id.as_str())
             .collect::<HashSet<_>>();
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|id, _| live.contains(id.as_str()));
+        cache.retain(|id, _| live.contains(id.as_str()));
     }
 }
 
@@ -167,6 +209,7 @@ impl DomainTranscript {
             history_retention: HistoryRetention::Complete,
             prefix_fingerprints: OnceLock::new(),
             entry_digests: EntryDigests::default(),
+            proven: ProvenChainCell::default(),
         }
     }
 
@@ -200,13 +243,39 @@ impl DomainTranscript {
         self.entry_digests = digests;
     }
 
+    /// The proof chain as last computed, for the prefix proof computation alone to update.
+    pub(crate) fn proven_chain(&self) -> std::sync::MutexGuard<'_, ProvenChain> {
+        self.proven.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records a mutation: proofs for entries before `index` still hold.
+    fn changed_from(&mut self, index: usize) {
+        self.prefix_fingerprints.take();
+        let proven = self
+            .proven
+            .0
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        proven.unchanged = proven.unchanged.min(index);
+    }
+
+    /// Records a mutation of `key`'s entry; an unknown key changes no existing entry.
+    fn changed_at_key(&mut self, key: &str) {
+        let index = self
+            .item_indices
+            .get(key)
+            .copied()
+            .unwrap_or(self.entries.len());
+        self.changed_from(index);
+    }
+
     #[must_use]
     pub const fn has_earlier_entries(&self) -> bool {
         matches!(self.history_retention, HistoryRetention::Truncated)
     }
 
     pub fn mark_history_truncated(&mut self) {
-        self.prefix_fingerprints.take();
+        self.changed_from(0);
         self.history_retention = HistoryRetention::Truncated;
     }
 
@@ -242,7 +311,7 @@ impl DomainTranscript {
     }
 
     pub fn set_images(&mut self, key: impl Into<String>, images: Vec<ImageData>) {
-        self.prefix_fingerprints.take();
+        self.changed_from(0);
         let multiple = images.len() > 1;
         self.set_labeled_images(
             key,
@@ -266,7 +335,7 @@ impl DomainTranscript {
         key: impl Into<String>,
         local_files: Vec<(String, String)>,
     ) {
-        self.prefix_fingerprints.take();
+        self.changed_from(0);
         let key = key.into();
         if local_files.is_empty() {
             self.local_files.remove(&key);
@@ -285,7 +354,7 @@ impl DomainTranscript {
         key: impl Into<String>,
         images: Vec<(String, ImageData)>,
     ) {
-        self.prefix_fingerprints.take();
+        self.changed_from(0);
         let key = key.into();
         if images.is_empty() {
             self.images.remove(&key);
@@ -316,7 +385,7 @@ impl DomainTranscript {
     }
 
     pub(crate) fn restore_images(&mut self, images: Vec<StoredTranscriptImage>) {
-        self.prefix_fingerprints.take();
+        self.changed_from(0);
         for image in images {
             self.images
                 .entry(image.entry_key)
@@ -329,7 +398,7 @@ impl DomainTranscript {
     }
 
     pub fn clear(&mut self) {
-        self.prefix_fingerprints.take();
+        self.changed_from(0);
         self.entries.clear();
         self.item_indices.clear();
         self.images.clear();
@@ -339,7 +408,7 @@ impl DomainTranscript {
     }
 
     pub fn set_stream_active(&mut self, active: bool) {
-        self.prefix_fingerprints.take();
+        self.changed_from(0);
         self.stream_state = if active {
             StreamState::Active
         } else {
@@ -348,14 +417,17 @@ impl DomainTranscript {
     }
 
     pub fn set_stream_label(&mut self, label: impl Into<String>) {
-        self.prefix_fingerprints.take();
+        self.changed_from(0);
         self.stream_label = label.into();
     }
 
     /// Restores one already-normalized durable entry without minting a new identity or dropping
     /// provider attribution and structured tool-audit evidence.
     pub fn restore(&mut self, entry: TranscriptEntry) {
-        self.prefix_fingerprints.take();
+        match entry.key.as_deref() {
+            Some(key) => self.changed_at_key(key),
+            None => self.changed_from(self.entries.len()),
+        }
         if let Some(key) = entry.key.as_ref()
             && let Some(index) = self.item_indices.get(key).copied()
         {
@@ -370,7 +442,7 @@ impl DomainTranscript {
     }
 
     pub(crate) fn set_coordination(&mut self, prompt_id: &str, json: Option<&str>) {
-        self.prefix_fingerprints.take();
+        self.changed_at_key(&format!("user:{prompt_id}"));
         if let Some(index) = self.item_indices.get(&format!("user:{prompt_id}")) {
             self.entries[*index].coordination_json = json.map(str::to_owned);
         }
@@ -383,7 +455,7 @@ impl DomainTranscript {
         body: impl Into<String>,
         status: EntryStatus,
     ) {
-        self.prefix_fingerprints.take();
+        self.changed_from(self.entries.len());
         self.entries.push(TranscriptEntry {
             coordination_json: None,
             id: uuid::Uuid::now_v7().to_string(),
@@ -405,7 +477,7 @@ impl DomainTranscript {
 
     /// Stable query cursors for evidence rebuilt without attaching a live engine.
     pub(crate) fn retain_entry_ids(&mut self, session_id: &str) {
-        self.prefix_fingerprints.take();
+        self.changed_from(0);
         for (index, entry) in self.entries.iter_mut().enumerate() {
             entry.id = format!(
                 "retained:{session_id}:{}",
@@ -425,8 +497,8 @@ impl DomainTranscript {
         body: impl Into<String>,
         status: EntryStatus,
     ) {
-        self.prefix_fingerprints.take();
         let key = key.into();
+        self.changed_at_key(&key);
         if let Some(index) = self.item_indices.get(&key).copied() {
             let entry = &mut self.entries[index];
             entry.kind = kind;
@@ -463,8 +535,8 @@ impl DomainTranscript {
         title: impl Into<String>,
         delta: &str,
     ) {
-        self.prefix_fingerprints.take();
         let key = key.into();
+        self.changed_at_key(&key);
         if let Some(index) = self.item_indices.get(&key).copied() {
             let entry = &mut self.entries[index];
             entry.body.push_str(delta);
@@ -493,14 +565,14 @@ impl DomainTranscript {
     }
 
     pub fn set_created_at_ms(&mut self, key: &str, created_at_ms: Option<u64>) {
-        self.prefix_fingerprints.take();
+        self.changed_at_key(key);
         if let Some(index) = self.item_indices.get(key).copied() {
             self.entries[index].created_at_ms = created_at_ms;
         }
     }
 
     pub fn set_origin(&mut self, key: &str, provider_id: Option<&str>, model_id: Option<&str>) {
-        self.prefix_fingerprints.take();
+        self.changed_at_key(key);
         if let Some(index) = self.item_indices.get(key).copied() {
             let entry = &mut self.entries[index];
             if entry.provider_id.is_none() {
@@ -518,7 +590,7 @@ impl DomainTranscript {
         reasoning_effort: Option<&str>,
         fast_mode: bool,
     ) {
-        self.prefix_fingerprints.take();
+        self.changed_at_key(key);
         if let Some(index) = self.item_indices.get(key).copied() {
             let entry = &mut self.entries[index];
             entry.reasoning_effort = reasoning_effort.map(str::to_owned);
@@ -533,7 +605,7 @@ impl DomainTranscript {
         reasoning_effort: Option<&str>,
         fast_mode: bool,
     ) {
-        self.prefix_fingerprints.take();
+        self.changed_at_key(key);
         if let Some(index) = self.item_indices.get(key).copied() {
             let entry = &mut self.entries[index];
             if entry.owner_turn_id.is_none() {
@@ -545,7 +617,7 @@ impl DomainTranscript {
     }
 
     pub fn set_source_transport(&mut self, key: &str, source_transport: Option<&str>) {
-        self.prefix_fingerprints.take();
+        self.changed_at_key(key);
         if let Some(index) = self.item_indices.get(key).copied() {
             let entry = &mut self.entries[index];
             if entry.source_transport.is_none() {
@@ -555,7 +627,7 @@ impl DomainTranscript {
     }
 
     pub fn set_source_transport_for_user_turn(&mut self, turn_id: &str, source_transport: &str) {
-        self.prefix_fingerprints.take();
+        self.changed_from(0);
         for entry in &mut self.entries {
             if entry.kind == EntryKind::User
                 && entry.owner_turn_id.as_deref() == Some(turn_id)
@@ -577,7 +649,7 @@ impl DomainTranscript {
     }
 
     pub fn set_tool_audit(&mut self, key: &str, audit_json: Option<String>) {
-        self.prefix_fingerprints.take();
+        self.changed_at_key(key);
         if let Some(index) = self.item_indices.get(key).copied()
             && audit_json.is_some()
         {
@@ -588,14 +660,14 @@ impl DomainTranscript {
     }
 
     pub fn set_status(&mut self, key: &str, status: EntryStatus) {
-        self.prefix_fingerprints.take();
+        self.changed_at_key(key);
         if let Some(index) = self.item_indices.get(key).copied() {
             self.entries[index].status = status;
         }
     }
 
     pub fn finish_running_entry(&mut self, key: &str, status: EntryStatus) {
-        self.prefix_fingerprints.take();
+        self.changed_at_key(key);
         if let Some(index) = self.item_indices.get(key).copied()
             && self.entries[index].status == EntryStatus::Running
         {
@@ -604,7 +676,7 @@ impl DomainTranscript {
     }
 
     pub fn replace_body(&mut self, key: &str, body: &str, status: EntryStatus) {
-        self.prefix_fingerprints.take();
+        self.changed_at_key(key);
         if let Some(index) = self.item_indices.get(key).copied() {
             body.clone_into(&mut self.entries[index].body);
             self.entries[index].status = status;
@@ -612,7 +684,8 @@ impl DomainTranscript {
     }
 
     pub fn move_before(&mut self, key: &str, anchor: &str) {
-        self.prefix_fingerprints.take();
+        // The entry moves up to its anchor, the first position this changes.
+        self.changed_at_key(anchor);
         let Some(index) = self.item_indices.get(key).copied() else {
             return;
         };
@@ -628,7 +701,7 @@ impl DomainTranscript {
     }
 
     pub fn remove(&mut self, key: &str) {
-        self.prefix_fingerprints.take();
+        self.changed_at_key(key);
         let Some(index) = self.item_indices.get(key).copied() else {
             return;
         };
@@ -637,7 +710,7 @@ impl DomainTranscript {
     }
 
     pub fn finish_running(&mut self, status: EntryStatus) {
-        self.prefix_fingerprints.take();
+        self.changed_from(0);
         for entry in &mut self.entries {
             if entry.status == EntryStatus::Running {
                 entry.status = status;
@@ -647,6 +720,7 @@ impl DomainTranscript {
     }
 
     fn reindex(&mut self) {
+        // Indices only; the entries and their proofs are unchanged.
         self.prefix_fingerprints.take();
         self.item_indices.clear();
         for (index, entry) in self.entries.iter().enumerate() {

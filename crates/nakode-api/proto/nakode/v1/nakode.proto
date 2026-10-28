@@ -953,8 +953,24 @@ message WatchSessionRequest {
   optional Cursor after = 2;
   bool launch_critical_only = 3;
   bool parent_presentation_only = 4;
+  // Opt in to transcript changes: after a complete first snapshot, a snapshot may carry
+  // `transcript_changes` and only the entries created or changed since the previous snapshot.
+  // Ignored with launch_critical_only or parent_presentation_only, which stay complete.
+  bool transcript_changes = 5;
 }
-message SessionSnapshot { Cursor cursor = 1; SessionState state = 2; }
+message SessionSnapshot {
+  Cursor cursor = 1;
+  SessionState state = 2;
+  // Present only on watches that opted in. Then `state.transcript.entries` holds just the entries
+  // created or changed since the previous snapshot on this stream; every other field is complete.
+  // Absent means `state` is a complete replacement.
+  optional TranscriptChanges transcript_changes = 3;
+}
+message TranscriptChanges {
+  // The complete window order, present only when it changed since the previous snapshot.
+  optional TranscriptOrder order = 1;
+}
+message TranscriptOrder { repeated string entry_ids = 1; }
 
 message PromptInput { string text = 1; repeated PromptAttachment attachments = 2; }
 message PromptAttachment {

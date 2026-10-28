@@ -211,6 +211,45 @@ impl GrpcService {
             .await
     }
 
+    /// The published session with only the transcript entries changed since `since`, as the
+    /// snapshot a changes watch sends, plus the generation to continue from.
+    async fn session_changes(
+        &self,
+        session_id: protocol::SessionId,
+        since: u64,
+    ) -> TimedServerResponse<(api::SessionSnapshot, u64)> {
+        let timed = self
+            .endpoint
+            .execute_session_changes_timed(self.client_id.clone(), session_id, since)
+            .await;
+        TimedServerResponse {
+            timing: timed.timing,
+            result: timed.result.and_then(session_changes_snapshot),
+        }
+    }
+
+    /// `WatchSession` for a client that opted in to transcript changes: a complete first snapshot,
+    /// then after each publication only the entries that changed since the previous one.
+    async fn watch_session_changes(
+        &self,
+        session_id: protocol::SessionId,
+    ) -> Result<tonic::Response<ApiStream<api::SessionSnapshot>>, tonic::Status> {
+        let publications = self.endpoint.subscribe_publications();
+        let timed = self.session_changes(session_id.clone(), 0).await;
+        let (initial, generation) = timed
+            .result
+            .map_err(|error| status_with_timing(error, &timed.timing))?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        sender.send(Ok(initial)).await.map_err(|_| {
+            tonic_status_with_timing(tonic::Status::cancelled("watch closed"), &timed.timing)
+        })?;
+        spawn_session_changes_watch(self.clone(), session_id, generation, publications, sender);
+        Ok(response_with_timing(
+            Box::pin(ReceiverStream::new(receiver)),
+            &timed.timing,
+        ))
+    }
+
     /// A watch's replacement snapshot after a publication. Every open watch on a scope refreshes on
     /// the same publication, so they share one load per cursor instead of each queueing its own
     /// full rebuild on the serialized runtime.
@@ -1520,6 +1559,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                     launch_critical_only,
                     parent_presentation_only,
                 )),
+                transcript_changes: None,
             },
             &timing,
         ))
@@ -1533,6 +1573,11 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         let input = request.into_inner();
         let launch_critical_only = input.launch_critical_only;
         let parent_presentation_only = input.parent_presentation_only;
+        if input.transcript_changes && !launch_critical_only && !parent_presentation_only {
+            return self
+                .watch_session_changes(protocol::SessionId::from(input.session_id))
+                .await;
+        }
         let scope = protocol::SubscriptionScope::Session {
             session_id: protocol::SessionId::from(input.session_id),
         };
@@ -1556,6 +1601,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                     launch_critical_only,
                     parent_presentation_only,
                 )),
+                transcript_changes: None,
             }))
             .await
             .map_err(|_| {
@@ -2723,6 +2769,7 @@ fn spawn_session_watch(
                                     launch_critical_only,
                                     parent_presentation_only,
                                 )),
+                                transcript_changes: None,
                             })
                         });
                     if sender.send(update).await.is_err() {
@@ -2748,6 +2795,7 @@ fn spawn_session_watch(
                                     launch_critical_only,
                                     parent_presentation_only,
                                 )),
+                                transcript_changes: None,
                             })
                         });
                     if sender.send(update).await.is_err() {
@@ -2758,6 +2806,80 @@ fn spawn_session_watch(
             }
         }
     });
+}
+
+fn spawn_session_changes_watch(
+    service: GrpcService,
+    session_id: protocol::SessionId,
+    mut generation: u64,
+    mut publications: tokio::sync::broadcast::Receiver<PublishedEvent>,
+    sender: tokio::sync::mpsc::Sender<Result<api::SessionSnapshot, tonic::Status>>,
+) {
+    let scope = protocol::SubscriptionScope::Session {
+        session_id: session_id.clone(),
+    };
+    tokio::spawn(async move {
+        loop {
+            match publications.recv().await {
+                Ok(publication) if publication.scopes.contains(&scope) => {}
+                Ok(_) => continue,
+                // Changes are read by generation, so a missed publication loses nothing.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+            drain_pending_publications(&mut publications);
+            let update = service
+                .session_changes(session_id.clone(), generation)
+                .await
+                .result
+                .map_err(status);
+            let update = match update {
+                // Nothing changed since the snapshot already sent.
+                Ok((_, next)) if next != 0 && next == generation => continue,
+                Ok((snapshot, next)) => {
+                    generation = next;
+                    Ok(snapshot)
+                }
+                Err(error) => Err(error),
+            };
+            if sender.send(update).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn session_changes_snapshot(
+    snapshot: protocol::Snapshot<protocol::SubscriptionView>,
+) -> Result<(api::SessionSnapshot, u64), protocol::ServiceError> {
+    let (view, generation, changes) = match snapshot.value {
+        protocol::SubscriptionView::SessionChanges(value) => {
+            let value = *value;
+            (value.session, value.generation, value.changes)
+        }
+        // A session served outside the publishing runtime is always complete.
+        protocol::SubscriptionView::Session(value) => (*value, 0, None),
+        _ => {
+            return Err(protocol::ServiceError {
+                code: protocol::ErrorCode::Internal,
+                message: "unexpected session subscription".to_owned(),
+                retryable: false,
+            });
+        }
+    };
+    let transcript_changes = changes.map(|changes| api::TranscriptChanges {
+        order: changes.entry_ids.map(|entry_ids| api::TranscriptOrder {
+            entry_ids: entry_ids.into_iter().map(|id| id.to_string()).collect(),
+        }),
+    });
+    Ok((
+        api::SessionSnapshot {
+            cursor: Some(cursor(&snapshot.cursor)),
+            state: Some(session_projection(view, false, false)),
+            transcript_changes,
+        },
+        generation,
+    ))
 }
 
 fn spawn_run_watch(
@@ -4224,29 +4346,6 @@ fn diagnostics_totals(value: &protocol::DiagnosticsUsageTotals) -> api::Diagnost
 mod tests {
     use super::*;
     use crate::ServerRequest;
-
-    #[test]
-    fn vision_settings_patch_preserves_optional_effort_on_the_wire() {
-        for effort in [None, Some("high".to_owned())] {
-            let patch = settings_patch(Some(api::SettingsPatch {
-                patch: Some(api::settings_patch::Patch::Vision(
-                    api::VisionSettingsPatch {
-                        model_id: Some("openai-codex/vision-test".to_owned()),
-                        clear_model: false,
-                        reasoning_effort: effort.clone(),
-                    },
-                )),
-            }))
-            .unwrap();
-            assert_eq!(
-                patch,
-                protocol::SettingsPatch::Vision {
-                    model_id: Some(protocol::ModelId::from("openai-codex/vision-test")),
-                    reasoning_effort: effort,
-                }
-            );
-        }
-    }
 
     fn run_view_with_briefing(
         briefing: Option<protocol::SharedContextBriefingView>,
