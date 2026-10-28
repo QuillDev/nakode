@@ -211,11 +211,17 @@ impl GrpcService {
             .await
     }
 
+    /// A watch's replacement snapshot after a publication. Every open watch on a scope refreshes on
+    /// the same publication, so they share one load per cursor instead of each queueing its own
+    /// full rebuild on the serialized runtime.
     async fn subscription(
         &self,
         scope: protocol::SubscriptionScope,
     ) -> Result<protocol::Snapshot<protocol::SubscriptionView>, tonic::Status> {
-        self.subscription_timed(scope).await.result.map_err(status)
+        self.endpoint
+            .execute_subscription(self.client_id.clone(), scope)
+            .await
+            .map_err(status)
     }
 }
 
@@ -4651,6 +4657,38 @@ mod tests {
             panic!("watch must fail");
         };
         assert_timing_metadata(error.metadata(), "subscription");
+    }
+
+    #[tokio::test]
+    async fn concurrent_watch_refreshes_of_one_scope_share_one_runtime_load() {
+        let (endpoint, mut requests) =
+            ServerEndpoint::channel("test", protocol::ServiceCapabilities::default(), 8);
+        let service = GrpcService::new(endpoint);
+        let scope = protocol::SubscriptionScope::Session {
+            session_id: protocol::SessionId::from("session"),
+        };
+        let refreshes =
+            futures_util::future::join_all((0..4).map(|_| service.subscription(scope.clone())));
+        let reply = async {
+            let ServerRequest::Subscribe { respond, .. } =
+                requests.recv().await.expect("one refresh request")
+            else {
+                panic!("expected subscription request");
+            };
+            let _ = respond.send(Err(protocol::ServiceError {
+                code: protocol::ErrorCode::Internal,
+                message: "refresh failed".to_owned(),
+                retryable: true,
+            }));
+        };
+        // Unshared refreshes would each queue a request that is never answered here.
+        let (refreshes, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(refreshes, reply)
+        })
+        .await
+        .expect("every refresh shares the one answered load");
+
+        assert!(refreshes.iter().all(Result::is_err));
     }
 
     #[test]
