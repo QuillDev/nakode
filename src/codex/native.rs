@@ -1018,7 +1018,12 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                 runtime.resolve_question(&id, answer).await;
             }
         }
-        BackendCommand::ResolveExternalTool { id, output, failed } => {
+        BackendCommand::ResolveExternalTool {
+            id,
+            output,
+            failed,
+            images,
+        } => {
             if let Some(runtime) = context.runtime {
                 runtime
                     .resolve_external_tool(
@@ -1028,6 +1033,7 @@ async fn handle_command(command: BackendCommand, context: &mut CommandContext<'_
                             failed,
                             invocation_identity: None,
                         },
+                        images,
                     )
                     .await;
             }

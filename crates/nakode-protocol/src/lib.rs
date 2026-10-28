@@ -31,9 +31,10 @@ mod view;
 
 pub use command::{
     AgentDefinitionInput, ClientContext, Command, CredentialInput, DeletionParentFence,
-    ExternalToolDefinition, ImageCrop, ImageTransform, InteractionResolution, ModelOptions,
-    ModelTarget, PromptAttachment, PromptInput, Query, QuestionResponse, RunTextField,
-    SessionBridgeIntent, SessionToolConfiguration, SettingsPatch, TranscriptOwner,
+    ExternalToolDefinition, ExternalToolResultImage, ImageCrop, ImageTransform,
+    InteractionResolution, ModelOptions, ModelTarget, PromptAttachment, PromptInput, Query,
+    QuestionResponse, RunTextField, SessionBridgeIntent, SessionToolConfiguration, SettingsPatch,
+    TranscriptOwner,
 };
 pub use diagnostics::{
     DiagnosticsDailyUsage, DiagnosticsReport, DiagnosticsSessionUsage, DiagnosticsToolUsage,

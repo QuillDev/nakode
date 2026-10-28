@@ -3085,6 +3085,7 @@ impl NativeServerRuntime {
             id: call_id.to_owned(),
             output,
             failed,
+            images: Vec::new(),
         };
         match source {
             BackendSource::Primary {
@@ -3584,6 +3585,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::MultipleClients,
             ServiceCapability::ArtifactTransfer,
             ServiceCapability::ExternalTools,
+            ServiceCapability::ExternalToolResultImages,
             ServiceCapability::InitialSessionTools,
             ServiceCapability::BuiltinToolAllowlists,
             ServiceCapability::CodeMode,
@@ -9284,7 +9286,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), commands.recv())
                 .await
                 .expect("backend callback deadline"),
-            Some(BackendCommand::ResolveExternalTool { id, output, failed: false })
+            Some(BackendCommand::ResolveExternalTool { id, output, failed: false, .. })
                 if id == "outer/3" && output == "real-mcp-result"
         ));
         assert!(runtime.pending_mcp_calls.is_empty());
@@ -9325,7 +9327,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), commands.recv())
                 .await
                 .expect("reconfiguration callback deadline"),
-            Some(BackendCommand::ResolveExternalTool { id, output, failed: true })
+            Some(BackendCommand::ResolveExternalTool { id, output, failed: true, .. })
                 if id == "outer/reconfigured" && output.contains("configuration changed")
         ));
     }
@@ -9358,7 +9360,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), commands.recv())
                 .await
                 .expect("denial callback deadline"),
-            Some(BackendCommand::ResolveExternalTool { id, output, failed: true })
+            Some(BackendCommand::ResolveExternalTool { id, output, failed: true, .. })
                 if id == "outer/denied" && output.contains("no longer granted")
         ));
         assert!(runtime.pending_mcp_calls.is_empty());

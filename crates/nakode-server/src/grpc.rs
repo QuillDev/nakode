@@ -1830,7 +1830,15 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             session_id: protocol::SessionId::from(input.session_id),
             call_id: input.call_id,
             output: input.output,
-            failed: input.failed
+            failed: input.failed,
+            images: input
+                .images
+                .into_iter()
+                .map(|image| protocol::ExternalToolResultImage {
+                    mime_type: image.mime_type,
+                    data: image.data,
+                })
+                .collect()
         }
     );
 

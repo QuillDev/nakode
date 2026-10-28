@@ -1231,6 +1231,39 @@ pub enum DomainCommandError {
     Unsupported(String),
 }
 
+/// Client images on an external tool result use `return_image`'s formats and per-image bound. The
+/// declared type must match the bytes, so a client cannot relabel content.
+fn external_tool_result_images(
+    images: Vec<nakode_protocol::ExternalToolResultImage>,
+) -> Result<Vec<crate::backend::PromptImage>, DomainCommandError> {
+    use crate::tools::return_image::{MAX_BYTES, MAX_IMAGES_PER_TURN, image_media_type};
+    if images.len() > MAX_IMAGES_PER_TURN {
+        return Err(DomainCommandError::Invalid(
+            "an external tool result may carry at most eight images".to_owned(),
+        ));
+    }
+    images
+        .into_iter()
+        .map(|image| {
+            if image.data.len() as u64 > MAX_BYTES {
+                return Err(DomainCommandError::Invalid(
+                    "an external tool result image exceeds 5 MiB".to_owned(),
+                ));
+            }
+            if image_media_type(&image.data) != Some(image.mime_type.as_str()) {
+                return Err(DomainCommandError::Invalid(
+                    "external tool result images must be PNG, JPEG, GIF or WebP bytes matching their type"
+                        .to_owned(),
+                ));
+            }
+            Ok(crate::backend::PromptImage {
+                mime_type: image.mime_type,
+                data: image.data,
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub enum Effect {
     Backend(BackendCommand),
@@ -6987,6 +7020,7 @@ impl DomainState {
         call_id: &str,
         output: String,
         failed: bool,
+        images: Vec<nakode_protocol::ExternalToolResultImage>,
     ) -> Result<Vec<Effect>, DomainCommandError> {
         let Some(position) = self
             .external_tool_calls
@@ -6995,12 +7029,14 @@ impl DomainState {
         else {
             return Err(DomainCommandError::NotFound(call_id.to_owned()));
         };
+        let images = external_tool_result_images(images)?;
         self.external_tool_calls.remove(position);
         self.status_message = format!("External tool completed: {call_id}");
         Ok(vec![Effect::Backend(BackendCommand::ResolveExternalTool {
             id: call_id.to_owned(),
             output,
             failed,
+            images,
         })])
     }
 
@@ -21279,5 +21315,22 @@ model = "claude-agent/sonnet"
             Some(super::ProviderAuthenticationState::Challenge { user_code, .. })
                 if user_code == "NAKODE-CODE"
         ));
+    }
+
+    #[test]
+    fn external_tool_result_images_must_match_their_declared_type() {
+        let png = b"\x89PNG\r\n\x1a\nrest".to_vec();
+        let image = |mime_type: &str| nakode_protocol::ExternalToolResultImage {
+            mime_type: mime_type.to_owned(),
+            data: png.clone(),
+        };
+
+        let accepted = super::external_tool_result_images(vec![image("image/png")])
+            .expect("matching PNG bytes are accepted");
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].data, png);
+
+        assert!(super::external_tool_result_images(vec![image("image/jpeg")]).is_err());
+        assert!(super::external_tool_result_images(vec![image("image/png"); 9]).is_err());
     }
 }

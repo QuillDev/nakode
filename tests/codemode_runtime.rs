@@ -160,7 +160,11 @@ async fn cancelling_code_mode_interrupts_the_pending_host_call_and_worker() {
     );
     assert!(
         !runtime
-            .resolve_external_tool(&request.id, ToolResult::success("late MCP result"))
+            .resolve_external_tool(
+                &request.id,
+                ToolResult::success("late MCP result"),
+                Vec::new()
+            )
             .await,
         "a late nested completion must not find a pending callback"
     );
@@ -245,7 +249,7 @@ async fn code_mode_worker_composes_native_mutation_client_and_mcp_callbacks() {
                 };
                 assert!(
                     runtime
-                        .resolve_external_tool(&request.id, ToolResult::success(output))
+                        .resolve_external_tool(&request.id, ToolResult::success(output), Vec::new())
                         .await
                 );
                 callbacks += 1;

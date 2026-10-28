@@ -8,7 +8,7 @@ use crate::{
     runtime::{ReturnedImage, ToolDefinition},
 };
 
-const MAX_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const MAX_BYTES: u64 = 5 * 1024 * 1024;
 /// Images one turn may return, and their bytes together.
 pub(crate) const MAX_IMAGES_PER_TURN: usize = 8;
 pub(crate) const MAX_BYTES_PER_TURN: usize = 20 * 1024 * 1024;

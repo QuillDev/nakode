@@ -342,15 +342,16 @@ function externalToolShape(definition) {
   );
 }
 
-function resolveExternalToolCall(id, output, failed, image) {
+function resolveExternalToolCall(id, output, failed, image, images = []) {
   const pending = externalToolCalls.get(id);
   if (!pending) return;
   externalToolCalls.delete(id);
+  const shown = [...(image?.data ? [image] : []), ...images.filter((item) => item?.data)];
   pending.resolve({
     isError: failed === true,
     content: [
       { type: "text", text: output || "" },
-      ...(image?.data ? [{ type: "image", data: image.data, mimeType: image.mimeType }] : []),
+      ...shown.map((item) => ({ type: "image", data: item.data, mimeType: item.mimeType })),
     ],
   });
 }
@@ -389,6 +390,7 @@ function externalToolsServer(session, turnId) {
               event: "external_tool_request",
               id,
               turnId,
+              model: session.model,
               name: definition.name,
               argumentsJson: JSON.stringify(args),
             });
@@ -1704,6 +1706,14 @@ async function handle(command) {
       break;
     }
     case "resolve_external_tool":
+      resolveExternalToolCall(
+        command.id,
+        command.output,
+        command.failed === true,
+        undefined,
+        command.images || [],
+      );
+      break;
     case "resolve_image_return":
     case "resolve_background_task":
     case "resolve_delegation":
