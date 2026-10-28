@@ -4397,9 +4397,7 @@ impl ServerCore {
         self.sessions_by_id
             .iter()
             .filter_map(|(session_id, engine)| {
-                let session = engine
-                    .bootstrap_view(&self.providers, &self.sessions)
-                    .active_session?;
+                let session = engine.session_overview(&self.sessions);
                 (!matches!(session.activity, nakode_protocol::SessionActivity::Idle)
                     || !session.queue.is_empty())
                 .then(|| (session_id.to_string(), session.revision))
@@ -4410,7 +4408,7 @@ impl ServerCore {
     fn workspace_bootstrap(&self) -> nakode_protocol::BootstrapView {
         let mut bootstrap = self
             .engine()
-            .bootstrap_view(&self.providers, &self.sessions);
+            .workspace_view(&self.providers, &self.sessions);
         let initial_session_is_persisted = self
             .sessions
             .iter()
@@ -4432,12 +4430,7 @@ impl ServerCore {
             {
                 summary
             } else {
-                let Some(session) = engine
-                    .bootstrap_view(&self.providers, &self.sessions)
-                    .active_session
-                else {
-                    continue;
-                };
+                let session = engine.session_overview(&self.sessions);
                 let mut owned_provider_sessions = session
                     .active_agent_session
                     .as_ref()
@@ -4520,7 +4513,8 @@ impl ServerCore {
                     || self.sessions.iter().any(|record| record.id == id.as_str())
             })
             .map(|id| {
-                let mut view = self.session_view(id)?;
+                // gRPC returns active inventory as overviews, which never carry transcripts.
+                let mut view = self.session_overview(id)?;
                 view.id = id.clone();
                 Ok(view)
             })
@@ -4650,11 +4644,17 @@ impl ServerCore {
         session_id: &SessionId,
     ) -> Result<nakode_protocol::SessionView, ServiceError> {
         self.engine_for(session_id)
-            .and_then(|engine| {
-                engine
-                    .bootstrap_view(&self.providers, &self.sessions)
-                    .active_session
-            })
+            .map(|engine| engine.session_view(&self.sessions))
+            .ok_or_else(|| self.unobserved_resource("session", session_id.as_str()))
+    }
+
+    /// A session view without transcript pages, for inventories that never return them.
+    fn session_overview(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<nakode_protocol::SessionView, ServiceError> {
+        self.engine_for(session_id)
+            .map(|engine| engine.session_overview(&self.sessions))
             .ok_or_else(|| self.unobserved_resource("session", session_id.as_str()))
     }
 
@@ -4783,9 +4783,8 @@ impl ServerCore {
             .iter()
             .find_map(|(session_id, engine)| {
                 engine
-                    .bootstrap_view(&self.providers, &self.sessions)
-                    .active_session
-                    .and_then(|session| session.active_agent_session)
+                    .session_overview(&self.sessions)
+                    .active_agent_session
                     .is_some_and(|session| session.id == *agent_session_id)
                     .then(|| session_id.clone())
             })
@@ -4800,9 +4799,8 @@ impl ServerCore {
             .iter()
             .find_map(|(session_id, engine)| {
                 engine
-                    .bootstrap_view(&self.providers, &self.sessions)
-                    .active_session
-                    .and_then(|session| session.active_turn)
+                    .session_overview(&self.sessions)
+                    .active_turn
                     .is_some_and(|turn| turn.id == *turn_id)
                     .then(|| {
                         engine
@@ -4824,10 +4822,9 @@ impl ServerCore {
             .iter()
             .find_map(|(session_id, engine)| {
                 engine
-                    .bootstrap_view(&self.providers, &self.sessions)
-                    .active_session
+                    .session_overview(&self.sessions)
+                    .interactions
                     .into_iter()
-                    .flat_map(|session| session.interactions)
                     .any(|interaction| interaction.id == *interaction_id)
                     .then(|| session_id.clone())
             })
@@ -7646,6 +7643,54 @@ mod tests {
         assert_eq!(discovered.sessions.len(), 1);
         assert_eq!(discovered.sessions[0].id, created_id);
         assert_eq!(discovered.sessions[0].updated_at_ms, 0);
+    }
+
+    #[test]
+    fn status_reads_omit_transcript_pages_but_keep_every_other_session_field() {
+        let (mut core, _) = ready_codex_server();
+        let workspace_id = core.workspace_bootstrap().workspace_id;
+        let (created, _) = core
+            .create_session_command(&workspace_id, None, &ModelOptions::default(), None)
+            .expect("create");
+        let session_id = SessionId::from(created.resource_id.expect("id"));
+        core.engine_for_mut(&session_id)
+            .expect("session")
+            .state_mut()
+            .transcript
+            .push(
+                crate::domain_transcript::EntryKind::Assistant,
+                "",
+                "a reply only full session reads carry",
+                crate::domain_transcript::EntryStatus::Complete,
+            );
+
+        let full = core.session_view(&session_id).expect("session view");
+        assert!(!full.transcript.entries.is_empty());
+        assert_eq!(
+            full.active_agent_session
+                .as_ref()
+                .map(|agent| &agent.transcript),
+            Some(&full.transcript),
+            "the agent session and the session share one projected page"
+        );
+
+        let QueryResult::ActiveSessions(active) = core
+            .query(Query::ListActiveSessions { workspace_id })
+            .expect("active query")
+        else {
+            panic!("active result")
+        };
+        let overview = active
+            .into_iter()
+            .find(|row| row.id == session_id)
+            .expect("active row");
+        assert!(overview.transcript.entries.is_empty());
+        let mut expected = full;
+        expected.transcript = overview.transcript.clone();
+        if let Some(agent) = expected.active_agent_session.as_mut() {
+            agent.transcript = overview.transcript.clone();
+        }
+        assert_eq!(overview, expected);
     }
 
     #[test]
