@@ -1994,9 +1994,19 @@ fn entry_digest(
 ) -> std::sync::Arc<crate::domain_transcript::EntryDigest> {
     transcript.entry_digest(entry, |entry| {
         use sha2::{Digest, Sha256};
+        // The body joins the proof through its own digest, so the largest field is hashed once
+        // and never JSON-encoded. A cold snapshot hashes every entry of a long history.
+        let body_sha256 = transcript_body_digest(&entry.body);
+        let metadata = TranscriptEntry {
+            body: String::new(),
+            ..entry.clone()
+        };
+        let mut content = Sha256::new();
+        content.update(serde_json::to_vec(&metadata).unwrap_or_default());
+        content.update(body_sha256.as_bytes());
         crate::domain_transcript::EntryDigest {
-            content: Sha256::digest(serde_json::to_vec(entry).unwrap_or_default()).into(),
-            body_sha256: transcript_body_digest(&entry.body),
+            content: content.finalize().into(),
+            body_sha256,
             parent_item_id: tool_audit_identity(entry, "parentItemId"),
             codemode_tool: entry.kind == EntryKind::Tool
                 && tool_audit_identity(entry, "name").as_deref() == Some("codemode"),
@@ -2030,7 +2040,7 @@ fn transcript_prefixes(transcript: &DomainTranscript) -> Option<Vec<String>> {
         .map(|(entry, _)| entry.id.as_str())
         .collect::<std::collections::HashSet<_>>();
     let mut start = Sha256::new();
-    start.update(b"nakode.transcript.prefix.v2");
+    start.update(b"nakode.transcript.prefix.v3");
     start.update([u8::from(transcript.has_earlier_entries())]);
     let mut current: [u8; 32] = start.finalize().into();
     let mut prefixes = vec![hex(&current)];
