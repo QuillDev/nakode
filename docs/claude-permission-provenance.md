@@ -22,6 +22,10 @@ Runtime stop still aborts the SDK query; a late approval cannot restart it.
 System guidance and PreToolUse/PostToolBatch context explain provenance to the model.
 Unknown or retracted provenance is not an instruction to stop and wait: the model continues the
 owner's task and checks whether the call took effect before relying on it, without replaying it.
+Claude Code's cancellation text cannot be replaced through the SDK, so for `sdk_unknown` calls the
+PostToolBatch context starts with a plain notice: the call was interrupted by the Claude runtime,
+not by the user, its effect is unconfirmed, and it should be checked before retrying. Runtime stops
+and denials never get this notice and keep their existing provenance.
 PostToolBatch also recognises the generic text in `tool_response`, because the batch can run
 before the SDK delivers the tool-result message.
 
@@ -45,11 +49,15 @@ and the tool call is cancelled with the generic STOP text. Nakode received no st
 `sdk_unknown`.
 
 The bridge now always sends streaming input, sets `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1`, and
-keeps input open until Claude Code reports `session_state_changed` `idle`. Claude Code emits `idle`
-only after the last background-driven turn, so follow-up turns keep their hooks however late they
-start. Turns with background tasks stay open while those tasks run, as Claude Code's process already
-did. A CLI that emits no session state falls back to closing at the first `result` (the old
-behaviour, still attributed as `sdk_unknown`).
+keeps input open until Claude Code reports `session_state_changed` `idle` while no non-ambient
+background task is live (`background_tasks_changed`). `idle` alone is not enough: Claude Code 2.1.304
+emits it at the end of every turn, even while a background Bash or Monitor task is running (only
+background agents delay it). Closing input on that `idle` caused the 2026-10-28 recurrences, where a
+CI watcher finished, its follow-up turn lost its hooks and the next Bash call was cancelled.
+If the task list empties while idle and no follow-up turn starts within 30 seconds, input closes so
+the turn still ends. Turns with background tasks stay open while those tasks run, as Claude Code's
+process already did. A CLI that emits no session state falls back to closing at the first `result`
+(the old behaviour, still attributed as `sdk_unknown`).
 Turns that end abnormally still settle: an error result is followed by `idle` (observed with
 Claude Code 2.1.304), and a cancelled or exited process ends the SDK stream, after which the turn
 closes its input.
