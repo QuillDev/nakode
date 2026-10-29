@@ -1593,7 +1593,7 @@ fn external_tool_result_payload(command: BackendCommand) -> Value {
 
 /// Retains an external tool result's images for every client, as one reply, under the same
 /// per-turn bounds as `return_image`. Claude always sees them in the tool result; past those
-/// bounds they are only not kept. Returns the note to append to the result text then.
+/// bounds the rest are only not kept. Returns the note to append to the result text then.
 async fn retain_external_tool_images(
     call_id: &str,
     images: &[crate::backend::PromptImage],
@@ -1606,28 +1606,34 @@ async fn retain_external_tool_images(
         return None;
     }
     let (count, bytes) = returned.turns.get(&turn_id).copied().unwrap_or_default();
-    let added: usize = images.iter().map(|image| image.data.len()).sum();
-    if count + images.len() > MAX_IMAGES_PER_TURN
-        || bytes.saturating_add(added) > MAX_BYTES_PER_TURN
-    {
-        return Some(
-            "Its images were not kept in the transcript: this turn already kept the most images it may."
-                .to_owned(),
-        );
+    // Keep the images in order while they fit the turn's bounds, rather than none of them.
+    let mut kept = 0;
+    let mut added = 0usize;
+    for image in images {
+        let next = bytes.saturating_add(added).saturating_add(image.data.len());
+        if count + kept >= MAX_IMAGES_PER_TURN || next > MAX_BYTES_PER_TURN {
+            break;
+        }
+        kept += 1;
+        added += image.data.len();
+    }
+    let note = (kept < images.len())
+        .then(|| crate::tools::return_image::kept_images_note(kept, images.len()));
+    if kept == 0 {
+        return note;
     }
     returned
         .turns
-        .insert(turn_id.clone(), (count + images.len(), bytes + added));
-    let mut attachments =
-        images
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(index, image)| crate::backend::PromptAttachment {
-                label: format!("Tool image {}", index + 1),
-                path: None,
-                image: Some(image),
-            });
+        .insert(turn_id.clone(), (count + kept, bytes + added));
+    let mut attachments = images[..kept]
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, image)| crate::backend::PromptAttachment {
+            label: format!("Tool image {}", index + 1),
+            path: None,
+            image: Some(image),
+        });
     let first = attachments.next()?;
     let image = crate::runtime::ReturnedImage {
         id: format!("{turn_id}:image:{call_id}"),
@@ -1640,7 +1646,7 @@ async fn retain_external_tool_images(
         more_attachments: attachments.collect(),
     };
     let _ = events.send(BackendEvent::ImageReturned(image)).await;
-    None
+    note
 }
 
 /// Claude's `return_image`: the bridge names a file, and Nakode reads, validates and attaches it
@@ -3354,6 +3360,43 @@ process.stdout.write(output);
             retain_external_tool_images("interrupted", &images, &mut returned, &events).await;
         assert!(note.is_none());
         assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn claude_external_tool_images_past_the_turn_bound_keep_what_fits() {
+        let (events, mut received) = mpsc::channel(8);
+        let mut returned = ReturnedImages::default();
+        let image = crate::backend::PromptImage {
+            mime_type: "image/jpeg".to_owned(),
+            data: b"\xff\xd8\xff".to_vec(),
+        };
+        // Four screenshots and a failure screenshot, then four more in the same turn.
+        let mut kept = Vec::new();
+        let mut notes = Vec::new();
+        for (call, count) in [("first", 5), ("second", 4), ("third", 1)] {
+            returned
+                .external_calls
+                .insert(call.to_owned(), ("turn".to_owned(), "model".to_owned()));
+            let images = vec![image.clone(); count];
+            notes.push(retain_external_tool_images(call, &images, &mut returned, &events).await);
+            kept.push(match received.try_recv() {
+                Ok(BackendEvent::ImageReturned(retained)) => 1 + retained.more_attachments.len(),
+                _ => 0,
+            });
+        }
+        assert_eq!(kept, [5, 3, 0]);
+        assert!(notes[0].is_none());
+        let partial = notes[1].as_deref().expect("a partial note");
+        assert!(
+            partial.starts_with("Kept 3 of this result's 4 images"),
+            "{partial}"
+        );
+        assert!(
+            notes[2]
+                .as_deref()
+                .expect("a note")
+                .starts_with("Kept 0 of this result's 1 images")
+        );
     }
 
     #[test]

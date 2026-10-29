@@ -72,6 +72,16 @@ pub(crate) fn returned_images_output(count: usize) -> String {
     }
 }
 
+/// Says a tool result's images were shown but only some kept, when a turn's bounds were reached.
+pub(crate) fn kept_images_note(kept: usize, total: usize) -> String {
+    format!(
+        "Kept {kept} of this result's {total} images in the transcript: a turn keeps at most \
+         {MAX_IMAGES_PER_TURN} images and {} MiB. All of them are in this result, but the others \
+         cannot be retrieved later.",
+        MAX_BYTES_PER_TURN / (1024 * 1024),
+    )
+}
+
 /// A validated image file, ready to attach.
 pub(crate) struct LoadedImage {
     pub label: String,

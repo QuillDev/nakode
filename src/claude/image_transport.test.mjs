@@ -66,3 +66,35 @@ test("Claude sends image+text and image-only SDK messages in new and resumed ses
   assert.equal(emitted.filter((message) => message.event === "turn_completed").length, 3);
   assert.equal(runs.size, 0);
 });
+
+// The SDK keeps only the text of an MCP error result, so a failed call's images must not be sent
+// as an error or the model never sees them.
+test("a failed external tool call with images reaches the model as a failure it can see", () => {
+  const source = readFileSync(new URL("./bridge.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("function resolveExternalToolCall");
+  const end = source.indexOf("function interruptExternalToolCalls", start);
+  assert.ok(start > 0 && end > start);
+  const externalToolCalls = new Map();
+  const resolveExternalToolCall = eval(
+    `(() => { ${source.slice(start, end)}; return resolveExternalToolCall; })()`,
+  );
+  const call = (id, output, failed, images) =>
+    new Promise((resolve) => {
+      externalToolCalls.set(id, { resolve });
+      resolveExternalToolCall(id, output, failed, null, images);
+    });
+  const screenshot = { data: "aW1hZ2U=", mimeType: "image/jpeg" };
+
+  return Promise.all([
+    call("with-image", "step 2 failed", true, [screenshot]),
+    call("text-only", "step 2 failed", true, []),
+    call("passed", "done", false, [screenshot]),
+  ]).then(([withImage, textOnly, passed]) => {
+    assert.equal(withImage.isError, false);
+    assert.equal(withImage.content[0].text, "The tool call failed.\n\nstep 2 failed");
+    assert.deepEqual(withImage.content[1], { type: "image", ...screenshot });
+    assert.deepEqual(textOnly, { isError: true, content: [{ type: "text", text: "step 2 failed" }] });
+    assert.equal(passed.isError, false);
+    assert.equal(passed.content[0].text, "done");
+  });
+});

@@ -1781,7 +1781,10 @@ impl AgentRuntime {
             )
             .await
             {
-                Ok(count) => crate::tools::return_image::returned_images_output(count),
+                Ok(kept) if kept == images.len() => {
+                    crate::tools::return_image::returned_images_output(kept)
+                }
+                Ok(kept) => crate::tools::return_image::kept_images_note(kept, images.len()),
                 Err(error) => format!("Its images were not attached: {error}"),
             };
             result.output = format!("{}\n\n{note}", result.output);
@@ -1960,7 +1963,8 @@ fn tool_images_message(sources: &[String], images: Vec<PromptAttachment>) -> Con
 }
 
 /// Keeps a client's external tool images as one returned-image reply under the same per-turn
-/// bounds as `return_image`, so every client and later history shows them.
+/// bounds as `return_image`, so every client and later history shows them. Past those bounds it
+/// keeps those that fit and returns how many.
 async fn retain_external_tool_images(
     session: &mut RuntimeSession,
     turn_id: &str,
@@ -1975,17 +1979,23 @@ async fn retain_external_tool_images(
         .filter(|image| image.turn_id == turn_id)
         .collect::<Vec<_>>();
     let returned: usize = turn_images.iter().map(|image| image.image_count()).sum();
-    if returned + images.len() > MAX_IMAGES_PER_TURN {
-        return Err("at most eight images may be returned per turn".to_owned());
+    let mut retained_bytes: usize = turn_images.iter().map(|image| image.image_bytes()).sum();
+    // Keep the images in order while they fit the turn's bounds, rather than none of them.
+    let mut kept = 0;
+    for image in &images {
+        let next = retained_bytes.saturating_add(image.data.len());
+        if returned + kept >= MAX_IMAGES_PER_TURN || next > MAX_BYTES_PER_TURN {
+            break;
+        }
+        kept += 1;
+        retained_bytes = next;
     }
-    let retained_bytes: usize = turn_images.iter().map(|image| image.image_bytes()).sum();
-    let added: usize = images.iter().map(|image| image.data.len()).sum();
-    if retained_bytes.saturating_add(added) > MAX_BYTES_PER_TURN {
-        return Err("returned images exceed 20 MiB per turn".to_owned());
+    if kept == 0 {
+        return Ok(0);
     }
-    let count = images.len();
     let mut attachments = images
         .into_iter()
+        .take(kept)
         .enumerate()
         .map(|(index, image)| PromptAttachment {
             label: format!("Tool image {}", index + 1),
@@ -2008,7 +2018,7 @@ async fn retain_external_tool_images(
         .await
         .map_err(|_| "session event receiver closed".to_owned())?;
     session.returned_images.insert(call_id.to_owned(), image);
-    Ok(count)
+    Ok(kept)
 }
 
 struct ExecutedTool {
@@ -4467,6 +4477,32 @@ mod tests {
             session.history.last(),
             Some(ConversationItem::Assistant { text, .. }) if text == "done"
         ));
+    }
+
+    #[tokio::test]
+    async fn external_tool_images_past_the_turn_bound_keep_what_fits() {
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        let (events, mut receiver) = mpsc::channel(8);
+        let screenshot = crate::backend::PromptImage {
+            mime_type: "image/jpeg".to_owned(),
+            data: b"\xff\xd8\xff".to_vec(),
+        };
+        // Four screenshots and a failure screenshot, then four more in the same turn.
+        let mut kept = Vec::new();
+        for (call, count) in [("first", 5), ("second", 4), ("third", 1)] {
+            let images = vec![screenshot.clone(); count];
+            let retained =
+                super::retain_external_tool_images(&mut session, "turn", call, images, &events)
+                    .await
+                    .expect("retained");
+            let attached = match receiver.try_recv() {
+                Ok(BackendEvent::ImageReturned(image)) => 1 + image.more_attachments.len(),
+                _ => 0,
+            };
+            assert_eq!(retained, attached);
+            kept.push(retained);
+        }
+        assert_eq!(kept, [5, 3, 0]);
     }
 
     #[tokio::test]
