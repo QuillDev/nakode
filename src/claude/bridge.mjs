@@ -346,7 +346,11 @@ function externalToolShape(definition) {
 // issues of every branch: hundreds of lines for one bad step in a list. Branches that share a
 // constant key become a discriminated union instead, which reports only the matching branch.
 function externalToolProperty(property) {
-  if (property?.type === "array" && unionKey(property.items) !== undefined) {
+  if (
+    property?.type === "array" &&
+    only(property, ["type", "items", "minItems", "maxItems", "description"]) &&
+    unionKey(property.items) !== undefined
+  ) {
     let value = z.array(externalToolProperty(property.items));
     if (property.minItems !== undefined) value = value.min(property.minItems);
     if (property.maxItems !== undefined) value = value.max(property.maxItems);
@@ -363,16 +367,20 @@ function externalToolProperty(property) {
 function unionKey(property) {
   const options = property?.oneOf ?? property?.anyOf;
   if (!Array.isArray(options) || options.length < 2) return undefined;
-  const other = Object.keys(property).filter((key) => !["oneOf", "anyOf", "description"].includes(key));
-  if (other.length > 0) return undefined;
+  if (!only(property, ["oneOf", "anyOf", "description"])) return undefined;
+  // Only plain object branches convert to objects a discriminated union can hold.
+  const plain = ["type", "properties", "required", "additionalProperties", "description"];
+  if (!options.every((option) => option?.type === "object" && only(option, plain))) return undefined;
   return Object.keys(options[0]?.properties ?? {}).find((key) => {
     const values = options.map((option) =>
-      option?.type === "object" && option.required?.includes(key)
-        ? option.properties?.[key]?.const
-        : undefined,
+      option.required?.includes(key) ? option.properties?.[key]?.const : undefined,
     );
     return values.every((value) => value !== undefined) && new Set(values).size === values.length;
   });
+}
+
+function only(schema, keys) {
+  return Object.keys(schema).every((key) => keys.includes(key));
 }
 
 function resolveExternalToolCall(id, output, failed, image, images = []) {
