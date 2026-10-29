@@ -31,6 +31,7 @@ use crate::backend::{
 use crate::credential::SecretValue;
 
 pub(crate) mod delegation;
+mod materials;
 
 use delegation::{
     ClaudeDelegations, DELEGATION_CANCELLED_EVENT, DELEGATION_REQUEST_EVENT, DelegationScope,
@@ -576,6 +577,7 @@ async fn run_supervisor(
     let mut deferred_command = None;
     let mut delegation_scope = DelegationScope::default();
     let mut delegations = ClaudeDelegations::new(config.native_delegation.clone());
+    let mut materials = materials::ClaudeMaterials::new(config.native_delegation.clone());
     let mut browser_calls = BrowserCalls::default();
     // Background task calls may wait on process termination, so they run off this loop.
     let (background_replies_tx, mut background_replies) = mpsc::channel::<Value>(16);
@@ -596,6 +598,13 @@ async fn run_supervisor(
                 // command itself cannot reach the bridge.
                 delegations.observe_command(&command);
                 browser_calls.observe_command(&command);
+                match &command {
+                    BackendCommand::InterruptTurn { turn_id, .. } => materials.forget_turn(turn_id),
+                    BackendCommand::UnsubscribeSession { .. } | BackendCommand::Shutdown => {
+                        materials.forget_all();
+                    }
+                    _ => {}
+                }
                 let mut command = command;
                 if let BackendCommand::ResolveExternalTool { id, output, images, .. } = &mut command
                     && let Some(note) = retain_external_tool_images(id, images, &mut returned_images, &events).await
@@ -695,6 +704,12 @@ async fn run_supervisor(
                     let _ = send(bridge, completion.bridge_reply()).await;
                 }
             }
+            completion = materials.next_completion() => {
+                let reply = material_reply(completion, &mut returned_images, &events).await;
+                if let Some(bridge) = bridge.as_mut() {
+                    let _ = send(bridge, reply).await;
+                }
+            }
             () = wait_until_credential_refresh(credential.as_ref()), if publish_credential_updates && credential.as_ref().is_some_and(|credential| !credential.brokered) => {
                 if let Err(message) = refresh_supervisor_credential(&mut credential, true, &events).await {
                     request_failed(&events, BackendOperation::Reload, message).await;
@@ -705,6 +720,7 @@ async fn run_supervisor(
                     // The exited bridge's tool calls can no longer receive a result.
                     delegations.cancel_all();
                     browser_calls.cancel_all();
+                    materials.forget_all();
                     returned_images.external_calls.clear();
                     let _ = events.send(BackendEvent::Disconnected { reason: "Claude SDK bridge exited".to_owned() }).await;
                     if let Some(stopped) = bridge.take() {
@@ -797,6 +813,11 @@ async fn run_supervisor(
                     }
                     continue;
                 }
+                if event_name == Some(materials::MATERIAL_REQUEST_EVENT) {
+                    // Identity is bound from the control plane; any identity in the payload is ignored.
+                    materials.start(&message, &delegation_scope);
+                    continue;
+                }
                 if event_name == Some(DELEGATION_CANCELLED_EVENT) {
                     delegations.cancel(&string(&message, "id"));
                     continue;
@@ -814,6 +835,7 @@ async fn run_supervisor(
                 // An ended turn's unresolved external calls (interrupted, say) never return images.
                 if matches!(event_name, Some("turn_completed" | "turn_start_failed")) {
                     returned_images.forget_turn_calls(&string(&message, "turnId"));
+                    materials.forget_turn(&string(&message, "turnId"));
                 }
                 if event_name == Some("external_tool_request") {
                     returned_images.external_calls.insert(
@@ -1647,6 +1669,71 @@ async fn retain_external_tool_images(
     };
     let _ = events.send(BackendEvent::ImageReturned(image)).await;
     note
+}
+
+/// The bridge answer for one material call. An inspected preview is attached to the transcript only
+/// while it fits the turn's image bounds; past them the call fails and attaches nothing.
+async fn material_reply(
+    completion: materials::MaterialCompletion,
+    returned: &mut ReturnedImages,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Value {
+    let materials::MaterialCompletion {
+        id,
+        turn_id,
+        model,
+        result,
+    } = completion;
+    let answered = match result {
+        Ok(materials::MaterialOutcome::Listed(output)) => Ok(output),
+        Ok(materials::MaterialOutcome::Prepared(prepared)) => match prepared.preview {
+            None => Ok(prepared.output),
+            Some(artifact) => attach_preview(&turn_id, &id, model, artifact, returned, events)
+                .await
+                .map(|()| prepared.output),
+        },
+        Err(error) => Err(error),
+    };
+    let (output, failed) = match answered {
+        Ok(output) => (output, false),
+        Err(error) => (error, true),
+    };
+    json!({"method": "resolve_material", "id": id, "output": output, "failed": failed})
+}
+
+async fn attach_preview(
+    turn_id: &str,
+    call_id: &str,
+    model_id: String,
+    artifact: nakode_protocol::ArtifactView,
+    returned: &mut ReturnedImages,
+    events: &mpsc::Sender<BackendEvent>,
+) -> Result<(), String> {
+    use crate::tools::prepare_image::{PREVIEW_LIMIT, preview_attachment, preview_fits};
+    let (count, bytes) = returned.turns.get(turn_id).copied().unwrap_or_default();
+    let added = artifact.data.len();
+    if !preview_fits(count, bytes, added) {
+        return Err(PREVIEW_LIMIT.to_owned());
+    }
+    let image = crate::runtime::ReturnedImage {
+        id: format!("{turn_id}:image:{call_id}"),
+        turn_id: turn_id.to_owned(),
+        provider_id: CLAUDE_PROVIDER.to_owned(),
+        model_id,
+        history_index: 0,
+        sequence: count,
+        attachment: preview_attachment(artifact),
+        more_attachments: Vec::new(),
+    };
+    events
+        .send(BackendEvent::ImageReturned(image))
+        .await
+        .map_err(|_| "image transcript receiver closed".to_owned())?;
+    // Counted only once the transcript has it.
+    returned
+        .turns
+        .insert(turn_id.to_owned(), (count + 1, bytes + added));
+    Ok(())
 }
 
 /// Claude's `return_image`: the bridge names a file, and Nakode reads, validates and attaches it
@@ -2624,6 +2711,65 @@ fn capabilities() -> BackendCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inspected(id: &str, turn: &str) -> materials::MaterialCompletion {
+        let artifact = nakode_protocol::ArtifactView {
+            id: nakode_protocol::ArtifactId::from("artifact-1".to_owned()),
+            label: "shot.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            byte_length: 4,
+            data: vec![1, 2, 3, 4],
+            width: None,
+            height: None,
+        };
+        materials::MaterialCompletion {
+            id: id.to_owned(),
+            turn_id: turn.to_owned(),
+            model: "claude-test".to_owned(),
+            result: Ok(materials::MaterialOutcome::Prepared(
+                crate::tools::prepare_image::Prepared {
+                    output: "prepared".to_owned(),
+                    preview: Some(artifact),
+                },
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inspected_preview_is_attached_and_counted_against_its_turn() {
+        let (events, mut received) = mpsc::channel(4);
+        let mut returned = ReturnedImages::default();
+        returned.turns.insert("turn-1".to_owned(), (3, 10));
+
+        let reply = material_reply(inspected("call-1", "turn-1"), &mut returned, &events).await;
+        assert_eq!(
+            reply,
+            json!({"method": "resolve_material", "id": "call-1", "output": "prepared", "failed": false})
+        );
+        let Some(BackendEvent::ImageReturned(image)) = received.try_recv().ok() else {
+            panic!("expected the preview in the transcript");
+        };
+        assert_eq!(image.id, "turn-1:image:call-1");
+        assert_eq!(image.provider_id, CLAUDE_PROVIDER);
+        assert_eq!(returned.turns["turn-1"], (4, 14));
+    }
+
+    #[tokio::test]
+    async fn a_preview_past_the_turn_bounds_fails_and_attaches_nothing() {
+        use crate::tools::prepare_image::PREVIEW_LIMIT;
+        use crate::tools::return_image::MAX_IMAGES_PER_TURN;
+        let (events, mut received) = mpsc::channel(4);
+        let mut returned = ReturnedImages::default();
+        returned
+            .turns
+            .insert("turn-1".to_owned(), (MAX_IMAGES_PER_TURN, 10));
+
+        let reply = material_reply(inspected("call-1", "turn-1"), &mut returned, &events).await;
+        assert_eq!(reply["failed"], true);
+        assert_eq!(reply["output"], PREVIEW_LIMIT);
+        assert!(received.try_recv().is_err());
+        assert_eq!(returned.turns["turn-1"], (MAX_IMAGES_PER_TURN, 10));
+    }
 
     #[tokio::test]
     async fn partial_sdk_install_is_not_current() {

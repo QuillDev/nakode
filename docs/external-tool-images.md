@@ -19,8 +19,8 @@ Accepted images become one returned transcript image for the call (`ImageReturne
 Kept images are ordinary transcript artifacts that persist with the session and go when it is deleted:
 
 - Owners and clients read them through session history, and by artifact id through `GetSessionImage`.
-- On native runtimes whose tools include `list_child_materials` and `prepare_image`, a session lists its own retained images with `list_child_materials { source: { session_id: <its own session id> } }` (a delegated run adds its own `run_id`), and a parent lists a child's the same way; `prepare_image { source, image_reference, inspect: true }` then copies one into the current turn under that turn's own image limits.
-- The Claude adapter does not expose `list_child_materials` or `prepare_image`, so a Claude session cannot list or re-attach its retained tool images itself; it has the labels (`Tool image N`) in the result text only. Closing that gap means exposing those two tools over the Claude bridge.
+- A session whose tools include `list_child_materials` and `prepare_image` lists its own retained images with `list_child_materials { source: { session_id: <its own session id> } }` (a delegated run adds its own `run_id`), and a parent lists a child's the same way; `prepare_image { source, image_reference, inspect: true }` then attaches one to the current turn's transcript under that turn's own image limits. The preview is for the owner; it is not sent to the model again.
+- Native runtimes and the Claude adapter expose both. Claude offers them as `mcp__nakode__list_child_materials` and `mcp__nakode__prepare_image` only when the session has an owner session, keeps the built-in tools (as on native runtimes, replacing them removes both) and its tool policy allows them; the owner and run come from the control plane's session commands, never the tool arguments, and the workspace server authorizes each source exactly as for native sessions.
 
 The tool result text gains a short "attached to the assistant transcript" note when images are kept.
 

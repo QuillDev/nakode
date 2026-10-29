@@ -2,6 +2,7 @@
 use nakode_protocol::{ArtifactId, MaterialSource, QueryResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{Tool, ToolContext, ToolFuture, ToolResult};
@@ -42,25 +43,8 @@ impl Tool for ListChildMaterialsTool {
         cancellation: &'a CancellationToken,
     ) -> ToolFuture<'a> {
         Box::pin(async move {
-            let read = async {
-                let args: Arguments =
-                    serde_json::from_value(arguments).map_err(|error| error.to_string())?;
-                let result = request(
-                    &context,
-                    args.source,
-                    NativeMaterialOperation::List {
-                        after: args.after_artifact_id,
-                        limit: args.limit,
-                    },
-                )
-                .await?;
-                match result {
-                    QueryResult::ChildMaterials(page) => {
-                        serde_json::to_string(&page).map_err(|error| error.to_string())
-                    }
-                    _ => Err("unexpected material service response".to_owned()),
-                }
-            };
+            let requester = MaterialRequester::of(&context);
+            let read = list(&requester, arguments);
             tokio::select! {
                 result = read => match result { Ok(output) => ToolResult::success(output), Err(error) => ToolResult::failure(error) },
                 () = cancellation.cancelled() => ToolResult::failure("material discovery cancelled"),
@@ -76,24 +60,62 @@ pub(super) fn source_schema() -> Value {
     },"required":["session_id"],"additionalProperties":false})
 }
 
+/// The identity a material read acts for, always bound by the runtime and never by tool
+/// arguments: the logical owner session and, inside a delegated run, that run.
+pub(crate) struct MaterialRequester<'a> {
+    pub route: Option<&'a mpsc::Sender<NativeAgentRequest>>,
+    pub owner_session_id: Option<String>,
+    pub run_id: Option<String>,
+}
+
+impl<'a> MaterialRequester<'a> {
+    pub(super) fn of(context: &ToolContext<'a>) -> Self {
+        Self {
+            route: context.delegation,
+            owner_session_id: context.session.owner_session_id.clone(),
+            run_id: context.session.parent_run_id.clone(),
+        }
+    }
+}
+
+/// `list_child_materials`: one metadata-only page from an authorized source.
+pub(crate) async fn list(
+    requester: &MaterialRequester<'_>,
+    arguments: Value,
+) -> Result<String, String> {
+    let args: Arguments = serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+    let result = request(
+        requester,
+        args.source,
+        NativeMaterialOperation::List {
+            after: args.after_artifact_id,
+            limit: args.limit,
+        },
+    )
+    .await?;
+    match result {
+        QueryResult::ChildMaterials(page) => {
+            serde_json::to_string(&page).map_err(|error| error.to_string())
+        }
+        _ => Err("unexpected material service response".to_owned()),
+    }
+}
+
 pub(super) async fn request(
-    context: &ToolContext<'_>,
+    requester: &MaterialRequester<'_>,
     source: MaterialSource,
     operation: NativeMaterialOperation,
 ) -> Result<QueryResult, String> {
-    let owner_session_id = context
-        .session
+    let owner_session_id = requester
         .owner_session_id
         .clone()
         .ok_or("material tool has no authoritative session")?;
-    let route = context
-        .delegation
-        .ok_or("material service is unavailable")?;
+    let route = requester.route.ok_or("material service is unavailable")?;
     let (respond, response) = tokio::sync::oneshot::channel();
     route
         .send(NativeAgentRequest::Material(NativeMaterialRequest {
             owner_session_id,
-            requester_run_id: context.session.parent_run_id.clone(),
+            requester_run_id: requester.run_id.clone(),
             source,
             operation,
             respond,

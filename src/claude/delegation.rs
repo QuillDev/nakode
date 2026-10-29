@@ -57,6 +57,11 @@ impl DelegationScope {
 }
 
 impl DelegationScope {
+    /// The logical owner session and active delegated run, as the control plane attached them.
+    pub(crate) fn identity(&self) -> (Option<String>, Option<String>) {
+        (self.owner_session_id.clone(), self.parent_run_id.clone())
+    }
+
     /// The authenticated background-task caller for one bridge tool call, if this Claude session
     /// acts for a logical owner. Identity in the bridge payload is never consulted.
     pub(crate) fn background_task_caller(
@@ -279,10 +284,10 @@ fn text(message: &Value, key: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    fn start_session(owner: Option<&str>, parent: Option<&str>) -> BackendCommand {
+    pub(crate) fn start_session(owner: Option<&str>, parent: Option<&str>) -> BackendCommand {
         BackendCommand::StartSession {
             model: None,
             instructions: None,

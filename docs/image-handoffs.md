@@ -35,7 +35,7 @@ Derived `image-v1:` references encode bounded recipes over originals, not image 
 - Crops must be nonempty and wholly inside the source; optional downscale bounds are 1–16,384 pixels. Aspect ratio is preserved, images never enlarge, and no transformation is implicit.
 - There is no default resizing. For a broad overview, explicitly request a longest side around 1024; for dense text, keep the original or choose a focused crop first. Inspect the result before forwarding when legibility matters.
 - Pixel and byte reductions are **not exact visual-token savings**. Provider accounting differs, and a smaller raster can even encode into more PNG bytes. No token-saving guarantee is made.
-- Selected models must advertise image input. Image-bearing delegation does not retry through a text-only fallback. The Claude compatibility adapter currently refuses native image attachments (including at dispatch) instead of silently discarding them. Optional compatibility harnesses are not established to expose `prepare_image`; native-tool support is required.
+- Selected models must advertise image input. Image-bearing delegation does not retry through a text-only fallback. The Claude compatibility adapter currently refuses native image attachments (including at dispatch) instead of silently discarding them. The Claude adapter exposes `prepare_image` and `list_child_materials` over its bridge with the same server-side authorization.
 
 ## Fixture validation
 

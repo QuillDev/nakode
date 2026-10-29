@@ -87,10 +87,11 @@ function delegationOutcome(toolResult) {
 function nakodeServer(
   session,
   turn,
-  { delegate: withDelegate, returnImage, desktop, browser, backgroundTasks },
+  { delegate: withDelegate, returnImage, materials, desktop, browser, backgroundTasks },
 ) {
   const tools = [];
   if (returnImage) tools.push(returnImageTool(session, turn));
+  for (const name of materials) tools.push(materialTool(name, session, turn));
   if (backgroundTasks) tools.push(backgroundTasksTool(session, turn));
   for (const name of desktop) tools.push(desktopTool(name, session, turn));
   if (browser) tools.push(browserControlTool(session, turn));
@@ -287,6 +288,68 @@ function returnImageTool(session, turn) {
   );
 }
 
+// Nakode's retained transcript images, as the native runtime offers them. The supervisor binds the
+// owner session and run, the server authorizes the source and resolves the reference, and an
+// inspected preview counts against this turn's image bounds.
+const MATERIAL_SOURCE = z
+  .strictObject({
+    session_id: z.string().min(1).max(200),
+    run_id: z.string().min(1).max(200).optional(),
+  })
+  .describe("Canonical session_id and optional exact run_id of the material source");
+
+const MATERIAL_TOOLS = {
+  list_child_materials: {
+    description:
+      "List one metadata-only page of retained transcript images from an authorized source: this session itself (its own session_id), a durable child session, or an exact native delegated run. Source requires its canonical session_id and optional run_id. Owner/parent is server-bound, never a tool argument. Use prepare_image with the same source and a selected artifact_id as image_reference to inspect/attach it. Limit 1–64. Images a turn's bounds did not keep were never retained and are not listed. No filesystem Gallery or cross-runtime source support yet; unavailable sources refuse. Does not load image bytes into model context.",
+    schema: {
+      source: MATERIAL_SOURCE,
+      after_artifact_id: z.string().min(1).max(200).optional(),
+      limit: z.number().int().min(1).max(64),
+    },
+  },
+  prepare_image: {
+    description:
+      "Inspect image metadata or explicitly crop/downscale a retained transcript image. Uses authoritative image references (an artifact_id from list_child_materials, with the same source), never file paths. Returns a reusable reference, dimensions, format, bytes and crop provenance; inspect attaches a preview to the transcript within this turn's limit of eight images and 20 MiB. Originals remain unchanged. PNG/JPEG transforms, PNG/JPEG/GIF/WebP originals, 5 MiB, 40 megapixels, 16384 pixels/side. Resizing preserves aspect ratio and never enlarges.",
+    schema: {
+      image_reference: z.string().min(1),
+      source: MATERIAL_SOURCE.optional(),
+      crop: z
+        .strictObject({
+          x: z.number().int().min(0),
+          y: z.number().int().min(0),
+          width: z.number().int().min(1),
+          height: z.number().int().min(1),
+        })
+        .optional(),
+      max_width: z.number().int().min(1).max(16384).optional(),
+      max_height: z.number().int().min(1).max(16384).optional(),
+      inspect: z
+        .boolean()
+        .optional()
+        .describe("Attach the resolved image to the transcript for inspection; defaults false."),
+    },
+  },
+};
+
+function materialTool(name, session, turn) {
+  const { description, schema } = MATERIAL_TOOLS[name];
+  return tool(name, description, schema, async (args, extra) =>
+    new Promise((resolve) => {
+      const id = randomUUID();
+      externalToolCalls.set(id, { resolve, sessionId: session.sessionId, turnId: turn.turnId });
+      write({
+        event: "material_request",
+        id,
+        turnId: turn.turnId,
+        model: session.model,
+        tool: name,
+        arguments: args,
+      });
+    }),
+  );
+}
+
 // Claude's provider identity for Nakode's canonical `nakode_agent` tool, with the same arguments.
 function delegateTool(session, turn) {
   return tool(
@@ -461,6 +524,8 @@ function providerToolName(name) {
 const NAKODE_MCP_TOOLS = new Set([
   "mcp__nakode__delegate",
   "mcp__nakode__return_image",
+  "mcp__nakode__list_child_materials",
+  "mcp__nakode__prepare_image",
   "mcp__nakode__background_tasks",
   "mcp__nakode__desktop_screenshot",
   "mcp__nakode__desktop_action",
@@ -738,6 +803,8 @@ const CLAUDE_POLICY_TOOLS = new Set([
   "AskUserQuestion",
   "mcp__nakode__delegate",
   "mcp__nakode__background_tasks",
+  "mcp__nakode__list_child_materials",
+  "mcp__nakode__prepare_image",
 ]);
 
 /**
@@ -1409,6 +1476,11 @@ async function sendTurn(command) {
       allows("mcp__nakode__delegate"),
   );
   const returnImage = allows("mcp__nakode__return_image");
+  // Material reads act for the logical owner the supervisor binds; without one they are absent.
+  // Like native built-ins, absent when external tools replace the built-in set.
+  const materials = session.ownerSessionId && !session.replaceBuiltinTools
+    ? Object.keys(MATERIAL_TOOLS).filter((name) => allows(`mcp__nakode__${name}`))
+    : [];
   // Ownership is bound by the supervisor from the logical owner; without one the tool is absent.
   const backgroundTasks = Boolean(
     session.ownerSessionId && allows("mcp__nakode__background_tasks"),
@@ -1423,11 +1495,18 @@ async function sendTurn(command) {
       session.ownerSessionId &&
       allows("mcp__nakode__browser_control"),
   );
-  if (withDelegate || returnImage || backgroundTasks || desktop.length > 0 || browser) {
+  if (
+    withDelegate ||
+    returnImage ||
+    materials.length > 0 ||
+    backgroundTasks ||
+    desktop.length > 0 ||
+    browser
+  ) {
     mcpServers.nakode = nakodeServer(
       session,
       { turnId: command.turnId, workspace: command.workspace },
-      { delegate: withDelegate, returnImage, desktop, browser, backgroundTasks },
+      { delegate: withDelegate, returnImage, materials, desktop, browser, backgroundTasks },
     );
   }
   if (session.externalTools.length > 0) {
@@ -1760,6 +1839,7 @@ async function handle(command) {
       );
       break;
     case "resolve_image_return":
+    case "resolve_material":
     case "resolve_background_task":
     case "resolve_delegation":
       resolveExternalToolCall(
