@@ -336,10 +336,51 @@ function externalToolShape(definition) {
   const required = new Set(schema.required || []);
   return Object.fromEntries(
     Object.entries(schema.properties || {}).map(([name, property]) => {
-      const value = z.fromJSONSchema(property);
+      const value = externalToolProperty(property);
       return [name, required.has(name) ? value : value.optional()];
     }),
   );
+}
+
+// zod reads a JSON Schema oneOf as an exclusive union and, when an input fails, reports the
+// issues of every branch: hundreds of lines for one bad step in a list. Branches that share a
+// constant key become a discriminated union instead, which reports only the matching branch.
+function externalToolProperty(property) {
+  if (
+    property?.type === "array" &&
+    only(property, ["type", "items", "minItems", "maxItems", "description"]) &&
+    unionKey(property.items) !== undefined
+  ) {
+    let value = z.array(externalToolProperty(property.items));
+    if (property.minItems !== undefined) value = value.min(property.minItems);
+    if (property.maxItems !== undefined) value = value.max(property.maxItems);
+    return property.description ? value.describe(property.description) : value;
+  }
+  const key = unionKey(property);
+  if (key === undefined) return z.fromJSONSchema(property);
+  const options = (property.oneOf ?? property.anyOf).map((option) => z.fromJSONSchema(option));
+  const value = z.discriminatedUnion(key, options);
+  return property.description ? value.describe(property.description) : value;
+}
+
+/** The required constant property every object branch of a plain union has, unique per branch. */
+function unionKey(property) {
+  const options = property?.oneOf ?? property?.anyOf;
+  if (!Array.isArray(options) || options.length < 2) return undefined;
+  if (!only(property, ["oneOf", "anyOf", "description"])) return undefined;
+  // Only plain object branches convert to objects a discriminated union can hold.
+  const plain = ["type", "properties", "required", "additionalProperties", "description"];
+  if (!options.every((option) => option?.type === "object" && only(option, plain))) return undefined;
+  return Object.keys(options[0]?.properties ?? {}).find((key) => {
+    const values = options.map((option) =>
+      option.required?.includes(key) ? option.properties?.[key]?.const : undefined,
+    );
+    return values.every((value) => value !== undefined) && new Set(values).size === values.length;
+  });
+}
+
+function only(schema, keys) {
+  return Object.keys(schema).every((key) => keys.includes(key));
 }
 
 function resolveExternalToolCall(id, output, failed, image, images = []) {
@@ -347,10 +388,14 @@ function resolveExternalToolCall(id, output, failed, image, images = []) {
   if (!pending) return;
   externalToolCalls.delete(id);
   const shown = [...(image?.data ? [image] : []), ...images.filter((item) => item?.data)];
+  // The SDK keeps only the text of an error result, so a failure with images, such as a failed
+  // browser step and its screenshot, is delivered as a result that says it failed.
+  const imagesOnFailure = failed === true && shown.length > 0;
+  const text = imagesOnFailure ? `The tool call failed.\n\n${output || ""}` : output || "";
   pending.resolve({
-    isError: failed === true,
+    isError: failed === true && !imagesOnFailure,
     content: [
-      { type: "text", text: output || "" },
+      { type: "text", text },
       ...shown.map((item) => ({ type: "image", data: item.data, mimeType: item.mimeType })),
     ],
   });
