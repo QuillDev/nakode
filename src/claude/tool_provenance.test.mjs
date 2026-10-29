@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import {
+  APPLICATION_EXECUTION_REVIEW_GUIDANCE,
   immediateProviderToolDecision,
   nativeDelegationDecision,
   preToolUseOutput,
@@ -29,9 +30,13 @@ function fixture(mode = "bypassPermissions") {
   const interruptExternalToolCalls = () => {};
   const errorMessage = (error) => error.message;
   let validation = { verdict: "allow", rationale: "Authorized read" };
-  const requestDelegation = async () => validation instanceof Error
-    ? Promise.reject(validation)
-    : { text: JSON.stringify(validation), failed: false };
+  const delegationRequests = [];
+  const requestDelegation = async (_session, _turnId, request) => {
+    delegationRequests.push(request);
+    return validation instanceof Error
+      ? Promise.reject(validation)
+      : { text: JSON.stringify(validation), failed: false };
+  };
   const delegationOutcome = (value) => value;
   const SUBAGENT_RESULT = /never matches/;
   // sendTurn runs against a scripted SDK stream; inference and process supervision stay isolated.
@@ -62,9 +67,9 @@ function fixture(mode = "bypassPermissions") {
   const signal = new AbortController();
   const options = { toolUseID: "call", signal: signal.signal, suggestions: [] };
   return {
-    emitted, signal, runs, approvals,
+    emitted, signal, runs, approvals, delegationRequests,
     validate(value) { validation = value; },
-    authorize: (allowed = null) => api.permissionHandler("turn", session, mode, allowed)("Bash", { command: "git status --short" }, options),
+    authorize: (allowed = null, command = "git status --short", tool = "Bash", agentID = null) => api.permissionHandler("turn", session, mode, allowed)(tool, { command }, { ...options, agentID }),
     resolve: (decision) => api.handle({ method: "resolve_approval", approvalId: "call", decision }),
     cancel: () => api.handle({ method: "cancel", turnId: "turn", requestId: "authenticated-control" }),
     result(output, isError = true, uuid = undefined) {
@@ -92,6 +97,59 @@ function fixture(mode = "bypassPermissions") {
     batch: (toolResponse) => api.permissionBatchHook("turn")({ tool_calls: [{ tool_use_id: "call", tool_response: toolResponse }] }),
   };
 }
+
+// Scripted validator outcomes exercise routing and enforcement, not live model classification.
+test("application-owned AI execution receives the narrow review policy and can pass review", async () => {
+  const f = fixture("auto");
+  f.validate({ verdict: "allow", rationale: "Owner requested scraper test; inspected src/luna.ts invokes codex exec for product behavior." });
+  const result = await f.authorize(null, "bun run scraper");
+  assert.equal(result.behavior, "allow");
+  assert.equal(result.permission.source, "validator");
+  assert.equal(f.approvals.size, 0);
+  assert.equal(f.delegationRequests.length, 1);
+  const { task } = f.delegationRequests[0];
+  assert.ok(task.includes(APPLICATION_EXECUTION_REVIEW_GUIDANCE));
+  assert.match(task, /Reject assistant-created or repurposed scripts/);
+  assert.match(task, /never overrides sandbox\/network\/tool\/archetype limits/);
+  assert.match(task, /never extract or repurpose Nakode\/provider credentials/);
+  assert.match(task, /If purpose or authorization is unclear, escalate/);
+});
+
+test("an application wrapper cannot override a rejected unmanaged assistant worker", async () => {
+  const f = fixture("auto");
+  f.validate({ verdict: "reject", rationale: "Repurposed application sends the assistant's review assignment to codex exec." });
+  // The same entrypoint name may be repurposed; its name cannot establish purpose.
+  const result = await f.authorize(null, "bun run scraper");
+  assert.equal(result.behavior, "deny");
+  assert.equal(result.permission.source, "validator_reject");
+  assert.ok(f.delegationRequests[0].task.includes(APPLICATION_EXECUTION_REVIEW_GUIDANCE));
+});
+
+test("application-owned execution retains validator uncertainty and existing approval gates", async () => {
+  const uncertain = fixture("auto");
+  uncertain.validate({ verdict: "escalate", rationale: "Application purpose is unconfirmed." });
+  const denied = await uncertain.authorize(null, "bun run scraper");
+  assert.equal(denied.behavior, "deny");
+  assert.equal(denied.permission.source, "validator_escalation");
+
+  const guarded = fixture("default");
+  const pending = guarded.authorize(null, "bun run scraper");
+  assert.equal(guarded.approvals.size, 1);
+  await guarded.resolve("decline");
+  const declined = await pending;
+  assert.equal(declined.behavior, "deny");
+  assert.equal(declined.permission.source, "approval_declined");
+});
+
+test("application-owned claims do not bypass tool limits or native-subagent prohibition", async () => {
+  for (const [allowed, tool, agentID] of [[[], "Bash", null], [null, "Agent", null], [null, "Bash", "unmanaged-child"]]) {
+    const f = fixture("auto");
+    const result = await f.authorize(allowed, "bun run scraper # application-owned AI", tool, agentID);
+    assert.equal(result.behavior, "deny");
+    assert.equal(result.permission.source, "policy");
+    assert.equal(f.delegationRequests.length, 0);
+  }
+});
 
 test("authorized read remains allowed and successful, without fabricated denial", async () => {
   const f = fixture();

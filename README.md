@@ -1,5 +1,8 @@
 # Nakode
 
+Application-owned AI CLI/SDK functionality is distinct from assistant delegation; see
+[scope, preserved gates, and offline coverage](docs/application-owned-ai-execution.md).
+
 Nakode is a provider-neutral agent server for orchestration, continuity, and
 execution. It owns the workspace runtime and canonical session state while
 replaceable frontends provide the interface. The included TUI is one thin

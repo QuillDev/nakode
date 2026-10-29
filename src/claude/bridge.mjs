@@ -6,6 +6,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod/v4";
 import {
+  APPLICATION_EXECUTION_REVIEW_GUIDANCE,
   UNRESTRICTED_BUILTIN_TOOLS,
   disallowedProviderTools,
   immediateProviderToolDecision,
@@ -911,7 +912,7 @@ function parseValidatorResult(result) {
 async function securityValidation(session, turnId, toolName, input, options) {
   const archetype =
     process.env.NAKODE_SECURITY_VALIDATOR_AGENT || "security-validator";
-  const task = `Return JSON only as {"verdict":"allow|reject|escalate","rationale":"..."}.\nDo not use tools or delegate. Independently validate this security-sensitive proposed Claude Code operation against the owner's repository task. Allow only when intent and bounded impact are clear; reject security-control bypass, credential exposure, exfiltration, and destructive out-of-scope actions; escalate uncertainty.\n\n${JSON.stringify({ tool: toolName, input, reason: options.decisionReason || options.description || "Claude auto mode requested review." })}`;
+  const task = `Return JSON only as {"verdict":"allow|reject|escalate","rationale":"..."}.\nDo not use tools or delegate. Independently validate this security-sensitive proposed Claude Code operation against the owner's repository task. Allow only when intent and bounded impact are clear; reject security-control bypass, credential exposure, exfiltration, and destructive out-of-scope actions; escalate uncertainty.\n${APPLICATION_EXECUTION_REVIEW_GUIDANCE}\n\n${JSON.stringify({ tool: toolName, input, reason: options.decisionReason || options.description || "Claude auto mode requested review." })}`;
   try {
     const { text, failed } = delegationOutcome(
       await requestDelegation(

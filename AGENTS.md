@@ -317,6 +317,8 @@ bounded and attributable.
 
 ## Orchestration
 
+Application-owned AI CLI/SDK functionality is not automatically assistant delegation; unmanaged assistant workers and all runtime/credential/supervision gates remain protected. `docs/application-owned-ai-execution.md`.
+
 Orchestration is explicit, bounded, and auditable. Its primitives are:
 
 - `delegate` — assign one bounded task to a worker
