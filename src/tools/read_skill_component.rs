@@ -3,6 +3,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Tool, ToolConcurrency, ToolContext, ToolFuture, ToolResult, required_string};
 use crate::runtime::ToolDefinition;
+use crate::skill::SkillCatalog;
 
 pub struct ReadSkillComponentTool;
 
@@ -51,43 +52,44 @@ impl Tool for ReadSkillComponentTool {
         _cancellation: &'a CancellationToken,
     ) -> ToolFuture<'a> {
         Box::pin(async move {
-            let result = (|| {
-                let name = required_string(&arguments, "name")?;
-                let component_name = required_string(&arguments, "component_name")?;
-                let skill = context.session.skill_catalogue.find(name).ok_or_else(|| {
-                    format!("skill {name:?} is disabled or unavailable for the current profile")
-                })?;
-                let component = skill.component(component_name).ok_or_else(|| {
-                    format!(
-                        "component {component_name:?} was not advertised by skill {name:?}; call read_skill and use an exact component_name from components"
-                    )
-                })?;
-                if component.owner_skill() != name
-                    && context
-                        .session
-                        .skill_catalogue
-                        .find(component.owner_skill())
-                        .is_none()
-                {
-                    return Err(format!(
-                        "component {component_name:?} belongs to disabled or unavailable skill {:?}",
-                        component.owner_skill()
-                    ));
-                }
-                Ok::<_, String>((
-                    json!({
-                        "name": name,
-                        "component_name": component.component_name,
-                        "file_path": component.file_path,
-                        "component_content": component.contents,
-                    })
-                    .to_string(),
-                    skill.stable_id().to_owned(),
-                ))
-            })();
-            result.map_or_else(ToolResult::failure, |(payload, identity)| {
-                ToolResult::success(payload).with_invocation_identity(identity)
-            })
+            read_skill_component(&context.session.skill_catalogue, &arguments).map_or_else(
+                ToolResult::failure,
+                |(payload, identity)| {
+                    ToolResult::success(payload).with_invocation_identity(identity)
+                },
+            )
         })
     }
+}
+
+/// Resolves one `read_skill_component` call against the session's effective catalogue, returning
+/// the component payload and the owning skill's stable invocation identity.
+pub(crate) fn read_skill_component(
+    catalogue: &SkillCatalog,
+    arguments: &Value,
+) -> Result<(String, String), String> {
+    let name = required_string(arguments, "name")?;
+    let component_name = required_string(arguments, "component_name")?;
+    let skill = catalogue.find(name).ok_or_else(|| {
+        format!("skill {name:?} is disabled or unavailable for the current profile")
+    })?;
+    let component = skill.component(component_name).ok_or_else(|| {
+        format!(
+            "component {component_name:?} was not advertised by skill {name:?}; call read_skill and use an exact component_name from components"
+        )
+    })?;
+    if component.owner_skill() != name && catalogue.find(component.owner_skill()).is_none() {
+        return Err(format!(
+            "component {component_name:?} belongs to disabled or unavailable skill {:?}",
+            component.owner_skill()
+        ));
+    }
+    let payload = json!({
+        "name": name,
+        "component_name": component.component_name,
+        "file_path": component.file_path,
+        "component_content": component.contents,
+    })
+    .to_string();
+    Ok((payload, skill.stable_id().to_owned()))
 }

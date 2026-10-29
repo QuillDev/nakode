@@ -88,11 +88,12 @@ function delegationOutcome(toolResult) {
 function nakodeServer(
   session,
   turn,
-  { delegate: withDelegate, returnImage, materials, desktop, browser, backgroundTasks },
+  { delegate: withDelegate, returnImage, materials, skills, desktop, browser, backgroundTasks },
 ) {
   const tools = [];
   if (returnImage) tools.push(returnImageTool(session, turn));
   for (const name of materials) tools.push(materialTool(name, session, turn));
+  for (const name of skills) tools.push(skillTool(name, session, turn));
   if (backgroundTasks) tools.push(backgroundTasksTool(session, turn));
   for (const name of desktop) tools.push(desktopTool(name, session, turn));
   if (browser) tools.push(browserControlTool(session, turn));
@@ -351,6 +352,43 @@ function materialTool(name, session, turn) {
   );
 }
 
+// Nakode's skill loader, as the native runtime offers it. The supervisor resolves each call
+// against the catalogue of the turn that issued it.
+const SKILL_TOOLS = {
+  read_skill: {
+    description:
+      "Load one installed Nakode skill by exact catalogue name as structured JSON containing skill_instructions, skill_content, and the auto-discovered components catalogue. Component bodies are loaded separately with read_skill_component, so agents never search package directories or receive unused reference material.",
+    schema: {
+      name: z
+        .string()
+        .min(1)
+        .describe("Exact installed skill name from the Nakode skill catalogue."),
+    },
+  },
+  read_skill_component: {
+    description:
+      "Load one exact Markdown component advertised by a prior read_skill result. Use the skill name and component_name from that result; this tool never accepts an arbitrary filesystem path.",
+    schema: {
+      name: z.string().min(1).describe("Exact installed skill name used with read_skill."),
+      component_name: z
+        .string()
+        .min(1)
+        .describe("Exact component_name returned in read_skill.components."),
+    },
+  },
+};
+
+function skillTool(name, session, turn) {
+  const { description, schema } = SKILL_TOOLS[name];
+  return tool(name, description, schema, async (args) =>
+    new Promise((resolve) => {
+      const id = randomUUID();
+      externalToolCalls.set(id, { resolve, sessionId: session.sessionId, turnId: turn.turnId });
+      write({ event: "skill_request", id, turnId: turn.turnId, tool: name, arguments: args });
+    }),
+  );
+}
+
 // Claude's provider identity for Nakode's canonical `nakode_agent` tool, with the same arguments.
 function delegateTool(session, turn) {
   return tool(
@@ -527,6 +565,8 @@ const NAKODE_MCP_TOOLS = new Set([
   "mcp__nakode__return_image",
   "mcp__nakode__list_child_materials",
   "mcp__nakode__prepare_image",
+  "mcp__nakode__read_skill",
+  "mcp__nakode__read_skill_component",
   "mcp__nakode__background_tasks",
   "mcp__nakode__desktop_screenshot",
   "mcp__nakode__desktop_action",
@@ -789,6 +829,8 @@ const POLICY_TOOL_NAMES = new Map([
   ["find", ["Glob"]],
   ["bash", ["Bash"]],
   ["background_tasks", ["mcp__nakode__background_tasks"]],
+  ["read_skill", ["mcp__nakode__read_skill"]],
+  ["read_skill_component", ["mcp__nakode__read_skill_component"]],
   ["write", ["Write"]],
   ["edit", ["Edit"]],
   ["ask", ["AskUserQuestion"]],
@@ -806,6 +848,8 @@ const CLAUDE_POLICY_TOOLS = new Set([
   "mcp__nakode__background_tasks",
   "mcp__nakode__list_child_materials",
   "mcp__nakode__prepare_image",
+  "mcp__nakode__read_skill",
+  "mcp__nakode__read_skill_component",
 ]);
 
 /**
@@ -1482,6 +1526,10 @@ async function sendTurn(command) {
   const materials = session.ownerSessionId && !session.replaceBuiltinTools
     ? Object.keys(MATERIAL_TOOLS).filter((name) => allows(`mcp__nakode__${name}`))
     : [];
+  // Like native built-ins, absent when external tools replace the built-in set.
+  const skills = session.replaceBuiltinTools
+    ? []
+    : Object.keys(SKILL_TOOLS).filter((name) => allows(`mcp__nakode__${name}`));
   // Ownership is bound by the supervisor from the logical owner; without one the tool is absent.
   const backgroundTasks = Boolean(
     session.ownerSessionId && allows("mcp__nakode__background_tasks"),
@@ -1500,6 +1548,7 @@ async function sendTurn(command) {
     withDelegate ||
     returnImage ||
     materials.length > 0 ||
+    skills.length > 0 ||
     backgroundTasks ||
     desktop.length > 0 ||
     browser
@@ -1507,7 +1556,7 @@ async function sendTurn(command) {
     mcpServers.nakode = nakodeServer(
       session,
       { turnId: command.turnId, workspace: command.workspace },
-      { delegate: withDelegate, returnImage, materials, desktop, browser, backgroundTasks },
+      { delegate: withDelegate, returnImage, materials, skills, desktop, browser, backgroundTasks },
     );
   }
   if (session.externalTools.length > 0) {
@@ -1841,6 +1890,7 @@ async function handle(command) {
       break;
     case "resolve_image_return":
     case "resolve_material":
+    case "resolve_skill":
     case "resolve_background_task":
     case "resolve_delegation":
       resolveExternalToolCall(

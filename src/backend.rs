@@ -109,6 +109,12 @@ const PROVIDER_TOOL_IDENTITIES: &[(&str, &str, &str)] = &[
         "prepare_image",
         "mcp__nakode__prepare_image",
     ),
+    (CLAUDE_PROVIDER, "read_skill", "mcp__nakode__read_skill"),
+    (
+        CLAUDE_PROVIDER,
+        "read_skill_component",
+        "mcp__nakode__read_skill_component",
+    ),
     (
         CLAUDE_PROVIDER,
         "desktop_screenshot",
@@ -1401,11 +1407,18 @@ mod tests {
                 "{provider}"
             );
         }
-        for provider in [CLAUDE_PROVIDER, CURSOR_PROVIDER] {
-            let projection = project_provider_tools(provider, Some(&loader));
-            assert_eq!(projection.allowed_tools, Some(Vec::new()), "{provider}");
-            assert_eq!(projection.unsupported_canonical_tools, loader, "{provider}");
-        }
+        let claude = project_provider_tools(CLAUDE_PROVIDER, Some(&loader));
+        assert_eq!(
+            claude.allowed_tools,
+            Some(vec![
+                "mcp__nakode__read_skill".to_owned(),
+                "mcp__nakode__read_skill_component".to_owned(),
+            ])
+        );
+        assert!(claude.unsupported_canonical_tools.is_empty());
+        let cursor = project_provider_tools(CURSOR_PROVIDER, Some(&loader));
+        assert_eq!(cursor.allowed_tools, Some(Vec::new()));
+        assert_eq!(cursor.unsupported_canonical_tools, loader);
     }
 
     #[test]
