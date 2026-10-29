@@ -287,3 +287,27 @@ async fn several_images_attach_in_order_in_one_call_or_not_at_all() {
     assert_eq!(image.history_item().attachments.len(), 2);
     assert_eq!(session.returned_images.len(), 1);
 }
+
+#[test]
+fn kept_images_note_names_the_kept_and_dropped_images() {
+    let partial = kept_images_note(3, 5);
+    assert!(
+        partial.starts_with("Kept 3 of this result's 5 images in the transcript, as Tool images 1–3; images 4–5 not kept"),
+        "{partial}"
+    );
+    assert!(partial.contains("at most 8 images and 20 MiB"), "{partial}");
+    assert!(partial.contains("cannot be retrieved later"), "{partial}");
+
+    let one_dropped = kept_images_note(1, 2);
+    assert!(
+        one_dropped.contains("as Tool image 1; image 2 not kept"),
+        "{one_dropped}"
+    );
+
+    let none = kept_images_note(0, 2);
+    assert!(
+        none.starts_with("None of this result's 2 images were kept in the transcript"),
+        "{none}"
+    );
+    assert!(!none.contains("Tool image"), "{none}");
+}

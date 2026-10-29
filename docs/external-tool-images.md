@@ -14,7 +14,13 @@ The server rejects the whole result as invalid when:
 
 ## Retention
 
-Accepted images become one returned transcript image for the call (`ImageReturned`, id `<turn>:image:<call>`, labels `Tool image N`), so clients and history see them like `return_image` output. The per-turn limits of `return_image` still apply: eight images and 20 MiB per turn, counted together. Past them the call keeps its images in order while they fit, and the text result says how many of them were kept; the model still sees all of them in that result, but the others cannot be retrieved later.
+Accepted images become one returned transcript image for the call (`ImageReturned`, id `<turn>:image:<call>`, labels `Tool image N`), so clients and history see them like `return_image` output. The per-turn limits of `return_image` still apply: eight images and 20 MiB per turn, counted together. Past them the call keeps its images in order while they fit, and the text result names the kept and the dropped ones (`Kept 3 of this result's 5 images in the transcript, as Tool images 1–3; images 4–5 not kept …`, or `None of this result's 2 images were kept …` once the turn is full). The model still sees every image in that result; a dropped image is never stored, so nothing can retrieve it later. Delivery failure (the transcript receiver gone) appends `Its images were not attached: …` and keeps nothing.
+
+Kept images are ordinary transcript artifacts that persist with the session and go when it is deleted:
+
+- Owners and clients read them through session history, and by artifact id through `GetSessionImage`.
+- A parent session, or a native delegated run inspecting its own run, lists them with `list_child_materials` (exact source session and optional run) and copies one into its own turn with `prepare_image { source, image_reference, inspect: true }`, under that turn's own image limits.
+- The calling conversation cannot name them yet. Its artifact id is derived from the transcript entry that records the image, which is created after the tool result text is written, so the result carries labels (`Tool image N`) rather than a reference, and `prepare_image` without `source` needs a reference it does not have. Closing this gap needs the result to carry the artifact references, which means a deterministic entry id for returned images, or a self-scoped material listing.
 
 The tool result text gains a short "attached to the assistant transcript" note when images are kept.
 

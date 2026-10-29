@@ -3395,7 +3395,7 @@ process.stdout.write(output);
             notes[2]
                 .as_deref()
                 .expect("a note")
-                .starts_with("Kept 0 of this result's 1 images")
+                .starts_with("None of this result's 1 image was kept")
         );
     }
 
