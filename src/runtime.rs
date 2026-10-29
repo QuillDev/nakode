@@ -4506,6 +4506,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_tool_images_are_not_recorded_when_the_transcript_is_gone() {
+        let mut session = RuntimeSession::new("test-model".to_owned(), "Test.".to_owned());
+        let (events, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let screenshot = crate::backend::PromptImage {
+            mime_type: "image/png".to_owned(),
+            data: b"\x89PNG\r\n\x1a\n".to_vec(),
+        };
+        let retained = super::retain_external_tool_images(
+            &mut session,
+            "turn",
+            "call",
+            vec![screenshot],
+            &events,
+        )
+        .await;
+        assert!(retained.is_err());
+        // Nothing counts against the turn's budget for an image no transcript received.
+        assert!(session.returned_images.is_empty());
+    }
+
+    #[tokio::test]
     async fn external_tool_result_images_are_retained_for_the_transcript() {
         let directory = tempfile::tempdir().expect("workspace");
         let provider = Arc::new(ExternalToolProvider {

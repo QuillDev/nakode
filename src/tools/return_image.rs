@@ -72,14 +72,40 @@ pub(crate) fn returned_images_output(count: usize) -> String {
     }
 }
 
-/// Says a tool result's images were shown but only some kept, when a turn's bounds were reached.
+/// Says which of a tool result's images the transcript kept, when a turn's bounds were reached:
+/// the kept ones stay in session history, the others exist only in this result.
 pub(crate) fn kept_images_note(kept: usize, total: usize) -> String {
-    format!(
-        "Kept {kept} of this result's {total} images in the transcript: a turn keeps at most \
-         {MAX_IMAGES_PER_TURN} images and {} MiB. All of them are in this result, but the others \
-         cannot be retrieved later.",
+    let limit = format!(
+        "a turn keeps at most {MAX_IMAGES_PER_TURN} images and {} MiB",
         MAX_BYTES_PER_TURN / (1024 * 1024),
+    );
+    let dropped = numbered_images(kept + 1, total);
+    if kept == 0 {
+        let images = if total == 1 {
+            "image was"
+        } else {
+            "images were"
+        };
+        return format!(
+            "None of this result's {total} {images} kept in the transcript: {limit}, and this \
+             turn has reached it. They are only in this result and cannot be retrieved later."
+        );
+    }
+    format!(
+        "Kept {kept} of this result's {total} images in the transcript, as Tool {}; {dropped} \
+         not kept: {limit}. The kept images stay in the session history. The others are only in \
+         this result and cannot be retrieved later.",
+        numbered_images(1, kept),
     )
+}
+
+/// "image 3" or "images 2–4".
+fn numbered_images(first: usize, last: usize) -> String {
+    if first == last {
+        format!("image {first}")
+    } else {
+        format!("images {first}–{last}")
+    }
 }
 
 /// A validated image file, ready to attach.
