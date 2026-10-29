@@ -8684,13 +8684,18 @@ mod tests {
 
     #[test]
     fn fresh_session_refuses_to_publish_an_unprojectable_skill_loader() {
-        let mut state =
-            AppState::new_for_backend(project_workspace(), None, 100, CLAUDE_PROVIDER, "Claude");
+        let mut state = AppState::new_for_backend(
+            project_workspace(),
+            None,
+            100,
+            crate::backend::CURSOR_PROVIDER,
+            "Cursor",
+        );
         state.handle_provider_backend(
-            CLAUDE_PROVIDER,
+            crate::backend::CURSOR_PROVIDER,
             BackendEvent::Ready(BackendIdentity {
-                provider: CLAUDE_PROVIDER.to_owned(),
-                display_name: "Claude".to_owned(),
+                provider: crate::backend::CURSOR_PROVIDER.to_owned(),
+                display_name: "Cursor".to_owned(),
                 version: None,
                 capabilities: BackendCapabilities {
                     external_tools: CapabilitySupport::Supported,
@@ -8716,7 +8721,7 @@ mod tests {
         let error = core
             .create_session_command(&workspace_id, None, &ModelOptions::default(), Some(tools))
             .expect_err("unsupported skill loader must fail before publication");
-        assert!(error.to_string().contains("provider Claude"));
+        assert!(error.to_string().contains("provider Cursor"));
         assert!(
             error
                 .to_string()
@@ -8729,10 +8734,10 @@ mod tests {
     fn persisted_session_surfaces_unsupported_provider_tool_error() {
         let (mut core, _) = ready_external_tools_server();
         core.session_template.handle_provider_backend(
-            CLAUDE_PROVIDER,
+            crate::backend::CURSOR_PROVIDER,
             BackendEvent::Ready(BackendIdentity {
-                provider: CLAUDE_PROVIDER.to_owned(),
-                display_name: "Claude".to_owned(),
+                provider: crate::backend::CURSOR_PROVIDER.to_owned(),
+                display_name: "Cursor".to_owned(),
                 version: None,
                 capabilities: BackendCapabilities {
                     resume: CapabilitySupport::Supported,
@@ -8740,20 +8745,20 @@ mod tests {
                 },
             }),
         );
-        install_available_tools(&mut core, CLAUDE_PROVIDER, &["read", "ask"]);
-        let restored_id = SessionId::from("restored-claude-session");
+        install_available_tools(&mut core, crate::backend::CURSOR_PROVIDER, &["read", "ask"]);
+        let restored_id = SessionId::from("restored-cursor-session");
         core.replace_session_records(vec![SessionRecord {
             relationship_revision: 0,
             parent_session_id: None,
             first_prompt_preview: String::new(),
             initial_instructions: None,
             id: restored_id.to_string(),
-            provider: CLAUDE_PROVIDER.to_owned(),
-            provider_session_id: "claude-thread".to_owned(),
+            provider: crate::backend::CURSOR_PROVIDER.to_owned(),
+            provider_session_id: "cursor-thread".to_owned(),
             account_id: None,
             workspace: "/tmp/project".to_owned(),
             working_directory: "/tmp/project".to_owned(),
-            title: "Historical Claude session".to_owned(),
+            title: "Historical Cursor session".to_owned(),
             model: None,
             model_options: crate::backend::ModelOptions::default(),
             last_turn: None,
@@ -8782,7 +8787,7 @@ mod tests {
         let error = core
             .open_session_command(&restored_id, Some(tools))
             .expect_err("unsupported resumed skill loader must return a provider-specific error");
-        assert!(error.to_string().contains("provider claude-agent"));
+        assert!(error.to_string().contains("provider cursor-sdk"));
         assert!(
             error
                 .to_string()

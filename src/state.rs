@@ -12165,12 +12165,20 @@ mod tests {
                 .contains("read_skill({\"name\":\"review\"})")
         );
 
+        // Claude exposes the loader through its Nakode MCP server, so it advertises the catalogue.
         state.backend_provider = CLAUDE_PROVIDER.to_owned();
+        assert!(
+            state
+                .rendered_skill_catalogue()
+                .contains("read_skill({\"name\":\"review\"})")
+        );
+
+        state.backend_provider = CURSOR_PROVIDER.to_owned();
         let unsupported = state.rendered_skill_catalogue();
         assert_eq!(unsupported, "- none");
         let instructions = state.nakode_system_instructions();
         assert!(!instructions.contains("[Nakode Available Skills]"));
-        assert!(!instructions.contains("provider claude-agent"));
+        assert!(!instructions.contains("provider cursor-sdk"));
         assert!(!instructions.contains("skill-loader tools"));
 
         let attached = catalogue

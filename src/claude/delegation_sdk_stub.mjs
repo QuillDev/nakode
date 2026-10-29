@@ -5,6 +5,7 @@
 // handed a Nakode executable to shell out to, or if any native subagent route is left open.
 
 const TOOL_USE_ID = "toolu_stub_delegate";
+const SKILL_TOOL_USE_ID = "toolu_stub_read_skill";
 const NATIVE_AGENT_ID = "toolu_native_agent";
 const NATIVE_TASK_ID = "toolu_native_task";
 const FUTURE_NATIVE_ID = "toolu_future_native";
@@ -131,6 +132,11 @@ export function query({ options }) {
       return;
     }
 
+    if (process.env.NAKODE_STUB_SCENARIO === "skill") {
+      yield* readSkill(options);
+      return;
+    }
+
     // A configuration path (settings, plugins, a future SDK) could still offer the native tool.
     const attempts = [
       await nativeAttempt(
@@ -211,4 +217,39 @@ export function query({ options }) {
     };
     yield { type: "result", subtype: "success", result: "delegated" };
   })();
+}
+
+// Calls Nakode's `read_skill` the way Claude Code calls an MCP tool.
+async function* readSkill(options) {
+  const nakode = options.mcpServers?.nakode;
+  const readSkillTool = nakode?.tools?.find((candidate) => candidate.name === "read_skill");
+  if (!readSkillTool) {
+    yield { type: "result", subtype: "error", is_error: true, result: "read_skill tool missing" };
+    return;
+  }
+  const input = { name: "review" };
+  yield {
+    type: "assistant",
+    message: {
+      content: [{ type: "tool_use", id: SKILL_TOOL_USE_ID, name: "mcp__nakode__read_skill", input }],
+    },
+  };
+  const output = await readSkillTool.handler(input, {
+    _meta: { "claudecode/toolUseId": SKILL_TOOL_USE_ID },
+    signal: options.abortController.signal,
+  });
+  yield {
+    type: "user",
+    message: {
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: SKILL_TOOL_USE_ID,
+          content: output.content,
+          is_error: output.isError === true,
+        },
+      ],
+    },
+  };
+  yield { type: "result", subtype: "success", result: "skill read" };
 }

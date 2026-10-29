@@ -579,6 +579,9 @@ async fn run_supervisor(
     let mut delegations = ClaudeDelegations::new(config.native_delegation.clone());
     let mut materials = materials::ClaudeMaterials::new(config.native_delegation.clone());
     let mut browser_calls = BrowserCalls::default();
+    // Each turn carries the logical session's current effective catalogue; skill reads use the
+    // catalogue of the turn that issued them.
+    let mut skill_catalogue = crate::skill::SkillCatalog::default();
     // Background task calls may wait on process termination, so they run off this loop.
     let (background_replies_tx, mut background_replies) = mpsc::channel::<Value>(16);
     let mut authentication_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -599,6 +602,9 @@ async fn run_supervisor(
                 delegations.observe_command(&command);
                 browser_calls.observe_command(&command);
                 match &command {
+                    BackendCommand::StartTurn { skill_catalogue: catalogue, .. } => {
+                        skill_catalogue = catalogue.clone();
+                    }
                     BackendCommand::InterruptTurn { turn_id, .. } => materials.forget_turn(turn_id),
                     BackendCommand::UnsubscribeSession { .. } | BackendCommand::Shutdown => {
                         materials.forget_all();
@@ -816,6 +822,16 @@ async fn run_supervisor(
                 if event_name == Some(materials::MATERIAL_REQUEST_EVENT) {
                     // Identity is bound from the control plane; any identity in the payload is ignored.
                     materials.start(&message, &delegation_scope);
+                    continue;
+                }
+                if event_name == Some(SKILL_REQUEST_EVENT) {
+                    let (reply, invoked) = skill_reply(&message, &skill_catalogue);
+                    if let Some(invoked) = invoked {
+                        let _ = events.send(invoked).await;
+                    }
+                    if let Some(bridge) = bridge.as_mut() {
+                        let _ = send(bridge, reply).await;
+                    }
                     continue;
                 }
                 if event_name == Some(DELEGATION_CANCELLED_EVENT) {
@@ -1669,6 +1685,45 @@ async fn retain_external_tool_images(
     };
     let _ = events.send(BackendEvent::ImageReturned(image)).await;
     note
+}
+
+/// Bridge request event emitted by the Claude skill-loader tools.
+const SKILL_REQUEST_EVENT: &str = "skill_request";
+
+/// The bridge answer for one `read_skill` or `read_skill_component` call, resolved against the
+/// current turn's catalogue exactly as the native tools resolve it. A successful `read_skill` also
+/// yields the same invocation telemetry event the native runtime records.
+fn skill_reply(
+    message: &Value,
+    catalogue: &crate::skill::SkillCatalog,
+) -> (Value, Option<BackendEvent>) {
+    let id = string(message, "id");
+    let tool = string(message, "tool");
+    let arguments = message.get("arguments").cloned().unwrap_or(Value::Null);
+    let result = match tool.as_str() {
+        "read_skill" => crate::tools::read_skill::read_skill(catalogue, &arguments),
+        "read_skill_component" => {
+            crate::tools::read_skill_component::read_skill_component(catalogue, &arguments)
+        }
+        other => Err(format!("unknown skill tool {other:?}")),
+    };
+    let mut invoked = None;
+    let (output, failed) = match result {
+        Ok((payload, identity)) => {
+            if tool == "read_skill" {
+                invoked = Some(BackendEvent::SkillInvoked {
+                    invocation_key: format!("skill:{}:{id}", string(message, "turnId")),
+                    identity,
+                    display_label: string(&arguments, "name"),
+                    occurred_at_ms: now_ms(),
+                });
+            }
+            (payload, false)
+        }
+        Err(error) => (error, true),
+    };
+    let reply = json!({"method": "resolve_skill", "id": id, "output": output, "failed": failed});
+    (reply, invoked)
 }
 
 /// The bridge answer for one material call. An inspected preview is attached to the transcript only
@@ -2712,6 +2767,68 @@ fn capabilities() -> BackendCapabilities {
 mod tests {
     use super::*;
 
+    #[test]
+    fn skill_requests_resolve_against_the_turn_catalogue() {
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = workspace.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code carefully\n---\n\nCheck correctness and tests.\n",
+        )
+        .unwrap();
+        let catalogue = crate::skill::SkillCatalog::load(workspace.path()).unwrap();
+        let request = |tool: &str, arguments: Value| json!({"event": "skill_request", "id": "call-1", "turnId": "turn-1", "tool": tool, "arguments": arguments});
+
+        let (loaded, invoked) = skill_reply(
+            &request("read_skill", json!({"name": "review"})),
+            &catalogue,
+        );
+        assert!(matches!(
+            invoked,
+            Some(BackendEvent::SkillInvoked { invocation_key, display_label, .. })
+                if invocation_key == "skill:turn-1:call-1" && display_label == "review"
+        ));
+        assert_eq!(loaded["method"], "resolve_skill");
+        assert_eq!(loaded["id"], "call-1");
+        assert_eq!(loaded["failed"], false);
+        assert!(
+            loaded["output"]
+                .as_str()
+                .unwrap()
+                .contains("Check correctness and tests.")
+        );
+
+        let (missing, invoked) = skill_reply(
+            &request("read_skill", json!({"name": "absent"})),
+            &catalogue,
+        );
+        assert_eq!(missing["failed"], true);
+        assert!(invoked.is_none());
+
+        let (component, _) = skill_reply(
+            &request(
+                "read_skill_component",
+                json!({"name": "review", "component_name": "absent"}),
+            ),
+            &catalogue,
+        );
+        assert_eq!(component["failed"], true);
+        assert!(
+            component["output"]
+                .as_str()
+                .unwrap()
+                .contains("was not advertised")
+        );
+
+        // A session whose turn carried no catalogue resolves nothing.
+        let (empty, _) = skill_reply(
+            &request("read_skill", json!({"name": "review"})),
+            &crate::skill::SkillCatalog::default(),
+        );
+        assert_eq!(empty["failed"], true);
+    }
+
     fn inspected(id: &str, turn: &str) -> materials::MaterialCompletion {
         let artifact = nakode_protocol::ArtifactView {
             id: nakode_protocol::ArtifactId::from("artifact-1".to_owned()),
@@ -3146,6 +3263,122 @@ mod tests {
             row.body,
             "[Subagent Result] [agent-7] [repo-explorer]\nNAKODE-CLAUDE-DELEGATION-7429"
         );
+
+        commands.send(BackendCommand::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(10), supervisor)
+            .await
+            .expect("supervisor stops")
+            .expect("supervisor task");
+    }
+
+    fn isolated_credential() -> ClaudeOAuthCredential {
+        ClaudeOAuthCredential {
+            access_token: "isolated-test-token".to_owned(),
+            refresh_token: String::new(),
+            expires_at_ms: now_ms() + 24 * 60 * 60 * 1_000,
+            authorized_at_ms: None,
+            account_id: None,
+            email: None,
+            organization_id: None,
+            organization_name: None,
+            brokered: true,
+        }
+    }
+
+    /// The real bridge offers Nakode's skill loader to Claude, and the supervisor answers it from
+    /// the catalogue the turn carried, so an advertised skill is also a loadable one.
+    #[tokio::test]
+    async fn claude_read_skill_tool_loads_from_the_turn_catalogue() {
+        let skills = tempfile::tempdir().expect("skills");
+        let skill_directory = skills.path().join(".agents/skills/review");
+        std::fs::create_dir_all(&skill_directory).unwrap();
+        std::fs::write(
+            skill_directory.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code carefully\n---\n\nNAKODE-CLAUDE-SKILL-5813\n",
+        )
+        .unwrap();
+        let catalogue = crate::skill::SkillCatalog::load(skills.path()).expect("skill catalogue");
+
+        let directory = stub_sdk_bridge_directory();
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut command = bridge_command(directory.path());
+        command.env("NAKODE_CLAUDE_PERMISSION_MODE", "bypassPermissions");
+        command.env("NAKODE_STUB_SCENARIO", "skill");
+        let bridge = start_bridge_process(command).expect("bridge process");
+        let config = BackendConfig::native(workspace.path().to_path_buf());
+        let (commands, command_rx) = mpsc::channel(8);
+        let (event_tx, mut events) = mpsc::channel(64);
+        let supervisor = tokio::spawn(run_supervisor(
+            false,
+            config,
+            Some(isolated_credential()),
+            false,
+            Some(bridge),
+            command_rx,
+            event_tx,
+        ));
+
+        commands
+            .send(BackendCommand::StartSession {
+                model: Some("opus".to_owned()),
+                instructions: None,
+                owner_session_id: Some("owner-session".to_owned()),
+                parent_run_id: None,
+                enabled_skill_ids: catalogue.stable_ids(),
+                external_tools: Vec::new(),
+                replace_builtin_tools: false,
+                code_mode: false,
+                allowed_builtin_tools: None,
+                max_turns: None,
+                finalization_reserve_turns: 0,
+                timeout_seconds: None,
+            })
+            .await
+            .unwrap();
+        let provider_session_id = next_matching(&mut events, |event| match event {
+            BackendEvent::SessionCreated {
+                provider_session_id,
+                ..
+            } => Some(provider_session_id),
+            _ => None,
+        })
+        .await;
+        commands
+            .send(BackendCommand::StartTurn {
+                provider_session_id,
+                client_id: "turn-1".to_owned(),
+                prompt: "Load the review skill.".to_owned(),
+                attachments: Vec::new(),
+                model: None,
+                skill_catalogue: catalogue,
+            })
+            .await
+            .unwrap();
+
+        let mut skill_row = None;
+        let mut invoked_label = None;
+        let outcome = next_matching(&mut events, |event| match event {
+            BackendEvent::ItemCompleted { item, .. } if item.id == "toolu_stub_read_skill" => {
+                skill_row = Some(item);
+                None
+            }
+            BackendEvent::SkillInvoked { display_label, .. } => {
+                invoked_label = Some(display_label);
+                None
+            }
+            BackendEvent::TurnCompleted { outcome, error, .. } => Some((outcome, error)),
+            _ => None,
+        })
+        .await;
+        assert_eq!(outcome, (TurnOutcome::Completed, None));
+        let row = skill_row.expect("completed read_skill row");
+        assert_eq!(row.status, ItemStatus::Complete);
+        assert!(
+            row.body.contains("NAKODE-CLAUDE-SKILL-5813"),
+            "{}",
+            row.body
+        );
+        assert_eq!(invoked_label.as_deref(), Some("review"));
 
         commands.send(BackendCommand::Shutdown).await.unwrap();
         timeout(Duration::from_secs(10), supervisor)

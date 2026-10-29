@@ -3,6 +3,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Tool, ToolConcurrency, ToolContext, ToolFuture, ToolResult, required_string};
 use crate::runtime::ToolDefinition;
+use crate::skill::SkillCatalog;
 
 pub struct ReadSkillTool;
 
@@ -44,16 +45,25 @@ impl Tool for ReadSkillTool {
         _cancellation: &'a CancellationToken,
     ) -> ToolFuture<'a> {
         Box::pin(async move {
-            let result = (|| {
-                let name = required_string(&arguments, "name")?;
-                let skill = context.session.skill_catalogue.find(name).ok_or_else(|| {
-                    format!("skill {name:?} is disabled or unavailable for the current profile")
-                })?;
-                Ok::<_, String>((skill.instructions.clone(), skill.stable_id().to_owned()))
-            })();
-            result.map_or_else(ToolResult::failure, |(instructions, identity)| {
-                ToolResult::success(instructions).with_invocation_identity(identity)
-            })
+            read_skill(&context.session.skill_catalogue, &arguments).map_or_else(
+                ToolResult::failure,
+                |(instructions, identity)| {
+                    ToolResult::success(instructions).with_invocation_identity(identity)
+                },
+            )
         })
     }
+}
+
+/// Resolves one `read_skill` call against the session's effective catalogue, returning the skill
+/// payload and its stable invocation identity. Shared by every provider adapter that exposes it.
+pub(crate) fn read_skill(
+    catalogue: &SkillCatalog,
+    arguments: &Value,
+) -> Result<(String, String), String> {
+    let name = required_string(arguments, "name")?;
+    let skill = catalogue.find(name).ok_or_else(|| {
+        format!("skill {name:?} is disabled or unavailable for the current profile")
+    })?;
+    Ok((skill.instructions.clone(), skill.stable_id().to_owned()))
 }
