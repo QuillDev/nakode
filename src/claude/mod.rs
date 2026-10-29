@@ -3271,6 +3271,20 @@ mod tests {
             .expect("supervisor task");
     }
 
+    fn isolated_credential() -> ClaudeOAuthCredential {
+        ClaudeOAuthCredential {
+            access_token: "isolated-test-token".to_owned(),
+            refresh_token: String::new(),
+            expires_at_ms: now_ms() + 24 * 60 * 60 * 1_000,
+            authorized_at_ms: None,
+            account_id: None,
+            email: None,
+            organization_id: None,
+            organization_name: None,
+            brokered: true,
+        }
+    }
+
     /// The real bridge offers Nakode's skill loader to Claude, and the supervisor answers it from
     /// the catalogue the turn carried, so an advertised skill is also a loadable one.
     #[tokio::test]
@@ -3292,23 +3306,12 @@ mod tests {
         command.env("NAKODE_STUB_SCENARIO", "skill");
         let bridge = start_bridge_process(command).expect("bridge process");
         let config = BackendConfig::native(workspace.path().to_path_buf());
-        let credential = ClaudeOAuthCredential {
-            access_token: "isolated-test-token".to_owned(),
-            refresh_token: String::new(),
-            expires_at_ms: now_ms() + 24 * 60 * 60 * 1_000,
-            authorized_at_ms: None,
-            account_id: None,
-            email: None,
-            organization_id: None,
-            organization_name: None,
-            brokered: true,
-        };
         let (commands, command_rx) = mpsc::channel(8);
         let (event_tx, mut events) = mpsc::channel(64);
         let supervisor = tokio::spawn(run_supervisor(
             false,
             config,
-            Some(credential),
+            Some(isolated_credential()),
             false,
             Some(bridge),
             command_rx,
