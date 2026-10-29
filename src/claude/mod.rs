@@ -825,8 +825,12 @@ async fn run_supervisor(
                     continue;
                 }
                 if event_name == Some(SKILL_REQUEST_EVENT) {
+                    let (reply, invoked) = skill_reply(&message, &skill_catalogue);
+                    if let Some(invoked) = invoked {
+                        let _ = events.send(invoked).await;
+                    }
                     if let Some(bridge) = bridge.as_mut() {
-                        let _ = send(bridge, skill_reply(&message, &skill_catalogue)).await;
+                        let _ = send(bridge, reply).await;
                     }
                     continue;
                 }
@@ -1687,21 +1691,39 @@ async fn retain_external_tool_images(
 const SKILL_REQUEST_EVENT: &str = "skill_request";
 
 /// The bridge answer for one `read_skill` or `read_skill_component` call, resolved against the
-/// current turn's catalogue exactly as the native tools resolve it.
-fn skill_reply(message: &Value, catalogue: &crate::skill::SkillCatalog) -> Value {
+/// current turn's catalogue exactly as the native tools resolve it. A successful `read_skill` also
+/// yields the same invocation telemetry event the native runtime records.
+fn skill_reply(
+    message: &Value,
+    catalogue: &crate::skill::SkillCatalog,
+) -> (Value, Option<BackendEvent>) {
+    let id = string(message, "id");
+    let tool = string(message, "tool");
     let arguments = message.get("arguments").cloned().unwrap_or(Value::Null);
-    let result = match string(message, "tool").as_str() {
+    let result = match tool.as_str() {
         "read_skill" => crate::tools::read_skill::read_skill(catalogue, &arguments),
         "read_skill_component" => {
             crate::tools::read_skill_component::read_skill_component(catalogue, &arguments)
         }
         other => Err(format!("unknown skill tool {other:?}")),
     };
+    let mut invoked = None;
     let (output, failed) = match result {
-        Ok((payload, _identity)) => (payload, false),
+        Ok((payload, identity)) => {
+            if tool == "read_skill" {
+                invoked = Some(BackendEvent::SkillInvoked {
+                    invocation_key: format!("skill:{}:{id}", string(message, "turnId")),
+                    identity,
+                    display_label: string(&arguments, "name"),
+                    occurred_at_ms: now_ms(),
+                });
+            }
+            (payload, false)
+        }
         Err(error) => (error, true),
     };
-    json!({"method": "resolve_skill", "id": string(message, "id"), "output": output, "failed": failed})
+    let reply = json!({"method": "resolve_skill", "id": id, "output": output, "failed": failed});
+    (reply, invoked)
 }
 
 /// The bridge answer for one material call. An inspected preview is attached to the transcript only
@@ -2758,10 +2780,15 @@ mod tests {
         let catalogue = crate::skill::SkillCatalog::load(workspace.path()).unwrap();
         let request = |tool: &str, arguments: Value| json!({"event": "skill_request", "id": "call-1", "turnId": "turn-1", "tool": tool, "arguments": arguments});
 
-        let loaded = skill_reply(
+        let (loaded, invoked) = skill_reply(
             &request("read_skill", json!({"name": "review"})),
             &catalogue,
         );
+        assert!(matches!(
+            invoked,
+            Some(BackendEvent::SkillInvoked { invocation_key, display_label, .. })
+                if invocation_key == "skill:turn-1:call-1" && display_label == "review"
+        ));
         assert_eq!(loaded["method"], "resolve_skill");
         assert_eq!(loaded["id"], "call-1");
         assert_eq!(loaded["failed"], false);
@@ -2772,13 +2799,14 @@ mod tests {
                 .contains("Check correctness and tests.")
         );
 
-        let missing = skill_reply(
+        let (missing, invoked) = skill_reply(
             &request("read_skill", json!({"name": "absent"})),
             &catalogue,
         );
         assert_eq!(missing["failed"], true);
+        assert!(invoked.is_none());
 
-        let component = skill_reply(
+        let (component, _) = skill_reply(
             &request(
                 "read_skill_component",
                 json!({"name": "review", "component_name": "absent"}),
@@ -2794,7 +2822,7 @@ mod tests {
         );
 
         // A session whose turn carried no catalogue resolves nothing.
-        let empty = skill_reply(
+        let (empty, _) = skill_reply(
             &request("read_skill", json!({"name": "review"})),
             &crate::skill::SkillCatalog::default(),
         );
@@ -3325,9 +3353,14 @@ mod tests {
             .unwrap();
 
         let mut skill_row = None;
+        let mut invoked_label = None;
         let outcome = next_matching(&mut events, |event| match event {
             BackendEvent::ItemCompleted { item, .. } if item.id == "toolu_stub_read_skill" => {
                 skill_row = Some(item);
+                None
+            }
+            BackendEvent::SkillInvoked { display_label, .. } => {
+                invoked_label = Some(display_label);
                 None
             }
             BackendEvent::TurnCompleted { outcome, error, .. } => Some((outcome, error)),
@@ -3342,6 +3375,7 @@ mod tests {
             "{}",
             row.body
         );
+        assert_eq!(invoked_label.as_deref(), Some("review"));
 
         commands.send(BackendCommand::Shutdown).await.unwrap();
         timeout(Duration::from_secs(10), supervisor)

@@ -58,6 +58,7 @@ function fixture(mode = "bypassPermissions") {
   const readHistory = async () => [];
   const emitNativeAgentHistory = async () => {};
   const DESKTOP_TOOLS = {};
+  const SKILL_TOOLS = {};
   const UNRESTRICTED_BUILTIN_TOOLS = [];
   const TOOL_PERMISSION_GUIDANCE = "";
   sessions.set("session", { ...session, sessionId: "session", model: "opus", options: {} });

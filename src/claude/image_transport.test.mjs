@@ -33,6 +33,7 @@ test("Claude sends image+text and image-only SDK messages in new and resumed ses
   const claudeExecutable = () => ({});
   const interruptExternalToolCalls = () => {};
   const readHistory = async () => [];
+  const SKILL_TOOLS = {};
   const emitNativeAgentHistory = async () => {};
   const write = (message) => emitted.push(message);
   const errorMessage = (error) => error.message;
