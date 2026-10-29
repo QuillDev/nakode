@@ -2,6 +2,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use super::child_materials::MaterialRequester;
 use super::{Tool, ToolContext, ToolFuture, ToolResult};
 use crate::{
     backend::{
@@ -53,34 +54,9 @@ impl Tool for PrepareImageTool {
     ) -> ToolFuture<'a> {
         Box::pin(async move {
             let result = async {
-                let args: Arguments =
-                    serde_json::from_value(arguments).map_err(|error| error.to_string())?;
-                let recipe =
-                    (args.crop.is_some() || args.max_width.is_some() || args.max_height.is_some())
-                        .then_some(Recipe {
-                            source: args.image_reference.clone(),
-                            crop: args.crop,
-                            max_width: args.max_width,
-                            max_height: args.max_height,
-                        });
-                let reference = match &recipe {
-                    Some(recipe) => recipe.reference()?,
-                    None => args.image_reference,
-                };
-                let (artifact, source) = resolve_image(&context, reference, args.source).await?;
-                let output = json!({
-                    "image_reference": artifact.id,
-                    "source": source.as_ref().map(|origin| &origin.source),
-                    "origin": source,
-                    "width": artifact.width,
-                    "height": artifact.height,
-                    "format": artifact.media_type,
-                    "bytes": artifact.byte_length,
-                    "provenance": Recipe::parse(artifact.id.as_str())?,
-                    "preview_attached": args.inspect,
-                })
-                .to_string();
-                if args.inspect {
+                let requester = MaterialRequester::of(&context);
+                let prepared = prepare(&requester, arguments).await?;
+                if let Some(artifact) = prepared.preview {
                     let returned = context
                         .session
                         .returned_images
@@ -89,8 +65,8 @@ impl Tool for PrepareImageTool {
                         .collect::<Vec<_>>();
                     let bytes: usize = returned.iter().map(|image| image.image_bytes()).sum();
                     let count: usize = returned.iter().map(|image| image.image_count()).sum();
-                    if count >= 8 || bytes.saturating_add(artifact.data.len()) > 20 * 1024 * 1024 {
-                        return Err("preview limit is eight images / 20 MiB per turn".to_owned());
+                    if !preview_fits(count, bytes, artifact.data.len()) {
+                        return Err(PREVIEW_LIMIT.to_owned());
                     }
                     let image = ReturnedImage {
                         id: format!("{}:image:{}", context.turn_id, context.call_id),
@@ -99,14 +75,7 @@ impl Tool for PrepareImageTool {
                         model_id: context.session.model.clone(),
                         history_index: context.session.history_position(),
                         sequence: context.session.returned_images.len(),
-                        attachment: PromptAttachment {
-                            label: artifact.label,
-                            path: None,
-                            image: Some(PromptImage {
-                                mime_type: artifact.media_type,
-                                data: artifact.data,
-                            }),
-                        },
+                        attachment: preview_attachment(artifact),
                         more_attachments: Vec::new(),
                     };
                     context
@@ -119,7 +88,7 @@ impl Tool for PrepareImageTool {
                         .returned_images
                         .insert(context.call_id.to_owned(), image);
                 }
-                Ok::<_, String>(output)
+                Ok::<_, String>(prepared.output)
             };
             tokio::select! {
                 result = result => match result { Ok(output) => ToolResult::success(output), Err(error) => ToolResult::failure(error) },
@@ -129,8 +98,73 @@ impl Tool for PrepareImageTool {
     }
 }
 
+/// Refusal when an inspection preview would pass the turn's returned-image bounds.
+pub(crate) const PREVIEW_LIMIT: &str = "preview limit is eight images / 20 MiB per turn";
+
+/// Whether one more preview of `added` bytes fits a turn already holding `count` images of `bytes`.
+pub(crate) fn preview_fits(count: usize, bytes: usize, added: usize) -> bool {
+    use super::return_image::{MAX_BYTES_PER_TURN, MAX_IMAGES_PER_TURN};
+    count < MAX_IMAGES_PER_TURN && bytes.saturating_add(added) <= MAX_BYTES_PER_TURN
+}
+
+/// The transcript attachment for an inspected image.
+pub(crate) fn preview_attachment(artifact: nakode_protocol::ArtifactView) -> PromptAttachment {
+    PromptAttachment {
+        label: artifact.label,
+        path: None,
+        image: Some(PromptImage {
+            mime_type: artifact.media_type,
+            data: artifact.data,
+        }),
+    }
+}
+
+/// What `prepare_image` answers, and the resolved image when the caller asked to inspect it.
+/// Attaching that preview is the caller's, under its own turn's image bounds.
+pub(crate) struct Prepared {
+    pub output: String,
+    pub preview: Option<nakode_protocol::ArtifactView>,
+}
+
+/// Resolves one authorized image reference, transformed when asked, through the runtime's
+/// image and material services.
+pub(crate) async fn prepare(
+    requester: &MaterialRequester<'_>,
+    arguments: Value,
+) -> Result<Prepared, String> {
+    let args: Arguments = serde_json::from_value(arguments).map_err(|error| error.to_string())?;
+    let recipe = (args.crop.is_some() || args.max_width.is_some() || args.max_height.is_some())
+        .then_some(Recipe {
+            source: args.image_reference.clone(),
+            crop: args.crop,
+            max_width: args.max_width,
+            max_height: args.max_height,
+        });
+    let reference = match &recipe {
+        Some(recipe) => recipe.reference()?,
+        None => args.image_reference,
+    };
+    let (artifact, source) = resolve_image(requester, reference, args.source).await?;
+    let output = json!({
+        "image_reference": artifact.id,
+        "source": source.as_ref().map(|origin| &origin.source),
+        "origin": source,
+        "width": artifact.width,
+        "height": artifact.height,
+        "format": artifact.media_type,
+        "bytes": artifact.byte_length,
+        "provenance": Recipe::parse(artifact.id.as_str())?,
+        "preview_attached": args.inspect,
+    })
+    .to_string();
+    Ok(Prepared {
+        output,
+        preview: args.inspect.then_some(artifact),
+    })
+}
+
 async fn resolve_image(
-    context: &ToolContext<'_>,
+    requester: &MaterialRequester<'_>,
     reference: String,
     source: Option<nakode_protocol::MaterialSource>,
 ) -> Result<
@@ -142,7 +176,7 @@ async fn resolve_image(
 > {
     if let Some(source) = source {
         let value = super::child_materials::request(
-            context,
+            requester,
             source,
             crate::backend::NativeMaterialOperation::Image { reference },
         )
@@ -160,19 +194,18 @@ async fn resolve_image(
         );
         return Ok((material.artifact, Some(material.scope)));
     }
-    let owner_session_id = context
-        .session
+    let owner_session_id = requester
         .owner_session_id
         .clone()
         .ok_or("image tool has no authoritative session")?;
-    let route = context
-        .delegation
+    let route = requester
+        .route
         .ok_or("image service route is unavailable")?;
     let (respond, response) = tokio::sync::oneshot::channel();
     route
         .send(NativeAgentRequest::Image(NativeImageRequest {
             owner_session_id,
-            requester_run_id: context.session.parent_run_id.clone(),
+            requester_run_id: requester.run_id.clone(),
             reference,
             respond,
         }))

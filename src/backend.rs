@@ -101,6 +101,16 @@ const PROVIDER_TOOL_IDENTITIES: &[(&str, &str, &str)] = &[
     (CLAUDE_PROVIDER, "return_image", "mcp__nakode__return_image"),
     (
         CLAUDE_PROVIDER,
+        "list_child_materials",
+        "mcp__nakode__list_child_materials",
+    ),
+    (
+        CLAUDE_PROVIDER,
+        "prepare_image",
+        "mcp__nakode__prepare_image",
+    ),
+    (
+        CLAUDE_PROVIDER,
         "desktop_screenshot",
         "mcp__nakode__desktop_screenshot",
     ),
@@ -1396,6 +1406,26 @@ mod tests {
             assert_eq!(projection.allowed_tools, Some(Vec::new()), "{provider}");
             assert_eq!(projection.unsupported_canonical_tools, loader, "{provider}");
         }
+    }
+
+    #[test]
+    fn claude_exposes_retained_image_tools_only_when_the_allowlist_names_them() {
+        let canonical = vec![
+            "list_child_materials".to_owned(),
+            "prepare_image".to_owned(),
+        ];
+        let claude = project_provider_tools(CLAUDE_PROVIDER, Some(&canonical));
+        assert_eq!(
+            claude.allowed_tools,
+            Some(vec![
+                "mcp__nakode__list_child_materials".to_owned(),
+                "mcp__nakode__prepare_image".to_owned(),
+            ])
+        );
+        assert!(claude.unsupported_canonical_tools.is_empty());
+
+        let without = project_provider_tools(CLAUDE_PROVIDER, Some(&["read".to_owned()]));
+        assert_eq!(without.allowed_tools, Some(vec!["Read".to_owned()]));
     }
 
     #[test]
