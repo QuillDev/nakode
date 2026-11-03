@@ -456,6 +456,53 @@ test("without session state the turn still ends, and the cancellation stays attr
   assert.match(f.emitted.find((event) => event.event === "warning").message, /not an owner stop/);
 });
 
+test("a quiet SDK background wait exposes its reason without completing or resending the turn", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const f = fixture();
+  let notify;
+  const notification = new Promise((resolve) => { notify = resolve; });
+  let waiting;
+  const atBackgroundWait = new Promise((resolve) => { waiting = resolve; });
+  let queries = 0;
+  f.useSdk(async function* (prompt) {
+    queries += 1;
+    const iterator = prompt[Symbol.asyncIterator]();
+    await iterator.next();
+    const drained = iterator.next();
+    yield { type: "system", subtype: "session_state_changed", state: "running" };
+    yield { type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "private-task" }] };
+    yield { type: "stream_event", event: { type: "content_block_delta", index: 0,
+      delta: { type: "text_delta", text: "Ready for the browser slot..." } } };
+    yield { type: "result", subtype: "success", result: "ready" };
+    yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    waiting();
+    await notification;
+    yield { type: "system", subtype: "task_notification", task_id: "private-task", status: "completed" };
+    yield { type: "system", subtype: "background_tasks_changed", tasks: [] };
+    yield { type: "system", subtype: "session_state_changed", state: "running" };
+    yield { type: "result", subtype: "success", result: "notification handled" };
+    yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    await drained;
+  });
+  const turn = f.turn();
+  await atBackgroundWait;
+  assert.equal(f.emitted.at(-1).message, "Waiting for Claude background tasks (1)");
+  assert.equal(f.emitted.at(-1).event, "turn_progress");
+  assert.equal(f.emitted.some((event) => event.event === "turn_completed"), false);
+  t.mock.timers.tick(2 * 60 * 60 * 1_000);
+  assert.match(f.emitted.at(-1).message, /^Waiting for Claude background tasks \(1\)/);
+  assert.equal(f.emitted.some((event) => event.event === "turn_completed"), false);
+  assert.equal(queries, 1);
+  notify();
+  await turn;
+  const phases = f.emitted.filter((event) => event.event === "turn_progress").map((event) => event.message);
+  assert.ok(phases.includes("Waiting for Claude background-task follow-up"));
+  assert.equal(phases.at(-1), "Waiting for Claude process to exit");
+  assert.equal(f.emitted.filter((event) => event.event === "turn_completed").length, 1);
+  assert.equal(f.emitted.find((event) => event.event === "turn_completed").status, "finished");
+  assert.equal(queries, 1);
+});
+
 // A late task arrival must revoke settlement. Duplicate idle/empty snapshots must neither
 // bypass nor extend the existing grace; no new provider request is issued by this input source.
 for (const lateEvent of ["background", "running", "unknown"]) {

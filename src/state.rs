@@ -1561,6 +1561,7 @@ pub struct DomainState {
     allowed_builtin_tools: Option<Vec<String>>,
     pub todo_phases: Vec<TodoPhase>,
     pub status_message: String,
+    turn_progress: Option<(String, String)>,
     pub diagnostic_count: usize,
     pub(crate) latest_failure: Option<SessionFailureState>,
     pub nakode_session_id: String,
@@ -2375,6 +2376,7 @@ impl DomainState {
             allowed_builtin_tools: None,
             todo_phases: Vec::new(),
             status_message: format!("Connecting to {backend_name}…"),
+            turn_progress: None,
             diagnostic_count: 0,
             latest_failure: None,
             nakode_session_id: uuid::Uuid::now_v7().to_string(),
@@ -7465,6 +7467,20 @@ impl DomainState {
             BackendEvent::TurnPlan { turn_id, plan } => {
                 self.observe_turn_artifact(&turn_id, plan, EntryKind::Reasoning, "PLAN", "plan");
             }
+            BackendEvent::TurnProgress {
+                turn_id,
+                message,
+                waiting,
+            } => {
+                if self
+                    .active_turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.id == turn_id && !turn.cancelling)
+                {
+                    self.turn_progress = waiting.then(|| (turn_id, message.clone()));
+                    self.status_message = message;
+                }
+            }
             BackendEvent::ApprovalRequested(approval) => {
                 self.status_message = format!("Approval required: {}", approval.title);
                 self.approvals.push_back(approval);
@@ -8493,6 +8509,7 @@ impl DomainState {
             self.diagnostic_count += 1;
             return;
         }
+        self.turn_progress = None;
         let starting = self.starting_turn.take();
         let model = starting
             .as_ref()
@@ -8584,6 +8601,7 @@ impl DomainState {
         let completion = crate::child_reports::completion::Completion::capture(turn_id, final_text);
         self.finish_turn_items(turn_id, outcome);
 
+        self.turn_progress = None;
         let completed_turn = self.active_turn.clone();
         self.active_turn = None;
         self.context_compaction = None;
@@ -10521,6 +10539,10 @@ impl DomainState {
             BackendEvent::QuestionRequested(request) => {
                 Self::answer_subagent_question(run_id, request.id)
             }
+            BackendEvent::TurnProgress { message, .. } => {
+                self.record_subagent_progress(run_id, message);
+                Vec::new()
+            }
             BackendEvent::TokenUsageUpdated { usage } => self.apply_subagent_usage(run_id, usage),
             BackendEvent::TurnCompleted { outcome, error, .. } => {
                 self.complete_subagent_turn(run_id, outcome, error)
@@ -10573,6 +10595,15 @@ impl DomainState {
             | BackendEvent::InterruptAccepted
             | BackendEvent::ModelRerouted { .. }
             | BackendEvent::SessionClosed { .. } => Vec::new(),
+        }
+    }
+
+    fn record_subagent_progress(&mut self, run_id: &str, message: String) {
+        if let Some(execution) = self.subagent_executions.get_mut(run_id)
+            && execution.run.status == SubagentStatus::Working
+        {
+            execution.run.latest_activity = message;
+            self.sync_subagent(run_id);
         }
     }
 
@@ -11616,6 +11647,23 @@ impl DomainState {
             EntryStatus::Failed,
         );
         Vec::new()
+    }
+
+    /// Active provider progress survives command acknowledgements such as queue admission.
+    /// It remains a display projection, never a change to execution ownership or dispatch gates.
+    pub(crate) fn projected_status_message(&self) -> &str {
+        if self.approvals.is_empty()
+            && self.questions.is_empty()
+            && self.latest_failure.is_none()
+            && let Some((turn_id, message)) = &self.turn_progress
+            && self
+                .active_turn
+                .as_ref()
+                .is_some_and(|turn| turn.id == *turn_id && !turn.cancelling)
+        {
+            return message;
+        }
+        &self.status_message
     }
 
     fn turn_is_current(&self, turn_id: &str) -> bool {
@@ -14713,6 +14761,77 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             ))
         );
         assert!(state.recoverable_prompt().is_none());
+    }
+
+    #[test]
+    fn turn_progress_projects_wait_reason_without_releasing_work_and_ignores_late_events() {
+        let mut state = ready_state();
+        state.provider_session_id = Some("provider-session".to_owned());
+        state
+            .submit_prompt("check readiness".to_owned(), Vec::new())
+            .expect("prompt accepted");
+        state.handle_backend(BackendEvent::TurnStarted {
+            turn_id: "turn-one".to_owned(),
+        });
+        let entries = state.transcript.entries().len();
+        let progress = |turn: &str, message: &str| BackendEvent::TurnProgress {
+            turn_id: turn.to_owned(),
+            message: message.to_owned(),
+            waiting: true,
+        };
+        let reason = "Waiting for provider background tasks (1)";
+        assert!(
+            state
+                .handle_backend(progress("turn-one", reason))
+                .is_empty()
+        );
+        let snapshot = projection::session_view(&state, 1, &[]);
+        assert_eq!(snapshot.status_message, reason);
+        assert!(snapshot.active_turn.is_some());
+        assert!(state.is_busy());
+        assert_eq!(state.transcript.entries().len(), entries);
+        state
+            .enqueue_prompt("follow-up instruction".to_owned(), Vec::new())
+            .expect("follow-up queued");
+        assert!(state.status_message.starts_with("Queued message"));
+        let queued = projection::session_view(&state, 2, &[]);
+        assert_eq!(queued.status_message, reason);
+        assert_eq!(state.queue.len(), 1);
+
+        state.handle_backend(progress("old-turn", "stale wait"));
+        assert_eq!(state.projected_status_message(), reason);
+        state.handle_backend(BackendEvent::TurnProgress {
+            turn_id: "turn-one".to_owned(),
+            message: "Provider processing".to_owned(),
+            waiting: false,
+        });
+        state.handle_backend(BackendEvent::ExternalToolRequested(
+            crate::backend::ExternalToolRequest {
+                id: "external-call".to_owned(),
+                name: "ReadAssociatedTicket".to_owned(),
+                arguments_json: "{}".to_owned(),
+            },
+        ));
+        assert_eq!(
+            state.projected_status_message(),
+            "External tool requested: ReadAssociatedTicket"
+        );
+        state.handle_backend(progress("turn-one", reason));
+        state.active_turn.as_mut().expect("active turn").cancelling = true;
+        state.status_message = "Interrupt accepted".to_owned();
+        state.handle_backend(progress("turn-one", "late progress while stopping"));
+        assert_eq!(state.status_message, "Interrupt accepted");
+        assert_eq!(state.projected_status_message(), "Interrupt accepted");
+        state.handle_backend(BackendEvent::TurnCompleted {
+            turn_id: "turn-one".to_owned(),
+            outcome: TurnOutcome::Interrupted,
+            error: None,
+        });
+        let terminal_status = state.status_message.clone();
+        state.handle_backend(progress("turn-one", "late wait after terminal"));
+        assert_eq!(state.status_message, terminal_status);
+        assert!(state.active_turn.is_none());
+        assert_ne!(state.projected_status_message(), reason);
     }
 
     #[test]

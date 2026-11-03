@@ -1885,6 +1885,11 @@ async fn handle_bridge_message(message: &Value, events: &mpsc::Sender<BackendEve
             turn_id: string(message, "turnId"),
             plan: string(message, "text"),
         },
+        "turn_progress" => BackendEvent::TurnProgress {
+            turn_id: string(message, "turnId"),
+            message: string(message, "message"),
+            waiting: message["waiting"].as_bool().unwrap_or(false),
+        },
         "approval_request" => approval_request_event(message),
         "approval_resolved" => BackendEvent::ApprovalResolved {
             request_id: message.get("approvalId").cloned().unwrap_or(Value::Null),

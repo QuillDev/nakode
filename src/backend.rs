@@ -954,6 +954,13 @@ pub enum BackendEvent {
         turn_id: String,
         plan: String,
     },
+    /// Provider-normalized progress for the current turn. Presentation only: it never releases
+    /// execution ownership or changes queue, approval, or cancellation state.
+    TurnProgress {
+        turn_id: String,
+        message: String,
+        waiting: bool,
+    },
     ApprovalRequested(ApprovalRequest),
     QuestionRequested(Box<QuestionRequest>),
     ExternalToolRequested(ExternalToolRequest),

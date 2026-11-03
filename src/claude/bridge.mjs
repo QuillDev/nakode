@@ -1515,6 +1515,22 @@ function turnInput(command) {
   };
 }
 
+// These labels describe observed provider boundaries, not inferred completion. A provider-reported
+// idle state with live tasks still owns the Nakode turn and cannot release queued instructions.
+function turnProgressMessage(input, stage) {
+  if (stage === "collecting provider history") return "Reading Claude response history";
+  if (stage === "waiting for provider process exit") return "Waiting for Claude process to exit";
+  const state = input.snapshot();
+  if (state.inputClosed) return "Waiting for Claude stream to close";
+  if (state.sessionState === "idle" && state.liveBackgroundTasks > 0) {
+    return `Waiting for Claude background tasks (${state.liveBackgroundTasks})`;
+  }
+  if (state.followUpGrace) return "Waiting for Claude background-task follow-up";
+  if (state.resultSeen) return "Waiting for Claude turn to settle";
+  if (state.sessionState === "idle") return "Waiting for Claude turn result";
+  return "Claude is processing";
+}
+
 // Observation only: silence never cancels, releases the provider session, or replays a request.
 // Retain a small, content-free event trail so a quiet active turn can be distinguished from an
 // SDK background wait or a process-release wait using the ordinary public transcript.
@@ -1537,8 +1553,8 @@ function turnDiagnostics(turnId, input) {
       write({
         event: "warning",
         turnId,
-        message: `Claude turn is still open: ${stage}; no provider progress for ${Math.floor((Date.now() - lastProgress) / 1000)}s. ` +
-          `Last session state: ${state.sessionState}; result seen: ${state.resultSeen}; non-ambient background tasks: ${state.liveBackgroundTasks}; ` +
+        message: `${turnProgressMessage(input, stage)} · No provider progress for ${Math.floor((Date.now() - lastProgress) / 1000)}s.\n` +
+          `Phase: ${stage}. Last session state: ${state.sessionState}; result seen: ${state.resultSeen}; non-ambient background tasks: ${state.liveBackgroundTasks}; ` +
           `input closed: ${state.inputClosed}; follow-up grace: ${state.followUpGrace}. ` +
           `Queued instructions remain held until the turn ends and its process exits; no work was retried. Lifecycle: ${events.join(", ") || "no events"}.`,
       });
@@ -1705,6 +1721,19 @@ async function sendTurn(command) {
   const lifecycle = sdkLifecycleLog();
   const input = turnInput(command);
   const diagnostics = turnDiagnostics(command.turnId, input);
+  let phase = "reading provider events";
+  let lastProgressMessage = null;
+  const publishProgress = (nextPhase = phase) => {
+    if (nextPhase !== phase) diagnostics.stage(nextPhase);
+    phase = nextPhase;
+    const message = turnProgressMessage(input, phase);
+    if (message === lastProgressMessage) return;
+    lastProgressMessage = message;
+    const state = input.snapshot();
+    const waiting = phase !== "reading provider events" || state.inputClosed ||
+      state.sessionState === "idle" || state.resultSeen || state.followUpGrace;
+    write({ event: "turn_progress", turnId: command.turnId, message, waiting });
+  };
   let timedOut = false;
   const timeout = session.timeoutSeconds
     ? setTimeout(() => {
@@ -1716,10 +1745,13 @@ async function sendTurn(command) {
     const stream = query({ prompt: input.prompt, options });
     await processLifecycle.started();
     write({ event: "turn_started", turnId: command.turnId });
+    publishProgress();
     for await (const message of stream) {
       const previousState = input.snapshot().sessionState;
       input.observe(message);
       diagnostics.observe(message);
+      if (message.type === "system" &&
+          ["session_state_changed", "background_tasks_changed"].includes(message.subtype)) publishProgress();
       // A background follow-up is a new provider turn in this process. Its predecessor's result
       // cannot prove success if this continuation later ends without its own result.
       const beganTurn = message.type === "system" && message.subtype === "session_state_changed" &&
@@ -1747,13 +1779,13 @@ async function sendTurn(command) {
       )
         sdkRefusal(command.turnId, message);
       else if (message.type === "result") {
-        diagnostics.stage("collecting provider history");
+        publishProgress("collecting provider history");
         await emitNativeAgentHistory(
           command.workspace,
           session.sessionId,
           command.turnId,
         );
-        diagnostics.stage("reading provider events");
+        publishProgress("reading provider events");
         if (message.usage)
           write({
             event: "usage",
@@ -1807,7 +1839,7 @@ async function sendTurn(command) {
 
   // Keep the authenticated cancel route alive until close releases the provider session. The
   // iterator can finish before its subprocess; removing the run here would make Stop a no-op.
-  diagnostics.stage("waiting for provider process exit");
+  publishProgress("waiting for provider process exit");
   try {
     await processLifecycle.released();
   } catch (error) {
