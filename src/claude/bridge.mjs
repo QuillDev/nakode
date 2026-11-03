@@ -1446,7 +1446,9 @@ function turnInput(command) {
     settle = resolve;
   });
   let reportsSessionState = false;
-  let idle = false;
+  let sessionState = "unknown";
+  let resultSeen = false;
+  let closed = false;
   let liveBackgroundTasks = 0;
   // A finished task normally starts its follow-up turn at once (`running`). If none starts, the
   // grace still lets the turn end instead of holding input open forever.
@@ -1456,9 +1458,11 @@ function turnInput(command) {
     followUpGrace = null;
   };
   const close = () => {
+    closed = true;
     clearFollowUpGrace();
     settle();
   };
+  const canClose = () => sessionState === "idle" && resultSeen && liveBackgroundTasks === 0 && followUpGrace === null;
   const prompt = (async function* () {
     yield {
       type: "user",
@@ -1477,20 +1481,93 @@ function turnInput(command) {
   return {
     prompt,
     close,
+    snapshot: () => ({
+      sessionState,
+      resultSeen,
+      liveBackgroundTasks,
+      inputClosed: closed,
+      followUpGrace: followUpGrace !== null,
+    }),
     observe(message) {
+      if (closed) return;
       if (message.type === "system" && message.subtype === "session_state_changed") {
         reportsSessionState = true;
-        idle = message.state === "idle";
-        clearFollowUpGrace();
-        if (idle && liveBackgroundTasks === 0) close();
+        const previousState = sessionState;
+        sessionState = ["idle", "running"].includes(message.state) ? message.state : "unknown";
+        if (sessionState !== "idle") {
+          clearFollowUpGrace();
+          if (sessionState === "running" && previousState !== "running") resultSeen = false;
+        } else if (canClose()) {
+          close();
+        }
       } else if (message.type === "system" && message.subtype === "background_tasks_changed") {
+        const previousCount = liveBackgroundTasks;
         liveBackgroundTasks = (message.tasks || []).filter((task) => !task.ambient).length;
-        if (idle && liveBackgroundTasks === 0 && followUpGrace === null) {
+        if (liveBackgroundTasks > 0) clearFollowUpGrace();
+        else if (previousCount > 0 && sessionState === "idle" && resultSeen && followUpGrace === null) {
           followUpGrace = setTimeout(close, BACKGROUND_FOLLOW_UP_GRACE_MS);
         }
-      } else if (message.type === "result" && !reportsSessionState) {
-        close();
+      } else if (message.type === "result") {
+        resultSeen = true;
+        if (!reportsSessionState || canClose()) close();
       }
+    },
+  };
+}
+
+// Observation only: silence never cancels, releases the provider session, or replays a request.
+// Retain a small, content-free event trail so a quiet active turn can be distinguished from an
+// SDK background wait or a process-release wait using the ordinary public transcript.
+function turnDiagnostics(turnId, input) {
+  const started = Date.now();
+  let lastProgress = started;
+  let stage = "reading provider events";
+  let warnings = 0;
+  let stopped = false;
+  const events = [];
+  const note = (label) => {
+    events.push(`${label} +${((Date.now() - started) / 1000).toFixed(1)}s`);
+    if (events.length > 12) events.shift();
+  };
+  const arm = () => setTimeout(() => {
+    if (stopped) return;
+    if (Date.now() - lastProgress >= 60_000 && warnings < 3) {
+      warnings += 1;
+      const state = input.snapshot();
+      write({
+        event: "warning",
+        turnId,
+        message: `Claude turn is still open: ${stage}; no provider progress for ${Math.floor((Date.now() - lastProgress) / 1000)}s. ` +
+          `Last session state: ${state.sessionState}; result seen: ${state.resultSeen}; non-ambient background tasks: ${state.liveBackgroundTasks}; ` +
+          `input closed: ${state.inputClosed}; follow-up grace: ${state.followUpGrace}. ` +
+          `Queued instructions remain held until the turn ends and its process exits; no work was retried. Lifecycle: ${events.join(", ") || "no events"}.`,
+      });
+    }
+    if (warnings < 3) timer = arm();
+  }, 60_000);
+  let timer = arm();
+  return {
+    stage(value) {
+      stage = value;
+      lastProgress = Date.now();
+      note(value);
+    },
+    observe(message) {
+      const subtype = message.type === "system" ? message.subtype : null;
+      const streamProgress = message.type === "stream_event" &&
+        ["message_start", "content_block_start", "content_block_delta", "message_delta", "message_stop"].includes(message.event?.type);
+      if (streamProgress || message.type === "assistant" || message.type === "user" || message.type === "result" ||
+          ["session_state_changed", "background_tasks_changed", "task_notification"].includes(subtype)) {
+        lastProgress = Date.now();
+      }
+      if (message.type === "result") note("result");
+      else if (subtype === "session_state_changed") note(`state:${input.snapshot().sessionState}`);
+      else if (subtype === "background_tasks_changed") note(`background:${input.snapshot().liveBackgroundTasks}`);
+      else if (subtype === "task_notification") note("task notification");
+    },
+    stop() {
+      stopped = true;
+      clearTimeout(timer);
     },
   };
 }
@@ -1627,6 +1704,7 @@ async function sendTurn(command) {
   let turnPermissions = new Map();
   const lifecycle = sdkLifecycleLog();
   const input = turnInput(command);
+  const diagnostics = turnDiagnostics(command.turnId, input);
   let timedOut = false;
   const timeout = session.timeoutSeconds
     ? setTimeout(() => {
@@ -1639,7 +1717,16 @@ async function sendTurn(command) {
     await processLifecycle.started();
     write({ event: "turn_started", turnId: command.turnId });
     for await (const message of stream) {
+      const previousState = input.snapshot().sessionState;
       input.observe(message);
+      diagnostics.observe(message);
+      // A background follow-up is a new provider turn in this process. Its predecessor's result
+      // cannot prove success if this continuation later ends without its own result.
+      const beganTurn = message.type === "system" && message.subtype === "session_state_changed" &&
+        message.state === "running" && previousState !== "running";
+      const beganMessage = message.type === "assistant" ||
+        (message.type === "stream_event" && message.event?.type === "message_start");
+      if (beganTurn || beganMessage) completion = null;
       // Retract superseded results first, so this message's replacement is the final projection.
       if (Array.isArray(message.supersedes))
         retractToolResults(command.turnId, message.supersedes, "a model refusal fallback");
@@ -1660,11 +1747,13 @@ async function sendTurn(command) {
       )
         sdkRefusal(command.turnId, message);
       else if (message.type === "result") {
+        diagnostics.stage("collecting provider history");
         await emitNativeAgentHistory(
           command.workspace,
           session.sessionId,
           command.turnId,
         );
+        diagnostics.stage("reading provider events");
         if (message.usage)
           write({
             event: "usage",
@@ -1682,7 +1771,12 @@ async function sendTurn(command) {
         };
       }
     }
-    if (completion === null) completion = { status: "finished" };
+    if (completion === null) {
+      completion = {
+        status: "failed",
+        error: "Claude stream ended without a result for its last turn. Partial output was retained; no work was retried.",
+      };
+    }
   } catch (error) {
     const interrupted = abortController.signal.aborted;
     completion = {
@@ -1709,12 +1803,16 @@ async function sendTurn(command) {
     for (const [uuid, events] of providerToolResultMessages) {
       if (events.some((event) => event.turnId === command.turnId)) providerToolResultMessages.delete(uuid);
     }
-    runs.delete(command.turnId);
   }
 
+  // Keep the authenticated cancel route alive until close releases the provider session. The
+  // iterator can finish before its subprocess; removing the run here would make Stop a no-op.
+  diagnostics.stage("waiting for provider process exit");
   try {
     await processLifecycle.released();
   } catch (error) {
+    runs.delete(command.turnId);
+    diagnostics.stop();
     if (!processLifecycle.didStart()) {
       write({
         event: "turn_start_failed",
@@ -1732,6 +1830,8 @@ async function sendTurn(command) {
     });
     return;
   }
+  runs.delete(command.turnId);
+  diagnostics.stop();
   if (!processLifecycle.didStart()) {
     write({
       event: "turn_start_failed",
@@ -1739,6 +1839,14 @@ async function sendTurn(command) {
       message: completion?.error || "Claude Code process did not start",
     });
     return;
+  }
+  if (abortController.signal.aborted) {
+    completion = {
+      status: timedOut ? "failed" : "cancelled",
+      error: timedOut
+        ? `archetype runtime exceeded its configured ${session.timeoutSeconds} second timeout`
+        : undefined,
+    };
   }
   session.started = true;
   write({

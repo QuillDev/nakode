@@ -48,8 +48,9 @@ function fixture(mode = "bypassPermissions") {
     return sdk ? sdk(prompt) : sdkMessages;
   };
   const streamMessageIds = new Map();
+  let releaseProcess = async () => {};
   const providerProcessLifecycle = () => ({
-    spawn() {}, async started() {}, async released() {}, didStart: () => true,
+    spawn() {}, async started() {}, released: () => releaseProcess(), didStart: () => true,
   });
   const effectiveAllowedTools = () => [];
   const permissionMode = () => "bypassPermissions";
@@ -64,7 +65,7 @@ function fixture(mode = "bypassPermissions") {
   sessions.set("session", { ...session, sessionId: "session", model: "opus", options: {} });
   const functions = source.slice(source.indexOf("function parseValidatorResult"), source.indexOf("/**\n * The Claude Code to run"));
   const handler = source.slice(source.indexOf("async function handle(command)"), source.indexOf("const input = createInterface"));
-  const api = eval(`(() => { ${functions}\n${handler}; return { permissionHandler, emitUserToolResults, permissionBatchHook, sdkPermissionDenied, sdkRefusal, retractToolResults, sendTurn, handle }; })()`);
+  const api = eval(`(() => { ${functions}\n${handler}; return { permissionHandler, emitUserToolResults, permissionBatchHook, sdkPermissionDenied, sdkRefusal, retractToolResults, turnInput, turnDiagnostics, sendTurn, handle }; })()`);
   const signal = new AbortController();
   const options = { toolUseID: "call", signal: signal.signal, suggestions: [] };
   return {
@@ -79,6 +80,9 @@ function fixture(mode = "bypassPermissions") {
       return emitted.at(-1);
     },
     useSdk(stream) { sdk = stream; },
+    releaseProcessWith(release) { releaseProcess = release; },
+    input: () => api.turnInput({ sessionId: "session", turnId: "turn", prompt: "check CI" }),
+    diagnostics: (input) => api.turnDiagnostics("turn", input),
     sdkOptions: () => lastOptions,
     async turn(messages = [], beforeResults = null) {
       sdkMessages = (async function* () {
@@ -450,6 +454,187 @@ test("without session state the turn still ends, and the cancellation stays attr
   const late = f.emitted.find((event) => event.callId === "after-notification" && event.status === "error");
   assert.equal(late.permission.source, "sdk_unknown");
   assert.match(f.emitted.find((event) => event.event === "warning").message, /not an owner stop/);
+});
+
+// A late task arrival must revoke settlement. Duplicate idle/empty snapshots must neither
+// bypass nor extend the existing grace; no new provider request is issued by this input source.
+for (const lateEvent of ["background", "running", "unknown"]) {
+  test(`a late ${lateEvent} event revokes background follow-up settlement`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const input = fixture().input();
+    t.after(() => input.close());
+    const iterator = input.prompt[Symbol.asyncIterator]();
+    await iterator.next();
+    let closed = false;
+    const drained = iterator.next().then((value) => { closed = true; return value; });
+    const state = (value) => input.observe({ type: "system", subtype: "session_state_changed", state: value });
+    const tasks = (values) => input.observe({ type: "system", subtype: "background_tasks_changed", tasks: values });
+    state("running");
+    tasks([{ task_id: "first" }]);
+    input.observe({ type: "result", subtype: "success" });
+    state("idle");
+    tasks([]);
+    t.mock.timers.tick(29_000);
+    if (lateEvent === "background") tasks([{ task_id: "second" }]);
+    else state(lateEvent);
+    t.mock.timers.tick(2_000);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closed, false);
+    if (lateEvent === "background") tasks([]);
+    else {
+      state("running");
+      input.observe({ type: "result", subtype: "success" });
+      state("idle");
+    }
+    t.mock.timers.tick(30_000);
+    assert.deepEqual(await drained, { done: true, value: undefined });
+  });
+}
+
+test("duplicate snapshots neither bypass nor restart background follow-up grace", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const input = fixture().input();
+  t.after(() => input.close());
+  const iterator = input.prompt[Symbol.asyncIterator]();
+  await iterator.next();
+  let closed = false;
+  const drained = iterator.next().then(() => { closed = true; });
+  input.observe({ type: "system", subtype: "session_state_changed", state: "running" });
+  input.observe({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "first" }] });
+  input.observe({ type: "result", subtype: "success" });
+  input.observe({ type: "system", subtype: "session_state_changed", state: "idle" });
+  input.observe({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+  t.mock.timers.tick(29_000);
+  input.observe({ type: "system", subtype: "session_state_changed", state: "idle" });
+  input.observe({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closed, false);
+  t.mock.timers.tick(1_000);
+  await drained;
+});
+
+test("idle before a result keeps input open; the subsequent result settles it", async () => {
+  const input = fixture().input();
+  const iterator = input.prompt[Symbol.asyncIterator]();
+  await iterator.next();
+  let closed = false;
+  const drained = iterator.next().then(() => { closed = true; });
+  input.observe({ type: "system", subtype: "session_state_changed", state: "running" });
+  input.observe({ type: "system", subtype: "session_state_changed", state: "idle" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closed, false);
+  input.observe({ type: "result", subtype: "success" });
+  await drained;
+});
+
+for (const continuation of [false, true]) {
+  test(`EOF after partial output${continuation ? " in a background continuation" : ""} is not success`, async () => {
+    const f = fixture();
+    const messages = [{ type: "system", subtype: "session_state_changed", state: "running" }];
+    if (continuation) messages.push(
+      { type: "result", subtype: "success", result: "first turn finished" },
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+      { type: "system", subtype: "session_state_changed", state: "running" },
+    );
+    messages.push({ type: "stream_event", event: { type: "content_block_delta", index: 0,
+      delta: { type: "text_delta", text: "Ready for the browser slot..." } } });
+    await f.turn(messages);
+    assert.equal(f.emitted.find((event) => event.event === "delta").text, "Ready for the browser slot...");
+    const completed = f.emitted.find((event) => event.event === "turn_completed");
+    assert.equal(completed.status, "failed");
+    assert.match(completed.error, /without a result/);
+    assert.equal(f.emitted.filter((event) => event.event === "turn_started").length, 1);
+  });
+}
+
+test("duplicate running state after a result does not erase the result", async () => {
+  const f = fixture();
+  await f.turn([
+    { type: "system", subtype: "session_state_changed", state: "running" },
+    { type: "result", subtype: "success", result: "done" },
+    { type: "system", subtype: "session_state_changed", state: "running" },
+  ]);
+  assert.equal(f.emitted.find((event) => event.event === "turn_completed").status, "finished");
+});
+
+test("cancellation followed by graceful EOF is interrupted, even after a result", async () => {
+  const f = fixture();
+  f.useSdk(async function* () {
+    yield { type: "result", subtype: "success", result: "waiting" };
+    await f.cancel();
+  });
+  await f.turn();
+  assert.equal(f.emitted.find((event) => event.event === "turn_completed").status, "cancelled");
+});
+
+test("terminal publication waits for process release, not partial output or a result", async () => {
+  const f = fixture();
+  let release;
+  f.releaseProcessWith(() => new Promise((resolve) => { release = resolve; }));
+  const turn = f.turn([{ type: "result", subtype: "success", result: "ready" }]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(f.emitted.some((event) => event.event === "turn_completed"), false);
+  release();
+  await turn;
+  assert.equal(f.emitted.filter((event) => event.event === "turn_completed").length, 1);
+});
+
+test("Stop still aborts the provider while waiting for process release", async () => {
+  const f = fixture();
+  let release;
+  f.releaseProcessWith(() => new Promise((resolve) => { release = resolve; }));
+  const turn = f.turn([{ type: "result", subtype: "success", result: "ready" }]);
+  await new Promise((resolve) => setImmediate(resolve));
+  const signal = f.sdkOptions().abortController.signal;
+  assert.equal(signal.aborted, false);
+  await f.cancel();
+  assert.equal(signal.aborted, true);
+  assert.equal(f.emitted.some((event) => event.event === "turn_completed"), false);
+  release();
+  await turn;
+  assert.equal(f.emitted.find((event) => event.event === "turn_completed").status, "cancelled");
+  assert.equal(f.runs.has("turn"), false);
+});
+
+test("quiet-turn diagnostics are bounded, content-free, and do not settle input", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const f = fixture();
+  const input = f.input();
+  const diagnostics = f.diagnostics(input);
+  t.after(() => { diagnostics.stop(); input.close(); });
+  const iterator = input.prompt[Symbol.asyncIterator]();
+  await iterator.next();
+  let closed = false;
+  const drained = iterator.next().then(() => { closed = true; });
+  for (const message of [
+    { type: "system", subtype: "session_state_changed", state: "running" },
+    { type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "private-task", command: "private-command" }] },
+    { type: "result", subtype: "success", result: "private-report" },
+    { type: "system", subtype: "session_state_changed", state: "idle" },
+  ]) {
+    input.observe(message);
+    diagnostics.observe(message);
+  }
+  for (let minute = 0; minute < 5; minute += 1) {
+    t.mock.timers.tick(30_000);
+    diagnostics.observe({ type: "stream_event", event: { type: "ping", secret: "private-heartbeat" } });
+    diagnostics.observe({ type: "system", subtype: "task_progress", description: "private-progress" });
+    t.mock.timers.tick(30_000);
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closed, false);
+  assert.equal(f.emitted.length, 3);
+  for (const warning of f.emitted) {
+    assert.equal(warning.event, "warning");
+    assert.match(warning.message, /Last session state: idle; result seen: true; non-ambient background tasks: 1/);
+    assert.match(warning.message, /Queued instructions remain held/);
+    assert.doesNotMatch(warning.message, /private-/);
+  }
+  diagnostics.stop();
+  t.mock.timers.tick(600_000);
+  assert.equal(f.emitted.length, 3);
+  input.close();
+  await drained;
 });
 
 // Models how Claude Code 2.1.304 and SDK 0.3.280 end a turn that does not finish normally, as
