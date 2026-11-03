@@ -66,6 +66,7 @@ state.
   in-process sessions
 - Claude permission provenance distinguishes policy, validator, approval, runtime interruption,
   and unattributed SDK cancellation without changing permission enforcement. `docs/claude-permission-provenance.md`.
+- Claude wait progress survives command acknowledgements through the canonical session status; quiet-turn diagnostics never imply idle, release a provider session or authorize replay. Terminal publication retains the subprocess-close barrier. `docs/claude-quiet-turns.md`.
 - Shared skills and their provider-specific materialization
 - Shared memory, provenance, scopes, confidence, and supersession
 - Provider enablement and user model-default preferences

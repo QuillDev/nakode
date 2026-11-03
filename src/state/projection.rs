@@ -306,7 +306,7 @@ fn projected_session_view(
         title: session_title(state, sessions),
         first_prompt_preview: first_prompt_preview(state, sessions),
         code_mode: state.code_mode(),
-        status_message: state.status_message.clone(),
+        status_message: state.projected_status_message().to_owned(),
         diagnostic_count: u64::try_from(state.diagnostic_count).unwrap_or(u64::MAX),
         activity: activity(state),
         selected_provider_id: provider,
@@ -1447,11 +1447,11 @@ fn bounded_text_to(value: &str, limit: usize) -> BoundedText {
 }
 
 fn notice_views(state: &DomainState, revision: u64) -> Vec<NoticeView> {
-    (!state.status_message.is_empty())
+    (!state.projected_status_message().is_empty())
         .then(|| NoticeView {
             id: format!("status:{revision}"),
             level: NoticeLevel::Info,
-            message: state.status_message.clone(),
+            message: state.projected_status_message().to_owned(),
         })
         .into_iter()
         .collect()

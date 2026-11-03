@@ -535,6 +535,15 @@ async fn idle_burst_starts_once_and_arrivals_wait_for_the_next_turn_boundary() {
     .await;
     assert!(h.inbox().items.iter().all(|item| item.state == "consumed"));
     h.enqueue("later").await;
+    let reason = "Waiting for provider background tasks (1)";
+    h.event(BackendEvent::TurnProgress {
+        turn_id: "provider-one".to_owned(),
+        message: reason.to_owned(),
+        waiting: true,
+    })
+    .await;
+    assert_eq!(h.state().status_message, reason);
+    assert!(h.state().is_busy());
     for _ in 0..4 {
         h.runtime.dispatch_followups().await;
     }
