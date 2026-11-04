@@ -6,6 +6,25 @@ dispatch. Neither operation resumes a manually paused inbox or replays interrupt
 Pending messages still wait for the supported idle boundary and existing durable
 claim/acceptance checkpoints. Older servers reject the distinct interrupt RPC.
 
+## Steer now
+
+`SteerFollowups` (capability `FollowupSteering`) is the inbox's Steer now. The runtime actor
+checks the inbox and interrupts in one serialized step, so no batch can start dispatching in
+between:
+
+- It refuses with Conflict, interrupting nothing, when the inbox is paused, nothing is pending, a
+  claimed batch is blocked, child-evidence ownership is unavailable, or a batch is dispatching.
+  A dispatching batch is either in flight or uncertain, and steering would interrupt its own
+  delivery turn.
+- Otherwise it cancels current work exactly as `InterruptSessionWork` does and leaves the pause
+  state unchanged. An idle session is accepted as a no-op. A turn already being interrupted is
+  accepted unchanged, so repeated clicks issue one provider interrupt. A cached retry replays
+  its original outcome.
+- Delivery is unchanged: the actor claims the next bounded FIFO batch at the idle boundary,
+  preserving attribution and attachments. Accepted ordinary visible-queue prompts still run
+  first. Batch bounds still apply, so a large backlog delivers over successive turns. A
+  rejected interrupt leaves every message pending. Interrupted work is never replayed.
+
 ## Current boundary
 
 This is an unshipped runtime/API foundation, not a completed dashboard feature.

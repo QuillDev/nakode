@@ -250,3 +250,165 @@ async fn tool_interrupt_after_completion_does_not_restart_and_rejection_is_isola
     assert!(prompt.contains("Requirement pending"));
     assert!(!prompt.contains("Original task"));
 }
+
+async fn steer(h: &mut Harness, key: &str) -> Result<CommandAccepted, ServiceError> {
+    let session_id = h.session.clone();
+    h.command(key, None, false, Command::SteerFollowups { session_id })
+        .await
+}
+
+#[tokio::test]
+async fn steer_now_interrupts_once_keeps_inbox_enabled_and_delivers_pending_in_order() {
+    let mut h = Box::pin(running()).await;
+    h.enqueue("first").await;
+    h.enqueue("second").await;
+    steer(&mut h, "steer-1").await.unwrap();
+    assert!(matches!(
+        h.commands.try_recv().unwrap(),
+        BackendCommand::InterruptTurn { .. }
+    ));
+    assert!(!h.inbox().paused);
+    // A double click while the turn is still being interrupted is accepted without a second
+    // provider interrupt.
+    steer(&mut h, "steer-2").await.unwrap();
+    assert!(h.commands.try_recv().is_err());
+    h.enqueue("during-cancel").await;
+    finish(&mut h).await;
+    h.runtime.dispatch_followups().await;
+    let (_, prompt) = h.start();
+    let first = prompt.find("Requirement first").unwrap();
+    let second = prompt.find("Requirement second").unwrap();
+    let third = prompt.find("Requirement during-cancel").unwrap();
+    assert!(first < second && second < third);
+    assert!(!prompt.contains("Original task"));
+    h.event(BackendEvent::TurnAccepted {
+        turn_id: "followup".to_owned(),
+    })
+    .await;
+    h.event(BackendEvent::TurnStarted {
+        turn_id: "followup".to_owned(),
+    })
+    .await;
+    // A late click finds nothing pending and must not interrupt the delivering turn.
+    let error = steer(&mut h, "steer-3").await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(h.commands.try_recv().is_err());
+    // A transport retry of the accepted first click replays its outcome, not a new interrupt.
+    steer(&mut h, "steer-1").await.unwrap();
+    assert!(h.commands.try_recv().is_err());
+    assert!(h.inbox().items.iter().all(|item| item.state == "consumed"));
+    assert!(!h.inbox().paused);
+}
+
+#[tokio::test]
+async fn steer_now_refuses_without_interrupting_when_nothing_can_deliver() {
+    let mut h = Box::pin(running()).await;
+    let error = steer(&mut h, "empty").await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(h.commands.try_recv().is_err());
+
+    h.enqueue("pending").await;
+    h.command(
+        "manual-pause",
+        None,
+        false,
+        Command::SetFollowupPaused {
+            session_id: h.session.clone(),
+            paused: true,
+        },
+    )
+    .await
+    .unwrap();
+    let error = steer(&mut h, "paused").await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(h.commands.try_recv().is_err());
+    assert!(h.inbox().paused);
+    assert_eq!(h.inbox().pending_count, 1);
+    // A retry of the refused request under its key replays the refusal after Resume.
+    h.command(
+        "manual-resume",
+        None,
+        false,
+        Command::SetFollowupPaused {
+            session_id: h.session.clone(),
+            paused: false,
+        },
+    )
+    .await
+    .unwrap();
+    let retried = steer(&mut h, "paused").await.unwrap_err();
+    assert_eq!(retried, error);
+    assert!(h.commands.try_recv().is_err());
+    assert!(
+        h.state()
+            .active_turn
+            .as_ref()
+            .is_some_and(|turn| !turn.cancelling)
+    );
+}
+
+#[tokio::test]
+async fn steer_now_on_idle_session_waits_for_dispatch_and_never_interrupts_a_delivering_batch() {
+    let mut h = Box::pin(running()).await;
+    h.event(BackendEvent::TurnCompleted {
+        turn_id: "original".to_owned(),
+        outcome: crate::backend::TurnOutcome::Completed,
+        error: None,
+    })
+    .await;
+    h.command(
+        "pause",
+        None,
+        false,
+        Command::SetFollowupPaused {
+            session_id: h.session.clone(),
+            paused: true,
+        },
+    )
+    .await
+    .unwrap();
+    h.enqueue("idle").await;
+    h.command(
+        "resume",
+        None,
+        false,
+        Command::SetFollowupPaused {
+            session_id: h.session.clone(),
+            paused: false,
+        },
+    )
+    .await
+    .unwrap();
+    // Idle: nothing to interrupt; the next tick delivers.
+    steer(&mut h, "idle-steer").await.unwrap();
+    assert!(h.commands.try_recv().is_err());
+    h.runtime.dispatch_followups().await;
+    let (_, prompt) = h.start();
+    assert!(prompt.contains("Requirement idle"));
+    // The batch is fenced but its turn has not started; a new arrival must not let a steer
+    // interrupt the delivery in flight.
+    h.enqueue("arrival").await;
+    let error = steer(&mut h, "race-steer").await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(h.commands.try_recv().is_err());
+    assert_eq!(h.inbox().pending_count, 1);
+}
+
+#[tokio::test]
+async fn steer_now_cancellation_failure_keeps_every_message_pending() {
+    let mut h = Box::pin(running()).await;
+    h.enqueue("kept").await;
+    h.runtime
+        .core
+        .engine_for_mut(&h.session)
+        .unwrap()
+        .state_mut()
+        .backend_capabilities
+        .interruption = crate::backend::CapabilitySupport::Unsupported;
+    let before = h.inbox();
+    let error = steer(&mut h, "unsupported").await.unwrap_err();
+    assert_ne!(error.code, ErrorCode::NotFound);
+    assert!(h.commands.try_recv().is_err());
+    assert_eq!(h.inbox(), before);
+    assert!(!h.inbox().paused);
+}

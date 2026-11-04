@@ -1850,6 +1850,12 @@ impl NakodeClient {
         "PendingFollowupRemoval"
     );
 
+    typed_mutation!(
+        steer_followups,
+        api::SteerFollowupsRequest,
+        "FollowupSteering"
+    );
+
     /// Reads a bounded durable follow-up page without restoring a provider.
     ///
     /// # Errors

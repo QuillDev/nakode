@@ -43,6 +43,9 @@ service NakodeService {
   rpc AdmitExternalChildReport(AdmitExternalChildReportRequest) returns (MutationResult);
   rpc RemoveFollowup(RemoveFollowupRequest) returns (MutationResult);
   rpc SetFollowupPaused(SetFollowupPausedRequest) returns (MutationResult);
+  // Interrupts current work so pending follow-ups deliver at the next idle boundary. Refuses,
+  // without interrupting, when nothing is deliverable. Requires `FollowupSteering`.
+  rpc SteerFollowups(SteerFollowupsRequest) returns (MutationResult);
   rpc ListFollowups(ListFollowupsRequest) returns (FollowupInbox);
   // Runtime-supervised background process trees owned by logical sessions on this machine.
   // Owner integrations see every task, including orphans of deleted sessions. Requires the
@@ -239,6 +242,10 @@ message RemoveFollowupRequest {
   MutationOptions mutation = 1;
   string session_id = 2;
   string message_id = 3;
+}
+message SteerFollowupsRequest {
+  MutationOptions mutation = 1;
+  string session_id = 2;
 }
 message SetFollowupPausedRequest {
   MutationOptions mutation = 1;

@@ -229,6 +229,72 @@ impl InboxStore {
             .unwrap_or(false)
     }
 
+    /// Refuses a steer that could not deliver anything at the next idle boundary, so Steer now never
+    /// interrupts work for nothing. A dispatching batch is already in flight (or uncertain); steering
+    /// then would interrupt the very turn delivering it.
+    pub(crate) fn check_steerable(&self, session: &SessionId) -> Result<()> {
+        authorize(&self.0, session.as_str(), true)?;
+        if !super::child_events::authorized_child_messages(&self.0, session.as_str())? {
+            return Err(refuse(
+                "child evidence ownership is unavailable; explicit recovery required",
+            ));
+        }
+        let paused: bool = self
+            .0
+            .query_row(
+                "SELECT COALESCE((SELECT paused FROM followup_inboxes WHERE session_id = ?1), 0)",
+                [session.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(failure)?;
+        if paused {
+            return Err(refuse(
+                "the follow-up inbox is paused; resume it to deliver pending messages",
+            ));
+        }
+        let open_batch: Option<(String, Option<String>)> = self
+            .0
+            .query_row(
+                "SELECT state, blocked_reason FROM followup_batches
+                 WHERE session_id = ?1 AND state <> 'consumed'",
+                [session.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(failure)?;
+        match open_batch {
+            Some((_, Some(_))) => {
+                return Err(refuse(
+                    "a claimed follow-up batch is blocked; resolve it before steering",
+                ));
+            }
+            Some((state, None)) if state == "dispatching" => {
+                return Err(refuse(
+                    "a follow-up batch is already being delivered; nothing was interrupted",
+                ));
+            }
+            // A claimed batch delivers next, exactly as claimed.
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        let pending: bool = self
+            .0
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM followup_messages
+                 WHERE session_id = ?1 AND batch_id IS NULL
+                   AND sequence NOT IN (SELECT message_sequence FROM followup_removals))",
+                [session.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(failure)?;
+        if !pending {
+            return Err(refuse(
+                "no pending follow-ups to deliver; nothing was interrupted",
+            ));
+        }
+        Ok(())
+    }
+
     /// IMMEDIATE serializes producers/claimers; the batch is a bounded FIFO prefix at this cutoff.
     /// An existing claim is reconstructed exactly. No arrival can join it after the commit.
     pub(crate) fn claim(&mut self, session: &SessionId) -> Result<Option<ClaimedBatch>> {

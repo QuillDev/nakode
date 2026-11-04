@@ -71,6 +71,43 @@ impl NativeServerRuntime {
                     .send(result.map(|resource| ServerCore::accepted(resource, Vec::new()).0));
                 None
             }
+            nakode_server::ServerRequest::Command {
+                command: Command::SteerFollowups { ref session_id },
+                ref idempotency_key,
+                ..
+            } => {
+                // A cached retry returns its original outcome from the core without a new check.
+                if self.core.command_cached(idempotency_key) {
+                    return Some(request);
+                }
+                // The check and the interrupt run in this actor turn, so no batch can begin
+                // dispatching in between and be interrupted by its own steer.
+                let checked = self
+                    .core
+                    .ensure_session(session_id)
+                    .map_err(super::super::domain_error)
+                    .and_then(|()| {
+                        InboxStore::open(&self.effects.persistence.database)?
+                            .check_steerable(session_id)
+                    });
+                match checked {
+                    Ok(()) => Some(request),
+                    Err(error) => {
+                        if let nakode_server::ServerRequest::Command {
+                            command,
+                            idempotency_key,
+                            respond,
+                            ..
+                        } = request
+                        {
+                            self.core
+                                .remember_refusal(idempotency_key, &command, error.clone());
+                            let _ = respond.send(Err(error));
+                        }
+                        None
+                    }
+                }
+            }
             request => Some(request),
         }
     }

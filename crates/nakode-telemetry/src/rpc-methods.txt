@@ -22,6 +22,7 @@
 /nakode.v1.NakodeService/AdmitExternalChildReport
 /nakode.v1.NakodeService/RemoveFollowup
 /nakode.v1.NakodeService/SetFollowupPaused
+/nakode.v1.NakodeService/SteerFollowups
 /nakode.v1.NakodeService/ListFollowups
 /nakode.v1.NakodeService/ListBackgroundTasks
 /nakode.v1.NakodeService/GetBackgroundTask

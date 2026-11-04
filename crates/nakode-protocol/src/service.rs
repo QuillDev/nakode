@@ -13,6 +13,8 @@ use crate::{
 pub enum ServiceCapability {
     DurableFollowupInbox,
     PendingFollowupRemoval,
+    /// `SteerFollowups` interrupts current work so pending follow-ups deliver next.
+    FollowupSteering,
     /// `AdmitExternalChildReport` admits a child in another runtime's report as child evidence.
     ExternalChildReports,
     Subscriptions,

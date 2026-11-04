@@ -323,6 +323,13 @@ pub enum Command {
         state: String,
         body: String,
     },
+    /// Interrupts current session work so pending follow-ups deliver at the next idle boundary.
+    /// Like `InterruptSessionWork`, it never changes the inbox pause state or replays work. It
+    /// refuses without interrupting when the inbox is paused, holds nothing pending, or a batch is
+    /// being dispatched or is blocked.
+    SteerFollowups {
+        session_id: SessionId,
+    },
     /// Pausing retains all messages. Resuming never retries uncertain provider dispatch.
     RemoveFollowup {
         session_id: SessionId,
