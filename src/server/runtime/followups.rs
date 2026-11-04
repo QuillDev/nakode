@@ -93,7 +93,15 @@ impl NativeServerRuntime {
                 match checked {
                     Ok(()) => Some(request),
                     Err(error) => {
-                        if let nakode_server::ServerRequest::Command { respond, .. } = request {
+                        if let nakode_server::ServerRequest::Command {
+                            command,
+                            idempotency_key,
+                            respond,
+                            ..
+                        } = request
+                        {
+                            self.core
+                                .remember_refusal(idempotency_key, &command, error.clone());
                             let _ = respond.send(Err(error));
                         }
                         None

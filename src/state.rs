@@ -4874,10 +4874,32 @@ impl DomainState {
     /// idempotent success, which lets lifecycle clients safely stop-before-close without racing the
     /// final completion snapshot.
     pub fn cancel_session_work(&mut self) -> Result<Vec<Effect>, DomainCommandError> {
-        let active_turn = self.active_turn.as_ref().map(|turn| turn.id.clone());
+        self.interrupt_session_work(false)
+    }
+
+    /// Cancels session work for inbox Steer now. A turn whose interrupt is already in flight is
+    /// left to finish, while the rest of the session's work is still cancelled.
+    ///
+    /// # Errors
+    /// Rejects the request when the active provider cannot interrupt its turn.
+    pub fn steer_session_work(&mut self) -> Result<Vec<Effect>, DomainCommandError> {
+        self.interrupt_session_work(true)
+    }
+
+    fn interrupt_session_work(
+        &mut self,
+        skip_cancelling_turn: bool,
+    ) -> Result<Vec<Effect>, DomainCommandError> {
+        let active_turn = self
+            .active_turn
+            .as_ref()
+            .filter(|turn| !(skip_cancelling_turn && turn.cancelling))
+            .map(|turn| turn.id.clone());
+        // Compaction is interrupted only when no turn exists, including one already cancelling.
         let context_compaction = self
             .context_compaction
             .as_ref()
+            .filter(|_| self.active_turn.is_none())
             .map(|compaction| compaction.turn_id.clone());
         let active_runs = self
             .subagent_executions
@@ -12921,6 +12943,31 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
 
         assert!(matches!(effects.as_slice(), [Effect::CancelShell(cancelled)] if cancelled == &id));
         assert_eq!(state.status_message, "Interrupting shell command…");
+    }
+
+    #[test]
+    fn steering_session_work_skips_a_cancelling_turn_but_still_stops_delegated_work() {
+        let mut state = ready_state();
+        state.install_agents(explorer_catalog());
+        let run_id = begin_mocked_subagent(&mut state);
+        state.provider_session_id = Some("primary-session".to_owned());
+        state.active_turn = Some(super::ActiveTurn {
+            id: "primary-turn".to_owned(),
+            model: Some("model-a".to_owned()),
+            options: ModelOptions::default(),
+            cancelling: true,
+        });
+
+        let effects = state.steer_session_work().expect("steer cancellation");
+
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Backend(BackendCommand::InterruptTurn { .. })
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::StopSubagent(cancelled) if cancelled == &run_id
+        )));
     }
 
     #[test]

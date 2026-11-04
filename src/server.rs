@@ -740,20 +740,35 @@ impl ServerCore {
                 .map_or_else(|| self.engine().revision(), ServiceEngine::revision);
             accepted.revision = Some(revision.saturating_add(u64::from(changed)));
         }
-        self.command_cache.insert(
-            key.clone(),
-            CachedCommand {
-                digest,
-                result: result.clone(),
-            },
-        );
+        self.remember_command(key, digest, result.clone());
+        (result, effects, effect_session, changed)
+    }
+
+    /// Caches a refusal decided before the core ran, so a retry under the same key replays it
+    /// instead of re-evaluating against later state.
+    pub(crate) fn remember_refusal(
+        &mut self,
+        key: IdempotencyKey,
+        command: &Command,
+        error: ServiceError,
+    ) {
+        self.remember_command(key, command_digest(command), Err(error));
+    }
+
+    fn remember_command(
+        &mut self,
+        key: IdempotencyKey,
+        digest: [u8; 32],
+        result: Result<CommandAccepted, ServiceError>,
+    ) {
+        self.command_cache
+            .insert(key.clone(), CachedCommand { digest, result });
         self.command_order.push_back(key);
         if self.command_order.len() > IDEMPOTENCY_CAPACITY
             && let Some(expired) = self.command_order.pop_front()
         {
             self.command_cache.remove(&expired);
         }
-        (result, effects, effect_session, changed)
     }
 
     fn execute_command_with_child_questions(
@@ -2725,17 +2740,14 @@ impl ServerCore {
         Ok(Self::accepted(Some(session_id.to_string()), effects))
     }
 
-    /// The runtime has already checked that the inbox can deliver. A turn that is already being
-    /// interrupted is accepted unchanged, so a repeated Steer now never fails or interrupts twice.
+    /// The runtime has already checked that the inbox can deliver. A repeated Steer now never fails
+    /// on, or re-sends, the interrupt of a turn already being interrupted.
     fn steer_followups_command(&mut self, session_id: &SessionId) -> DomainCommandOutcome {
-        let already_interrupting = self
-            .engine_for(session_id)
-            .and_then(|engine| engine.state().active_turn.as_ref())
-            .is_some_and(|turn| turn.cancelling);
-        if already_interrupting {
-            return Ok(Self::accepted(Some(session_id.to_string()), Vec::new()));
-        }
-        self.cancel_session_work_command(session_id)
+        let effects = self
+            .session_engine_mut(session_id)?
+            .state_mut()
+            .steer_session_work()?;
+        Ok(Self::accepted(Some(session_id.to_string()), effects))
     }
 
     /// Resolves the canonical identity used by both live teardown and durable deletion.
@@ -4963,8 +4975,6 @@ impl ServerCore {
             .cloned()
     }
 
-    // One exhaustive routing table: splitting it would let a new command skip session routing.
-    #[allow(clippy::too_many_lines)]
     fn command_session(&self, command: &Command) -> Option<SessionId> {
         match command {
             Command::ReparentChildSession {
@@ -5014,15 +5024,9 @@ impl ServerCore {
                 target: ModelTarget::AgentSession { .. },
                 ..
             } => self.execution_command_session(command),
-            Command::LinkChildSession {
-                parent_session_id, ..
-            } => Some(parent_session_id.clone()),
-            Command::PublishChildReport {
-                child_session_id, ..
-            }
-            | Command::AnswerChildQuestions {
-                child_session_id, ..
-            } => Some(child_session_id.clone()),
+            Command::LinkChildSession { .. }
+            | Command::PublishChildReport { .. }
+            | Command::AnswerChildQuestions { .. } => Self::child_command_session(command),
             // Parent-aware creation selects the accepted new child, never the default engine.
             Command::CreateSession {
                 parent_session_id, ..
@@ -5068,6 +5072,21 @@ impl ServerCore {
             | Command::PruneSession { .. }
             | Command::StopBackgroundTask { .. }
             | Command::DismissBackgroundTask { .. } => None,
+        }
+    }
+
+    fn child_command_session(command: &Command) -> Option<SessionId> {
+        match command {
+            Command::LinkChildSession {
+                parent_session_id, ..
+            } => Some(parent_session_id.clone()),
+            Command::PublishChildReport {
+                child_session_id, ..
+            }
+            | Command::AnswerChildQuestions {
+                child_session_id, ..
+            } => Some(child_session_id.clone()),
+            _ => None,
         }
     }
 

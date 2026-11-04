@@ -324,6 +324,21 @@ async fn steer_now_refuses_without_interrupting_when_nothing_can_deliver() {
     assert!(h.commands.try_recv().is_err());
     assert!(h.inbox().paused);
     assert_eq!(h.inbox().pending_count, 1);
+    // A retry of the refused request under its key replays the refusal after Resume.
+    h.command(
+        "manual-resume",
+        None,
+        false,
+        Command::SetFollowupPaused {
+            session_id: h.session.clone(),
+            paused: false,
+        },
+    )
+    .await
+    .unwrap();
+    let retried = steer(&mut h, "paused").await.unwrap_err();
+    assert_eq!(retried, error);
+    assert!(h.commands.try_recv().is_err());
     assert!(
         h.state()
             .active_turn
