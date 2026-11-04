@@ -159,3 +159,64 @@ async fn removal_requires_capability_and_preserves_exact_identity() {
     shutdown.send(()).unwrap();
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn steering_requires_capability_and_preserves_exact_identity() {
+    let (client, mut requests, shutdown, server) = parent_creation::server(None).await;
+    let request = api::SteerFollowupsRequest {
+        session_id: "exact-session".into(),
+        mutation: Some(api::MutationOptions {
+            idempotency_key: "steer-retry-key".into(),
+            ..Default::default()
+        }),
+    };
+    let error = client.steer_followups(request.clone()).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not support FollowupSteering")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), requests.recv())
+            .await
+            .is_err()
+    );
+    shutdown.send(()).unwrap();
+    server.await.unwrap();
+
+    let (client, mut requests, shutdown, server) =
+        parent_creation::server(Some(protocol::ServiceCapability::FollowupSteering)).await;
+    let send = client.steer_followups(request);
+    let receive = async {
+        let Some(ServerRequest::Command {
+            command,
+            idempotency_key,
+            respond,
+            ..
+        }) = requests.recv().await
+        else {
+            panic!("expected SteerFollowups");
+        };
+        assert_eq!(idempotency_key.as_str(), "steer-retry-key");
+        assert_eq!(
+            command,
+            protocol::Command::SteerFollowups {
+                session_id: protocol::SessionId::from("exact-session"),
+            }
+        );
+        respond
+            .send(Ok(protocol::CommandAccepted {
+                resource_id: Some("exact-session".into()),
+                revision: Some(1),
+                effective_session_tools: None,
+                bridge_continuation: None,
+                replayed_bridge_continuation: None,
+                replayed_bridge_source_active: None,
+            }))
+            .unwrap();
+    };
+    let (result, ()) = tokio::join!(send, receive);
+    assert!(result.is_ok());
+    shutdown.send(()).unwrap();
+    server.await.unwrap();
+}

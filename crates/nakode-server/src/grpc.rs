@@ -910,6 +910,14 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         }
     );
     command_rpc!(
+        steer_followups,
+        api::SteerFollowupsRequest,
+        input,
+        protocol::Command::SteerFollowups {
+            session_id: protocol::SessionId::from(input.session_id)
+        }
+    );
+    command_rpc!(
         remove_followup,
         api::RemoveFollowupRequest,
         input,

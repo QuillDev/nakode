@@ -1015,6 +1015,7 @@ impl ServerCore {
             | Command::InterruptSessionWork { session_id } => {
                 self.cancel_session_work_command(&session_id)
             }
+            Command::SteerFollowups { session_id } => self.steer_followups_command(&session_id),
             Command::DeleteSession {
                 session_id,
                 parent_fence,
@@ -2722,6 +2723,19 @@ impl ServerCore {
             return Err(DomainCommandError::NotFound(session_id.to_string()));
         };
         Ok(Self::accepted(Some(session_id.to_string()), effects))
+    }
+
+    /// The runtime has already checked that the inbox can deliver. A turn that is already being
+    /// interrupted is accepted unchanged, so a repeated Steer now never fails or interrupts twice.
+    fn steer_followups_command(&mut self, session_id: &SessionId) -> DomainCommandOutcome {
+        let already_interrupting = self
+            .engine_for(session_id)
+            .and_then(|engine| engine.state().active_turn.as_ref())
+            .is_some_and(|turn| turn.cancelling);
+        if already_interrupting {
+            return Ok(Self::accepted(Some(session_id.to_string()), Vec::new()));
+        }
+        self.cancel_session_work_command(session_id)
     }
 
     /// Resolves the canonical identity used by both live teardown and durable deletion.
@@ -4949,6 +4963,8 @@ impl ServerCore {
             .cloned()
     }
 
+    // One exhaustive routing table: splitting it would let a new command skip session routing.
+    #[allow(clippy::too_many_lines)]
     fn command_session(&self, command: &Command) -> Option<SessionId> {
         match command {
             Command::ReparentChildSession {
@@ -4974,6 +4990,7 @@ impl ServerCore {
             | Command::SteerQueuedPrompt { session_id, .. }
             | Command::CancelSessionWork { session_id, .. }
             | Command::InterruptSessionWork { session_id }
+            | Command::SteerFollowups { session_id }
             | Command::Delegate { session_id, .. }
             | Command::PublishSharedContext { session_id, .. }
             | Command::RunShell { session_id, .. }
