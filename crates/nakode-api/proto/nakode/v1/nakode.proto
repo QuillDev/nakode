@@ -161,6 +161,8 @@ service NakodeService {
   // timeline is server-bucketed and bounded, never an unbounded raw event stream.
   rpc GetInvocationSummary(GetInvocationSummaryRequest) returns (InvocationSummary);
   rpc GetInvocationTimeline(GetInvocationTimelineRequest) returns (InvocationTimeline);
+  // Weekly provider quota per enabled account. Cached briefly; reads never refresh sign-ins.
+  rpc GetProviderUsage(GetProviderUsageRequest) returns (ProviderUsageReport);
   rpc GetServerInfo(google.protobuf.Empty) returns (ServerInfo);
 }
 
@@ -1906,6 +1908,32 @@ message InvocationTimeline {
   uint64 bucket_width_ms = 3;
   repeated InvocationBucket buckets = 4;
 }
+
+message GetProviderUsageRequest {}
+// Only AVAILABLE and STALE carry a weekly window; unknown usage is never zero.
+enum ProviderUsageState {
+  PROVIDER_USAGE_STATE_UNSPECIFIED = 0;
+  PROVIDER_USAGE_STATE_AVAILABLE = 1;
+  PROVIDER_USAGE_STATE_STALE = 2;
+  PROVIDER_USAGE_STATE_UNSUPPORTED = 3;
+  PROVIDER_USAGE_STATE_UNAVAILABLE = 4;
+  PROVIDER_USAGE_STATE_FAILED = 5;
+}
+message WeeklyUsageWindow {
+  // Whole percent already used; above 100 means overage.
+  uint32 used_percent = 1;
+  optional uint64 resets_at_ms = 2;
+}
+message ProviderAccountUsage {
+  string provider_id = 1;
+  string account_id = 2;
+  string account_label = 3;
+  ProviderUsageState state = 4;
+  optional WeeklyUsageWindow weekly = 5;
+  optional uint64 observed_at_ms = 6;
+  optional string safe_reason = 7;
+}
+message ProviderUsageReport { repeated ProviderAccountUsage accounts = 1; }
 
 // Machine-local owner-authorized arbitrary command execution. Save/Get never resolve.
 service MachinePathService {

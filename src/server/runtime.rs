@@ -282,6 +282,7 @@ pub(crate) struct NativeServerRuntime {
     /// cannot open is retried at intervals rather than every tick.
     inbox_reopens: HashMap<nakode_protocol::SessionId, std::time::Instant>,
     agent_browser_check_generation: u64,
+    provider_usage: crate::provider_usage::ProviderUsageReader,
 }
 
 pub(crate) struct PreparedRuntime {
@@ -534,6 +535,7 @@ impl NativeServerRuntime {
                 followup_polling_enabled,
                 inbox_reopens: HashMap::new(),
                 agent_browser_check_generation: 0,
+                provider_usage: crate::provider_usage::ProviderUsageReader::default(),
             },
             handle,
         )
@@ -1442,6 +1444,30 @@ impl NativeServerRuntime {
         }
     }
 
+    /// Enabled accounts of enabled providers, with their current in-memory sign-ins.
+    fn provider_usage_targets(&self) -> Vec<crate::provider_usage::UsageTarget> {
+        let credentials = &self.effects.backends.provider_account_credentials;
+        self.core
+            .provider_records()
+            .iter()
+            .filter(|provider| provider.enabled)
+            .flat_map(|provider| {
+                provider
+                    .accounts
+                    .iter()
+                    .filter(|account| account.enabled)
+                    .map(|account| crate::provider_usage::UsageTarget {
+                        provider_id: provider.provider.clone(),
+                        account_id: account.account_id.clone(),
+                        account_label: account.label.clone(),
+                        credential: credentials
+                            .get(&(provider.provider.clone(), account.account_id.clone()))
+                            .cloned(),
+                    })
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_lines)]
     // The request dispatcher keeps fencing, typed routing, persistence rollback, and response
     // completion in one exhaustive match so a newly added public request cannot bypass a guard.
@@ -1918,6 +1944,23 @@ impl NativeServerRuntime {
                             retryable: false,
                         });
                     let _ = respond.send(result);
+                });
+                return;
+            }
+            nakode_server::ServerRequest::Query {
+                query: Query::GetProviderUsage,
+                respond,
+                ..
+            } => {
+                let cursor = self.endpoint.cursor();
+                let targets = self.provider_usage_targets();
+                let reader = self.provider_usage.clone();
+                tokio::spawn(async move {
+                    let report = reader.read(targets).await;
+                    let _ = respond.send(Ok(Snapshot {
+                        cursor,
+                        value: QueryResult::ProviderUsage(report),
+                    }));
                 });
                 return;
             }

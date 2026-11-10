@@ -32,6 +32,9 @@ use crate::credential::SecretValue;
 
 pub(crate) mod delegation;
 mod materials;
+mod usage;
+
+pub(crate) use usage::read_weekly_usage;
 
 use delegation::{
     ClaudeDelegations, DELEGATION_CANCELLED_EVENT, DELEGATION_REQUEST_EVENT, DelegationScope,

@@ -2,6 +2,7 @@
 mod compatibility;
 mod image_tokens;
 mod native;
+mod usage;
 
 pub(crate) use image_tokens::estimate as estimate_image_tokens;
 #[cfg(feature = "codex-process-adapter")]
@@ -15,6 +16,7 @@ pub(crate) use native::RefreshCoordinator;
 pub use native::{BackendConfig, brokered_credential_metadata, spawn, vision_service};
 #[cfg(feature = "codex-process-adapter")]
 pub use protocol::{RpcError, RpcMessage};
+pub(crate) use usage::read_weekly_usage;
 
 fn discovered_model_capabilities(
     efforts: Option<&serde_json::Value>,

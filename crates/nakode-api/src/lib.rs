@@ -234,6 +234,7 @@ mod tests {
             "GetDiagnostics",
             "GetInvocationSummary",
             "GetInvocationTimeline",
+            "GetProviderUsage",
             "GetServerInfo",
             "GetActivationStatus",
             "WatchActivationStatus",

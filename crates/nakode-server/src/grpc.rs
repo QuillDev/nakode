@@ -2619,6 +2619,20 @@ impl api::nakode_service_server::NakodeService for GrpcService {
         Ok(response_with_timing(invocation_timeline(*value), &timing))
     }
 
+    async fn get_provider_usage(
+        &self,
+        _request: tonic::Request<api::GetProviderUsageRequest>,
+    ) -> Result<tonic::Response<api::ProviderUsageReport>, tonic::Status> {
+        let (result, timing) = self.query(protocol::Query::GetProviderUsage).await?;
+        let protocol::QueryResult::ProviderUsage(value) = result.value else {
+            return Err(internal_with_timing(
+                "unexpected provider usage response",
+                &timing,
+            ));
+        };
+        Ok(response_with_timing(provider_usage(value), &timing))
+    }
+
     async fn get_server_info(
         &self,
         _request: tonic::Request<()>,
@@ -4270,6 +4284,37 @@ fn invocation_summary(value: protocol::InvocationSummary) -> api::InvocationSumm
                 last_used_at_ms: item.last_used_at_ms,
             })
             .collect(),
+    }
+}
+
+fn provider_usage(value: protocol::ProviderUsageReport) -> api::ProviderUsageReport {
+    api::ProviderUsageReport {
+        accounts: value
+            .accounts
+            .into_iter()
+            .map(|account| api::ProviderAccountUsage {
+                provider_id: account.provider_id,
+                account_id: account.account_id,
+                account_label: account.account_label,
+                state: provider_usage_state(account.state) as i32,
+                weekly: account.weekly.map(|weekly| api::WeeklyUsageWindow {
+                    used_percent: weekly.used_percent,
+                    resets_at_ms: weekly.resets_at_ms,
+                }),
+                observed_at_ms: account.observed_at_ms,
+                safe_reason: account.safe_reason,
+            })
+            .collect(),
+    }
+}
+
+fn provider_usage_state(state: protocol::ProviderUsageState) -> api::ProviderUsageState {
+    match state {
+        protocol::ProviderUsageState::Available => api::ProviderUsageState::Available,
+        protocol::ProviderUsageState::Stale => api::ProviderUsageState::Stale,
+        protocol::ProviderUsageState::Unsupported => api::ProviderUsageState::Unsupported,
+        protocol::ProviderUsageState::Unavailable => api::ProviderUsageState::Unavailable,
+        protocol::ProviderUsageState::Failed => api::ProviderUsageState::Failed,
     }
 }
 

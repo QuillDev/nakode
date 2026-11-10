@@ -2189,6 +2189,19 @@ impl NakodeClient {
             .into_inner())
     }
 
+    /// Returns weekly provider quota usage for every enabled provider account.
+    ///
+    /// # Errors
+    /// Returns a transport or server status error.
+    pub async fn get_provider_usage(&self) -> Result<api::ProviderUsageReport, SdkError> {
+        Ok(self
+            .transport
+            .clone()
+            .get_provider_usage(api::GetProviderUsageRequest {})
+            .await?
+            .into_inner())
+    }
+
     /// Returns the full profile-scoped manageable skill catalogue, including unavailable rows.
     ///
     /// # Errors

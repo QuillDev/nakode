@@ -227,6 +227,7 @@ pub enum QueryResult {
     Diagnostics(Box<crate::DiagnosticsReport>),
     InvocationSummary(Box<crate::InvocationSummary>),
     InvocationTimeline(Box<crate::InvocationTimeline>),
+    ProviderUsage(crate::ProviderUsageReport),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

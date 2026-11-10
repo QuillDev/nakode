@@ -400,6 +400,7 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
     fixed("NakodeService", "GetDiagnostics", RequestLane::Query),
     fixed("NakodeService", "GetInvocationSummary", RequestLane::Query),
     fixed("NakodeService", "GetInvocationTimeline", RequestLane::Query),
+    fixed("NakodeService", "GetProviderUsage", RequestLane::Query),
     fixed("NakodeService", "GetServerInfo", RequestLane::Control),
     fixed(
         "ActivationService",
@@ -558,7 +559,8 @@ fn query_lane(query: &Query) -> QueryLane {
         | Query::ListSessionStatuses { .. }
         | Query::GetDiagnostics { .. }
         | Query::GetInvocationSummary
-        | Query::GetInvocationTimeline { .. } => QueryLane::Ordinary,
+        | Query::GetInvocationTimeline { .. }
+        | Query::GetProviderUsage => QueryLane::Ordinary,
     }
 }
 
