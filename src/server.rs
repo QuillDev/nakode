@@ -3798,19 +3798,7 @@ impl ServerCore {
                 session_id,
                 before,
                 limit,
-            } => {
-                let state = self
-                    .engine_for(&session_id)
-                    .ok_or_else(|| self.unobserved_resource("session", session_id.as_str()))?
-                    .state();
-                let page = crate::state::projection::run_page(
-                    state,
-                    before.as_ref(),
-                    usize::try_from(limit).unwrap_or(usize::MAX),
-                )
-                .ok_or_else(|| not_found("run", before.as_ref().map_or("", RunId::as_str)))?;
-                Ok(QueryResult::Runs(page))
-            }
+            } => self.query_run_page(&session_id, before.as_ref(), limit),
             Query::GetRunTextWindow {
                 run_id,
                 field,
@@ -3826,12 +3814,32 @@ impl ServerCore {
             Query::GetDiagnostics { .. }
             | Query::ListSkills { .. }
             | Query::GetInvocationSummary
-            | Query::GetInvocationTimeline { .. } => Err(service_error(
+            | Query::GetInvocationTimeline { .. }
+            | Query::GetProviderUsage => Err(service_error(
                 ErrorCode::Internal,
                 "telemetry queries are served by the native runtime",
                 false,
             )),
         }
+    }
+
+    fn query_run_page(
+        &self,
+        session_id: &SessionId,
+        before: Option<&RunId>,
+        limit: u32,
+    ) -> Result<QueryResult, ServiceError> {
+        let state = self
+            .engine_for(session_id)
+            .ok_or_else(|| self.unobserved_resource("session", session_id.as_str()))?
+            .state();
+        let page = crate::state::projection::run_page(
+            state,
+            before,
+            usize::try_from(limit).unwrap_or(usize::MAX),
+        )
+        .ok_or_else(|| not_found("run", before.map_or("", RunId::as_str)))?;
+        Ok(QueryResult::Runs(page))
     }
 
     fn query_mcp_management(

@@ -27,6 +27,7 @@ pub use material::{
     MaterialSource,
 };
 mod service;
+mod usage;
 mod view;
 
 pub use command::{
@@ -59,6 +60,7 @@ pub use service::{
     SessionStatusInventory, SkillCatalogueView, Snapshot, SoulDocumentView, SubscriptionScope,
     SubscriptionView, TranscriptChanges, WorkspacePathInspectionView,
 };
+pub use usage::{ProviderAccountUsage, ProviderUsageReport, ProviderUsageState, WeeklyUsageWindow};
 pub use view::{
     AgentBrowserView, AgentDefinitionView, AgentSessionView, ArtifactView, BootstrapView,
     BridgeDeliveryView, BridgeLifecycle, BridgeProjectionKind, BridgeProjectionView,

@@ -45,6 +45,7 @@ Nakode feature and must not be merged as one.
 - Provider authentication and token refresh
 - Delegates bind the same-provider parent's account or the target provider's default without sibling fallback; refresh persistence and cooldowns retain launch-account attribution, and Codex startup refreshes coalesce per account. `docs/delegate-oauth-refresh.md`.
 - Provider protocol encoding, request validation, streaming, and errors
+- Weekly quota reads (`GetProviderUsage`) use stored sign-ins without refreshing them, are cached per account, and never report unknown usage as zero. `docs/provider-weekly-usage.md`.
 - Model discovery and provider-specific model configuration
 - Provider conversation identifiers and resumable response state
 - Provider-specific inference features such as structured output, hosted tools,

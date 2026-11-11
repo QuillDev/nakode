@@ -47,6 +47,7 @@ pub mod memory;
 #[cfg(feature = "tui")]
 mod native_client;
 pub mod personality;
+mod provider_usage;
 pub mod pty;
 pub mod purge;
 pub mod remote;

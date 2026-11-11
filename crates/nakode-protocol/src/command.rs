@@ -929,6 +929,8 @@ pub enum Query {
         end_at_ms: u64,
         bucket_width_ms: u64,
     },
+    /// Returns weekly quota usage for enabled provider accounts, served from a short-lived cache.
+    GetProviderUsage,
 }
 
 #[cfg(test)]

@@ -107,6 +107,7 @@
 /nakode.v1.NakodeService/GetDiagnostics
 /nakode.v1.NakodeService/GetInvocationSummary
 /nakode.v1.NakodeService/GetInvocationTimeline
+/nakode.v1.NakodeService/GetProviderUsage
 /nakode.v1.NakodeService/GetServerInfo
 /nakode.v1.ActivationService/GetActivationStatus
 /nakode.v1.ActivationService/WatchActivationStatus
