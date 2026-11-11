@@ -57,17 +57,23 @@ impl ProviderUsageReader {
         for target in targets {
             let key = (target.provider_id.clone(), target.account_id.clone());
             let credential_digest = target.credential.as_ref().map(credential_digest);
+            let now_ms = unix_time_ms();
+            let expired = credential_expired(target.credential.as_ref(), now_ms);
             let cached = cache.get(&key).filter(|cached| {
                 cached.credential_digest == credential_digest
                     && cached.read_at.elapsed() < FRESH_FOR
+                    && !expired
             });
             if let Some(cached) = cached {
                 accounts.push(cached.usage.clone());
                 continue;
             }
-            let now_ms = unix_time_ms();
             let result = read_weekly_usage(&self.client, &target, now_ms).await;
-            let previous = cache.get(&key).map(|cached| &cached.usage);
+            // Only the same sign-in's last window may stand in for a failed read.
+            let previous = cache
+                .get(&key)
+                .filter(|cached| cached.credential_digest == credential_digest)
+                .map(|cached| &cached.usage);
             let usage = settle(target, result, previous, now_ms);
             cache.insert(
                 key,
@@ -81,6 +87,14 @@ impl ProviderUsageReader {
         }
         ProviderUsageReport { accounts }
     }
+}
+
+/// A cached window never outlives the access token it was read with.
+fn credential_expired(credential: Option<&Value>, now_ms: u64) -> bool {
+    credential
+        .and_then(|credential| credential.get("expires_at_ms"))
+        .and_then(Value::as_u64)
+        .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
 }
 
 async fn read_weekly_usage(
@@ -322,6 +336,25 @@ mod tests {
             assert_eq!(usage.observed_at_ms, None);
             assert!(usage.safe_reason.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn cached_usage_does_not_outlive_its_token() {
+        let credential = json!({"access_token": "secret", "expires_at_ms": 1});
+        let reader = ProviderUsageReader::default();
+        reader.cache.lock().await.insert(
+            (CLAUDE_PROVIDER.to_owned(), "account-1".to_owned()),
+            CachedUsage {
+                read_at: Instant::now(),
+                credential_digest: Some(credential_digest(&credential)),
+                usage: settle(target(CLAUDE_PROVIDER, None), Ok(window(42)), None, 0),
+            },
+        );
+        let report = reader
+            .read(vec![target(CLAUDE_PROVIDER, Some(credential))])
+            .await;
+        assert_eq!(report.accounts[0].state, ProviderUsageState::Unavailable);
+        assert_eq!(report.accounts[0].weekly, None);
     }
 
     #[tokio::test]
