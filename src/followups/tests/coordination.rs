@@ -11,6 +11,7 @@ fn relay(f: &Fixture, source: &str, call: &str, id: &str) -> Command {
             attachments: vec![],
         },
         source_owner_chat: false,
+        steer_now: false,
     }
 }
 

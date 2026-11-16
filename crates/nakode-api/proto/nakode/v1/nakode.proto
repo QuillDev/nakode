@@ -221,6 +221,10 @@ message RelayAgentFollowupRequest {
   // The authenticated integration vouches that the source is one of the owner's Chats: its
   // message instructs any of the owner's agents, not only the source's own children.
   bool source_owner_chat = 7;
+  // Steer now: admit and, in the same runtime step, interrupt the target's current work so this
+  // message delivers next. A paused inbox is never delivered into or resumed. The result's
+  // followup_steer says what happened. Requires `RelayFollowupSteering`.
+  bool steer_now = 8;
 }
 message EnqueueFollowupRequest {
   MutationOptions mutation = 1;
@@ -593,6 +597,21 @@ message MutationResult {
   optional uint64 revision = 2;
   // Present for OpenSession so clients retain the authoritative established tool boundary.
   optional SessionToolConfiguration effective_session_tools = 3;
+  // Present only for a steer-now RelayAgentFollowup.
+  optional FollowupSteer followup_steer = 4;
+}
+enum FollowupSteer {
+  FOLLOWUP_STEER_UNSPECIFIED = 0;
+  // The target was working; that work was interrupted and this message delivers next.
+  FOLLOWUP_STEER_INTERRUPTED = 1;
+  // The target was idle; nothing was interrupted.
+  FOLLOWUP_STEER_IDLE = 2;
+  // The inbox is paused; the message waits and nothing was interrupted.
+  FOLLOWUP_STEER_PAUSED = 3;
+  // A batch is being delivered or is blocked; the message waits behind it, nothing interrupted.
+  FOLLOWUP_STEER_HELD = 4;
+  // An earlier attempt admitted this message; the retry did not steer again.
+  FOLLOWUP_STEER_REPLAYED = 5;
 }
 
 message Cursor { string server_epoch = 1; uint64 sequence = 2; }

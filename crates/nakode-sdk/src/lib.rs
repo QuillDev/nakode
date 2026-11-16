@@ -1827,7 +1827,23 @@ impl NakodeClient {
             .into_inner())
     }
 
-    typed_mutation!(relay_agent_followup, api::RelayAgentFollowupRequest);
+    /// Relays one pending source `SendAgentMessage` call into the target's inbox. Steer now requires
+    /// `RelayFollowupSteering`: an older server would ignore the flag and only queue the message.
+    ///
+    /// # Errors
+    /// Returns a capability, transport or server status error.
+    pub async fn relay_agent_followup(
+        &self,
+        mut request: api::RelayAgentFollowupRequest,
+    ) -> Result<api::MutationResult, SdkError> {
+        if request.steer_now {
+            self.require_capability("RelayFollowupSteering").await?;
+        }
+        if request.mutation.is_none() {
+            request.mutation = Some(mutation(None));
+        }
+        send_mutation!(self, relay_agent_followup, request)
+    }
     typed_mutation!(
         admit_external_child_report,
         api::AdmitExternalChildReportRequest,
@@ -3783,6 +3799,7 @@ mod tests {
                         bridge_continuation: None,
                         replayed_bridge_continuation: None,
                         replayed_bridge_source_active: None,
+                        followup_steer: None,
                     }));
                 }
                 ServerRequest::Command { respond, .. } => {
@@ -4239,6 +4256,7 @@ mod tests {
                     bridge_continuation: None,
                     replayed_bridge_continuation: None,
                     replayed_bridge_source_active: None,
+                    followup_steer: None,
                 }));
             }
         });

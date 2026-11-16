@@ -3611,6 +3611,7 @@ impl ServerCore {
                 bridge_continuation: None,
                 replayed_bridge_continuation: None,
                 replayed_bridge_source_active: None,
+                followup_steer: None,
             },
             effects,
         )
@@ -3648,6 +3649,7 @@ impl ServerCore {
                 bridge_continuation: Some(disposition),
                 replayed_bridge_continuation: None,
                 replayed_bridge_source_active: None,
+                followup_steer: None,
             },
             effects,
         )

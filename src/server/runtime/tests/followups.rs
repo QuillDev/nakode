@@ -6,7 +6,7 @@ mod mixed_sources;
 mod relationships;
 mod self_clear;
 use crate::followups::InboxStore;
-use nakode_protocol::{CommandAccepted, FollowupInbox, PromptInput, ServiceError};
+use nakode_protocol::{CommandAccepted, FollowupInbox, FollowupSteer, PromptInput, ServiceError};
 
 #[tokio::test]
 async fn ordinary_runtime_skips_unused_inbox_polling_and_explicit_admission_enables_it() {
@@ -258,6 +258,89 @@ impl Harness {
                 event,
             )
             .await;
+    }
+
+    /// A loaded parent Chat linked to this harness session, able to relay to it.
+    fn parent_chat(&mut self) -> SessionId {
+        let workspace = self.state().workspace.clone();
+        let mut parent =
+            DomainState::new_for_backend(&workspace, None, 100, CODEX_PROVIDER, "Codex");
+        let record = self
+            .runtime
+            .effects
+            .persistence
+            .sessions
+            .create_with_id(
+                &parent.nakode_session_id,
+                CODEX_PROVIDER,
+                "parent-native",
+                &workspace,
+                &workspace,
+                "Parent Chat",
+                None,
+                &BackendModelOptions::default(),
+                None,
+            )
+            .unwrap();
+        parent.session_id = Some(record.id.clone());
+        let source = SessionId::from(record.id);
+        self.runtime
+            .core
+            .sessions_by_id
+            .insert(source.clone(), ServiceEngine::new(parent));
+        crate::child_reports::ReportStore::open(&self.runtime.effects.persistence.database)
+            .unwrap()
+            .execute(
+                &Command::LinkChildSession {
+                    parent_session_id: source.clone(),
+                    child_session_id: self.session.clone(),
+                },
+                "link-test",
+                false,
+                None,
+                1,
+            )
+            .unwrap();
+        source
+    }
+
+    /// Leaves a pending `SendAgentMessage` call on the parent, as the relay requires.
+    fn pending_send(&mut self, parent: &SessionId, call_id: &str, arguments: &serde_json::Value) {
+        self.runtime
+            .core
+            .engine_for_mut(parent)
+            .unwrap()
+            .state_mut()
+            .external_tool_calls
+            .push(crate::backend::ExternalToolRequest {
+                id: call_id.into(),
+                name: "SendAgentMessage".into(),
+                arguments_json: arguments.to_string(),
+            });
+    }
+
+    /// Relays a steer-now `SendAgentMessage` from the parent Chat, keyed by its call.
+    async fn steer_now(
+        &mut self,
+        parent: &SessionId,
+        call_id: &str,
+        text: &str,
+    ) -> Result<CommandAccepted, ServiceError> {
+        let arguments = serde_json::json!({"sessionId": self.session.as_str(), "message": text, "steerNow": true});
+        self.pending_send(parent, call_id, &arguments);
+        let command = Command::RelayAgentFollowup {
+            session_id: self.session.clone(),
+            message_id: call_id.to_owned(),
+            source_session_id: parent.clone(),
+            source_call_id: call_id.to_owned(),
+            prompt: PromptInput {
+                text: text.to_owned(),
+                attachments: Vec::new(),
+            },
+            source_owner_chat: false,
+            steer_now: true,
+        };
+        self.command(call_id, None, false, command).await
     }
 
     fn start(&mut self) -> (String, String) {
@@ -873,53 +956,12 @@ async fn durable_pending_question_wakes_parent_without_answering_original_intera
 #[tokio::test]
 async fn relay_requires_exact_live_source_call_and_persists_structured_display() {
     let mut h = Harness::new().await;
-    let workspace = h.state().workspace.clone();
-    let mut parent = DomainState::new_for_backend(&workspace, None, 100, CODEX_PROVIDER, "Codex");
-    let record = h
-        .runtime
-        .effects
-        .persistence
-        .sessions
-        .create_with_id(
-            &parent.nakode_session_id,
-            CODEX_PROVIDER,
-            "parent-native",
-            &workspace,
-            &workspace,
-            "Parent Chat",
-            None,
-            &BackendModelOptions::default(),
-            None,
-        )
-        .unwrap();
-    parent.session_id = Some(record.id.clone());
-    let source = SessionId::from(record.id);
-    parent
-        .external_tool_calls
-        .push(crate::backend::ExternalToolRequest {
-            id: "source-call".into(),
-            name: "SendAgentMessage".into(),
-            arguments_json:
-                serde_json::json!({"sessionId": h.session.as_str(), "message": "Run the new task"})
-                    .to_string(),
-        });
-    h.runtime
-        .core
-        .sessions_by_id
-        .insert(source.clone(), ServiceEngine::new(parent));
-    crate::child_reports::ReportStore::open(&h.runtime.effects.persistence.database)
-        .unwrap()
-        .execute(
-            &Command::LinkChildSession {
-                parent_session_id: source.clone(),
-                child_session_id: h.session.clone(),
-            },
-            "link-test",
-            false,
-            None,
-            1,
-        )
-        .unwrap();
+    let source = h.parent_chat();
+    h.pending_send(
+        &source,
+        "source-call",
+        &serde_json::json!({"sessionId": h.session.as_str(), "message": "Run the new task"}),
+    );
     let command = Command::RelayAgentFollowup {
         session_id: h.session.clone(),
         message_id: "relay-message".into(),
@@ -930,6 +972,7 @@ async fn relay_requires_exact_live_source_call_and_persists_structured_display()
             attachments: vec![],
         },
         source_owner_chat: false,
+        steer_now: false,
     };
     let mut forged = command.clone();
     if let Command::RelayAgentFollowup { prompt, .. } = &mut forged {

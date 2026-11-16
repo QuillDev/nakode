@@ -12,6 +12,7 @@ claim/acceptance checkpoints. Older servers reject the distinct interrupt RPC.
 checks the inbox and interrupts in one serialized step, so no batch can start dispatching in
 between:
 
+- A turn still starting has no provider turn id yet; it is interrupted as soon as it starts.
 - It refuses with Conflict, interrupting nothing, when the inbox is paused, nothing is pending, a
   claimed batch is blocked, child-evidence ownership is unavailable, or a batch is dispatching.
   A dispatching batch is either in flight or uncertain, and steering would interrupt its own
@@ -24,6 +25,26 @@ between:
   preserving attribution and attachments. Accepted ordinary visible-queue prompts still run
   first. Batch bounds still apply, so a large backlog delivers over successive turns. A
   rejected interrupt leaves every message pending. Interrupted work is never replayed.
+
+### Relay steer now
+
+`RelayAgentFollowupRequest.steer_now` (capability `RelayFollowupSteering`) admits a coordinator
+message and steers in the same runtime actor step, so no turn can start or end in between. It
+must match the source call's `steerNow` argument. `MutationResult.followup_steer` reports:
+
+- `INTERRUPTED`: the target was working; that work was interrupted as by `SteerFollowups`, or as
+  soon as a turn that was still starting reports it started. Accepted visible-queue prompts and
+  earlier pending messages still run first; the message joins the next bounded batch after them.
+- `IDLE`: nothing was running; nothing was interrupted and the message starts as a plain relay.
+- `PAUSED`: the inbox is paused; the message waits there, nothing was interrupted, and the pause
+  is unchanged.
+- `HELD`: a batch is being delivered or a claimed batch is blocked; the message waits behind it
+  and nothing was interrupted.
+- `REPLAYED`: an earlier attempt admitted this message; a retry never steers again, because the
+  current turn may be the one delivering it.
+
+The SDK refuses `steer_now` against a server without the capability instead of sending a plain
+relay.
 
 ## Current boundary
 

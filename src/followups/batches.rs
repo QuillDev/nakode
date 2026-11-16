@@ -229,6 +229,16 @@ impl InboxStore {
             .unwrap_or(false)
     }
 
+    pub(crate) fn paused(&self, session: &SessionId) -> Result<bool> {
+        self.0
+            .query_row(
+                "SELECT COALESCE((SELECT paused FROM followup_inboxes WHERE session_id = ?1), 0)",
+                [session.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(failure)
+    }
+
     /// Refuses a steer that could not deliver anything at the next idle boundary, so Steer now never
     /// interrupts work for nothing. A dispatching batch is already in flight (or uncertain); steering
     /// then would interrupt the very turn delivering it.
@@ -239,15 +249,7 @@ impl InboxStore {
                 "child evidence ownership is unavailable; explicit recovery required",
             ));
         }
-        let paused: bool = self
-            .0
-            .query_row(
-                "SELECT COALESCE((SELECT paused FROM followup_inboxes WHERE session_id = ?1), 0)",
-                [session.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(failure)?;
-        if paused {
+        if self.paused(session)? {
             return Err(refuse(
                 "the follow-up inbox is paused; resume it to deliver pending messages",
             ));

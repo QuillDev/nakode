@@ -22,6 +22,12 @@ const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) type Result<T> = std::result::Result<T, ServiceError>;
 pub(crate) struct InboxStore(Connection);
 
+pub(crate) struct InboxReceipt {
+    pub resource_id: Option<String>,
+    /// This call admitted a new message, rather than replaying an earlier admission.
+    pub admitted: bool,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct InboxRequest<'a> {
     pub command: &'a Command,
@@ -282,12 +288,24 @@ impl InboxStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_authenticated(
         &mut self,
         request: InboxRequest<'_>,
         materialize: impl FnOnce(&PromptInput) -> Result<PromptInput>,
         authenticate: impl FnOnce() -> Result<()>,
     ) -> Result<Option<String>> {
+        self.execute_receipted(request, materialize, authenticate)
+            .map(|receipt| receipt.resource_id)
+    }
+
+    /// Also says whether this call newly admitted its message, rather than replaying a receipt.
+    pub(crate) fn execute_receipted(
+        &mut self,
+        request: InboxRequest<'_>,
+        materialize: impl FnOnce(&PromptInput) -> Result<PromptInput>,
+        authenticate: impl FnOnce() -> Result<()>,
+    ) -> Result<InboxReceipt> {
         let InboxRequest {
             command,
             key,
@@ -311,9 +329,12 @@ impl InboxStore {
             )
             .optional()
             .map_err(failure)?;
-        if let Some((saved, id)) = saved {
+        if let Some((saved, resource_id)) = saved {
             return if saved == digest {
-                Ok(id)
+                Ok(InboxReceipt {
+                    resource_id,
+                    admitted: false,
+                })
             } else {
                 Err(refuse(
                     "follow-up idempotency key reused for different content",
@@ -323,6 +344,7 @@ impl InboxStore {
         if replay_only {
             return Err(refuse("follow-up receipt missing; no mutation executed"));
         }
+        let mut admitted = false;
         let (session, id) = match command {
             Command::EnqueueFollowup {
                 session_id,
@@ -354,6 +376,7 @@ impl InboxStore {
                             coordination::adopt(&tx, &source.session_id, session_id.as_str())?;
                         }
                     }
+                    admitted = true;
                 }
                 (session_id.as_str(), Some(message_id.clone()))
             }
@@ -378,7 +401,10 @@ impl InboxStore {
             params![key, session, digest, id],
         ).map_err(failure)?;
         tx.commit().map_err(failure)?;
-        Ok(id)
+        Ok(InboxReceipt {
+            resource_id: id,
+            admitted,
+        })
     }
 
     #[cfg(test)]

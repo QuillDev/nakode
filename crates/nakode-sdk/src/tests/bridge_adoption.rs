@@ -62,6 +62,7 @@ async fn bridge_adoption_preserves_exact_profile_and_intent_through_public_trans
                 bridge_continuation: None,
                 replayed_bridge_continuation: None,
                 replayed_bridge_source_active: None,
+                followup_steer: None,
             }))
             .unwrap();
     };

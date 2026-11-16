@@ -304,6 +304,7 @@ fn relay(f: &Fixture, inbox: &mut InboxStore) {
                         attachments: vec![],
                     },
                     source_owner_chat: false,
+                    steer_now: false,
                 },
                 key: "relay",
                 sender: "host",

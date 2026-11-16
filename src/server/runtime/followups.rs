@@ -1,12 +1,13 @@
 use super::{BackendEvent, Effect, NativeServerRuntime, ServerCore};
-use crate::followups::{InboxRequest, InboxStore, refuse};
+use crate::followups::{InboxReceipt, InboxRequest, InboxStore, refuse};
 use nakode_protocol::{
-    Command, PromptAttachment, PromptInput, Query, QueryResult, ServiceError, SessionId, Snapshot,
+    Command, CommandAccepted, FollowupSteer, PromptAttachment, PromptInput, Query, QueryResult,
+    ServiceError, SessionId, Snapshot,
 };
 
 impl NativeServerRuntime {
     /// The transport's client ID is audit attribution, not an ownership or permission grant.
-    pub(super) fn handle_followup_request(
+    pub(super) async fn handle_followup_request(
         &mut self,
         request: nakode_server::ServerRequest,
     ) -> Option<nakode_server::ServerRequest> {
@@ -47,28 +48,16 @@ impl NativeServerRuntime {
                 respond,
                 ..
             } => {
-                let session = self.core.command_session(&command);
-                let result = if expected_revision.is_some() {
-                    Err(refuse(
-                        "follow-up admission uses durable identities, not volatile session revision fences",
-                    ))
-                } else {
-                    self.admit_followup(
+                let result = self
+                    .admit_followup_request(
                         &command,
                         idempotency_key.as_str(),
                         client_id.as_str(),
+                        expected_revision,
                         replay_only,
                     )
-                };
-                if result.is_ok()
-                    && let Some(session) = session
-                {
-                    self.followup_polling_enabled = true;
-                    self.core
-                        .commit_and_publish_session(&self.endpoint, &session);
-                }
-                let _ = respond
-                    .send(result.map(|resource| ServerCore::accepted(resource, Vec::new()).0));
+                    .await;
+                let _ = respond.send(result);
                 None
             }
             nakode_server::ServerRequest::Command {
@@ -112,13 +101,52 @@ impl NativeServerRuntime {
         }
     }
 
+    async fn admit_followup_request(
+        &mut self,
+        command: &Command,
+        key: &str,
+        sender: &str,
+        expected_revision: Option<u64>,
+        replay_only: bool,
+    ) -> Result<CommandAccepted, ServiceError> {
+        if expected_revision.is_some() {
+            return Err(refuse(
+                "follow-up admission uses durable identities, not volatile session revision fences",
+            ));
+        }
+        let receipt = self.admit_followup(command, key, sender, replay_only)?;
+        let session = self.core.command_session(command);
+        let (mut accepted, _) = ServerCore::accepted(receipt.resource_id, Vec::new());
+        if let (
+            Command::RelayAgentFollowup {
+                steer_now: true, ..
+            },
+            Some(session),
+        ) = (command, &session)
+        {
+            // A retry of an admitted message never steers again: the turn it would interrupt
+            // may now be the one delivering that message.
+            accepted.followup_steer = Some(if receipt.admitted {
+                Box::pin(self.steer_relayed_followup(session)).await
+            } else {
+                FollowupSteer::Replayed
+            });
+        }
+        if let Some(session) = session {
+            self.followup_polling_enabled = true;
+            self.core
+                .commit_and_publish_session(&self.endpoint, &session);
+        }
+        Ok(accepted)
+    }
+
     fn admit_followup(
         &self,
         command: &Command,
         key: &str,
         sender: &str,
         replay_only: bool,
-    ) -> Result<Option<String>, ServiceError> {
+    ) -> Result<InboxReceipt, ServiceError> {
         let session = self
             .core
             .command_session(command)
@@ -131,7 +159,7 @@ impl NativeServerRuntime {
                 .ensure_session(&session)
                 .map_err(super::super::domain_error)?;
         }
-        InboxStore::open(&self.effects.persistence.database)?.execute_authenticated(
+        InboxStore::open(&self.effects.persistence.database)?.execute_receipted(
             InboxRequest {
                 command,
                 key,
@@ -144,12 +172,51 @@ impl NativeServerRuntime {
         )
     }
 
+    /// Runs in the actor turn that admitted the message, so no turn can start or end in between:
+    /// the work interrupted is the work current when the message arrived, never the turn that
+    /// delivers it. The checks match `SteerFollowups`, except that an idle target is not an error.
+    async fn steer_relayed_followup(&mut self, session: &SessionId) -> FollowupSteer {
+        let Ok(store) = InboxStore::open(&self.effects.persistence.database) else {
+            return FollowupSteer::Held;
+        };
+        match store.paused(session) {
+            Ok(true) => return FollowupSteer::Paused,
+            Ok(false) => {}
+            Err(_) => return FollowupSteer::Held,
+        }
+        if store.check_steerable(session).is_err() {
+            return FollowupSteer::Held;
+        }
+        let Some(engine) = self.core.engine_for_mut(session) else {
+            return FollowupSteer::Idle;
+        };
+        if !engine.state().is_busy() {
+            return FollowupSteer::Idle;
+        }
+        let Ok(effects) = engine.state_mut().steer_session_work() else {
+            return FollowupSteer::Held;
+        };
+        self.register_effect_owners(session, &effects);
+        if let Some(engine) = self.core.engine_for_mut(session) {
+            self.effects
+                .execute(
+                    session,
+                    engine.state_mut(),
+                    effects,
+                    super::EffectOrigin::PrimarySession,
+                )
+                .await;
+        }
+        FollowupSteer::Interrupted
+    }
+
     fn authenticate_relay(&self, command: &Command) -> Result<(), ServiceError> {
         let Command::RelayAgentFollowup {
             session_id,
             source_session_id,
             source_call_id,
             prompt,
+            steer_now,
             ..
         } = command
         else {
@@ -177,9 +244,14 @@ impl NativeServerRuntime {
             != Some(session_id.as_str())
             || arguments.get("message").and_then(serde_json::Value::as_str)
                 != Some(prompt.text.as_str())
+            || arguments
+                .get("steerNow")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                != *steer_now
         {
             return Err(refuse(
-                "relay target or message differs from the pending source call",
+                "relay target, message or steer now differs from the pending source call",
             ));
         }
         let references = arguments
