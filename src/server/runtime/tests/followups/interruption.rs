@@ -412,3 +412,85 @@ async fn steer_now_cancellation_failure_keeps_every_message_pending() {
     assert_eq!(h.inbox(), before);
     assert!(!h.inbox().paused);
 }
+
+#[tokio::test]
+async fn relay_steer_now_interrupts_working_agent_and_the_message_runs_next() {
+    let mut h = Box::pin(running()).await;
+    let chat = h.parent_chat();
+    let accepted = h.steer_now(&chat, "redirect", "New plan").await.unwrap();
+    assert_eq!(accepted.followup_steer, Some(FollowupSteer::Interrupted));
+    assert!(matches!(
+        h.commands.try_recv().unwrap(),
+        BackendCommand::InterruptTurn { .. }
+    ));
+    assert!(!h.inbox().paused);
+    finish(&mut h).await;
+    h.runtime.dispatch_followups().await;
+    let (_, prompt) = h.start();
+    assert!(prompt.contains("New plan"));
+    assert!(!prompt.contains("Original task"));
+}
+
+#[tokio::test]
+async fn relay_steer_now_retry_never_interrupts_the_turn_delivering_its_message() {
+    let mut h = Box::pin(running()).await;
+    let chat = h.parent_chat();
+    h.steer_now(&chat, "redirect", "New plan").await.unwrap();
+    h.commands.try_recv().unwrap();
+    finish(&mut h).await;
+    h.runtime.dispatch_followups().await;
+    h.start();
+    h.event(BackendEvent::TurnStarted {
+        turn_id: "new-plan".to_owned(),
+    })
+    .await;
+    // A transport retry after a lost receipt lands while the new message is the active turn.
+    let accepted = h.steer_now(&chat, "redirect", "New plan").await.unwrap();
+    assert_eq!(accepted.followup_steer, Some(FollowupSteer::Replayed));
+    assert!(h.commands.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn relay_steer_now_on_an_idle_agent_starts_the_message_and_cancels_nothing() {
+    let mut h = Harness::new().await;
+    h.event(BackendEvent::Ready(crate::backend::BackendIdentity {
+        provider: CODEX_PROVIDER.to_owned(),
+        display_name: "Codex".to_owned(),
+        version: None,
+        capabilities: h.state().backend_capabilities.clone(),
+    }))
+    .await;
+    let chat = h.parent_chat();
+    let accepted = h.steer_now(&chat, "redirect", "New plan").await.unwrap();
+    assert_eq!(accepted.followup_steer, Some(FollowupSteer::Idle));
+    h.runtime.dispatch_followups().await;
+    // The only provider command is the message's own start: nothing was interrupted.
+    let (_, prompt) = h.start();
+    assert!(prompt.contains("New plan"));
+}
+
+#[tokio::test]
+async fn relay_steer_now_never_delivers_into_a_paused_inbox() {
+    let mut h = Box::pin(running()).await;
+    h.command(
+        "owner-pause",
+        None,
+        false,
+        Command::SetFollowupPaused {
+            session_id: h.session.clone(),
+            paused: true,
+        },
+    )
+    .await
+    .unwrap();
+    let chat = h.parent_chat();
+    let accepted = h.steer_now(&chat, "redirect", "New plan").await.unwrap();
+    assert_eq!(accepted.followup_steer, Some(FollowupSteer::Paused));
+    assert!(h.commands.try_recv().is_err());
+    finish(&mut h).await;
+    h.runtime.dispatch_followups().await;
+    assert!(h.commands.try_recv().is_err());
+    let inbox = h.inbox();
+    assert!(inbox.paused);
+    assert_eq!(inbox.items[0].state, "pending");
+}

@@ -82,6 +82,7 @@ async fn followup_sdk_preserves_caller_identity_and_original_message() {
                 bridge_continuation: None,
                 replayed_bridge_continuation: None,
                 replayed_bridge_source_active: None,
+                followup_steer: None,
             }))
             .unwrap();
     };
@@ -148,6 +149,7 @@ async fn removal_requires_capability_and_preserves_exact_identity() {
                 bridge_continuation: None,
                 replayed_bridge_continuation: None,
                 replayed_bridge_source_active: None,
+                followup_steer: None,
             }))
             .unwrap();
     };
@@ -212,11 +214,38 @@ async fn steering_requires_capability_and_preserves_exact_identity() {
                 bridge_continuation: None,
                 replayed_bridge_continuation: None,
                 replayed_bridge_source_active: None,
+                followup_steer: None,
             }))
             .unwrap();
     };
     let (result, ()) = tokio::join!(send, receive);
     assert!(result.is_ok());
+    shutdown.send(()).unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn relay_steer_now_refuses_a_server_that_would_only_queue_it() {
+    let (client, mut requests, shutdown, server) = parent_creation::server(None).await;
+    let error = client
+        .relay_agent_followup(api::RelayAgentFollowupRequest {
+            session_id: "session".into(),
+            message_id: "message".into(),
+            steer_now: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not support RelayFollowupSteering")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), requests.recv())
+            .await
+            .is_err()
+    );
     shutdown.send(()).unwrap();
     server.await.unwrap();
 }

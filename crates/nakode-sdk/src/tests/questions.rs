@@ -151,6 +151,7 @@ async fn question_answers_preserve_identity_text_and_stale_errors_through_public
                     bridge_continuation: None,
                     replayed_bridge_continuation: None,
                     replayed_bridge_source_active: None,
+                    followup_steer: None,
                 })
             } else {
                 Err(protocol::ServiceError {

@@ -177,6 +177,9 @@ impl GrpcService {
                 resource_id: result.resource_id,
                 revision: result.revision,
                 effective_session_tools: result.effective_session_tools.map(session_tools_api),
+                followup_steer: result
+                    .followup_steer
+                    .map(|steer| followup_steer_api(steer) as i32),
             },
             &timed.timing,
         ))
@@ -398,6 +401,16 @@ fn session_tools(
         allowed_builtin_tools: (!value.allowed_builtin_tools.is_empty())
             .then_some(value.allowed_builtin_tools),
     })
+}
+
+fn followup_steer_api(value: protocol::FollowupSteer) -> api::FollowupSteer {
+    match value {
+        protocol::FollowupSteer::Interrupted => api::FollowupSteer::Interrupted,
+        protocol::FollowupSteer::Idle => api::FollowupSteer::Idle,
+        protocol::FollowupSteer::Paused => api::FollowupSteer::Paused,
+        protocol::FollowupSteer::Held => api::FollowupSteer::Held,
+        protocol::FollowupSteer::Replayed => api::FollowupSteer::Replayed,
+    }
 }
 
 fn session_tools_api(value: protocol::SessionToolConfiguration) -> api::SessionToolConfiguration {
@@ -874,6 +887,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             source_call_id: input.source_call_id,
             prompt,
             source_owner_chat: input.source_owner_chat,
+            steer_now: input.steer_now,
         })
     );
     try_command_rpc!(
@@ -1417,6 +1431,7 @@ impl api::nakode_service_server::NakodeService for GrpcService {
                     resource_id: result.resource_id,
                     revision: result.revision,
                     effective_session_tools: result.effective_session_tools.map(session_tools_api),
+                    followup_steer: None,
                 }),
                 disposition: disposition as i32,
                 replayed_disposition,
@@ -4715,6 +4730,7 @@ mod tests {
                 bridge_continuation: None,
                 replayed_bridge_continuation: None,
                 replayed_bridge_source_active: None,
+                followup_steer: None,
             }));
         };
         let (publish, ()) = tokio::join!(publish, reply);

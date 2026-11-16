@@ -1489,7 +1489,7 @@ impl NativeServerRuntime {
                 request => request,
             }
         };
-        let Some(request) = self.handle_followup_request(request) else {
+        let Some(request) = self.handle_followup_request(request).await else {
             return;
         };
         let Some(request) = self.handle_background_task_request(request) else {
@@ -3644,6 +3644,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
             ServiceCapability::DurableFollowupInbox,
             ServiceCapability::PendingFollowupRemoval,
             ServiceCapability::FollowupSteering,
+            ServiceCapability::RelayFollowupSteering,
             ServiceCapability::ExternalChildReports,
             ServiceCapability::ParentSessionCreation,
             ServiceCapability::AttachedSessionBridge,

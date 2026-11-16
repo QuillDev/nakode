@@ -108,6 +108,7 @@ async fn parent_creation_preserves_exact_parent_across_sdk_and_grpc() {
                 bridge_continuation: None,
                 replayed_bridge_continuation: None,
                 replayed_bridge_source_active: None,
+                followup_steer: None,
             }))
             .unwrap();
     };

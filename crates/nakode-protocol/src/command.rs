@@ -305,6 +305,11 @@ pub enum Command {
         /// its message instructs any of the owner's agents rather than only its own children.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         source_owner_chat: bool,
+        /// Steer now: in the same runtime step as admission, interrupt the target's current work so
+        /// this message delivers next. Never delivers into or resumes a paused inbox. Requires
+        /// `RelayFollowupSteering`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        steer_now: bool,
     },
     EnqueueFollowup {
         session_id: SessionId,

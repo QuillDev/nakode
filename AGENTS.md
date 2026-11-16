@@ -197,6 +197,7 @@ submit its result.
 
 - Coordinator `InterruptSessionWork` preserves coordination inbox pause state; manual `CancelSessionWork` pauses dispatch. Both cancel current work without replay. `docs/followup-inbox.md`.
 - `SteerFollowups` (Steer now) interrupts like `InterruptSessionWork` only when the runtime confirms deliverable pending inbox work; it refuses while paused, empty, blocked or dispatching, and absorbs repeated clicks. `docs/followup-inbox.md`.
+- `RelayAgentFollowup` `steer_now` admits and steers in one actor step; it never steers a paused inbox or a replayed admission, and reports its outcome in `followup_steer`. `docs/followup-inbox.md`.
 
 A Nakode session is a logical body of work, not an alias for one provider
 thread. One logical session may contain many native agent sessions using

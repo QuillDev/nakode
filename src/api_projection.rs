@@ -142,6 +142,7 @@ pub(crate) async fn execute_command(
                 resource_id: Some(resource_id),
                 revision: None,
                 effective_session_tools: None,
+                followup_steer: None,
             })
         }
         TuiAction::OpenSession {
@@ -227,6 +228,7 @@ async fn open_session(
         resource_id: Some(opened.id),
         revision: None,
         effective_session_tools: opened.effective_session_tools,
+        followup_steer: None,
     })
 }
 

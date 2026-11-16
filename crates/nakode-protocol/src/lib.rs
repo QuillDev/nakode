@@ -55,8 +55,8 @@ pub use mcp::{
     McpSessionGrant, McpSessionSurface, McpTemplateView, McpToolView,
 };
 pub use service::{
-    BridgeContinuationDisposition, CommandAccepted, Cursor, ManageableSkillView, QueryResult,
-    ServiceCapabilities, ServiceCapability, SessionChangesView, SessionInventory,
+    BridgeContinuationDisposition, CommandAccepted, Cursor, FollowupSteer, ManageableSkillView,
+    QueryResult, ServiceCapabilities, ServiceCapability, SessionChangesView, SessionInventory,
     SessionStatusInventory, SkillCatalogueView, Snapshot, SoulDocumentView, SubscriptionScope,
     SubscriptionView, TranscriptChanges, WorkspacePathInspectionView,
 };

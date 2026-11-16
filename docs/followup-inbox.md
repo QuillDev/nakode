@@ -25,6 +25,25 @@ between:
   first. Batch bounds still apply, so a large backlog delivers over successive turns. A
   rejected interrupt leaves every message pending. Interrupted work is never replayed.
 
+### Relay steer now
+
+`RelayAgentFollowupRequest.steer_now` (capability `RelayFollowupSteering`) admits a coordinator
+message and steers in the same runtime actor step, so no turn can start or end in between. It
+must match the source call's `steerNow` argument. `MutationResult.followup_steer` reports:
+
+- `INTERRUPTED`: the target was working; that work was interrupted as by `SteerFollowups` and this
+  message delivers in the next batch, after any earlier pending messages.
+- `IDLE`: nothing was running; nothing was interrupted and the message starts as a plain relay.
+- `PAUSED`: the inbox is paused; the message waits there, nothing was interrupted, and the pause
+  is unchanged.
+- `HELD`: a batch is being delivered or a claimed batch is blocked; the message waits behind it
+  and nothing was interrupted.
+- `REPLAYED`: an earlier attempt admitted this message; a retry never steers again, because the
+  current turn may be the one delivering it.
+
+The SDK refuses `steer_now` against a server without the capability instead of sending a plain
+relay.
+
 ## Current boundary
 
 This is an unshipped runtime/API foundation, not a completed dashboard feature.

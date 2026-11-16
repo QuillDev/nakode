@@ -15,6 +15,8 @@ pub enum ServiceCapability {
     PendingFollowupRemoval,
     /// `SteerFollowups` interrupts current work so pending follow-ups deliver next.
     FollowupSteering,
+    /// `RelayAgentFollowup` accepts `steer_now`, admitting and steering in one runtime step.
+    RelayFollowupSteering,
     /// `AdmitExternalChildReport` admits a child in another runtime's report as child evidence.
     ExternalChildReports,
     Subscriptions,
@@ -134,6 +136,23 @@ pub enum BridgeContinuationDisposition {
     Busy,
 }
 
+/// What a steer-now relay did to the target's work, decided in the same step as admission.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FollowupSteer {
+    /// The target was working; that work was interrupted and this message delivers next.
+    Interrupted,
+    /// The target was idle; nothing was interrupted and the message starts as an ordinary relay.
+    Idle,
+    /// The inbox is paused; the message waits there and nothing was interrupted.
+    Paused,
+    /// A batch is already being delivered, or a claimed batch is blocked; the message waits behind
+    /// it and nothing was interrupted.
+    Held,
+    /// This message was admitted by an earlier attempt; the retry did not steer again.
+    Replayed,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CommandAccepted {
     pub resource_id: Option<String>,
@@ -151,6 +170,9 @@ pub struct CommandAccepted {
     /// Whether the replayed Accepted message still owns live/final reaction routing.
     #[serde(default)]
     pub replayed_bridge_source_active: Option<bool>,
+    /// Present only for a steer-now `RelayAgentFollowup`.
+    #[serde(default)]
+    pub followup_steer: Option<FollowupSteer>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
