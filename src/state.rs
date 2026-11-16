@@ -1584,6 +1584,8 @@ pub struct DomainState {
     pending_redirect: Option<PendingRedirect>,
     /// A promoted follow-up removed from the queue only while its replacement turn is starting.
     redirect_start: Option<RedirectStart>,
+    /// Steer now arrived while a turn was starting and had no provider turn id to interrupt yet.
+    interrupt_on_start: bool,
     pending_handoff: Option<HandoffPackage>,
     resuming_session: Option<SessionRecord>,
     /// Server runtimes set this for one resume event when a durable bridge inbox must dispatch
@@ -2394,6 +2396,7 @@ impl DomainState {
             pending_steer: None,
             pending_redirect: None,
             redirect_start: None,
+            interrupt_on_start: false,
             pending_handoff: None,
             resuming_session: None,
             defer_resume_queue: false,
@@ -4883,6 +4886,10 @@ impl DomainState {
     /// # Errors
     /// Rejects the request when the active provider cannot interrupt its turn.
     pub fn steer_session_work(&mut self) -> Result<Vec<Effect>, DomainCommandError> {
+        // A starting turn has no provider id to interrupt yet; interrupt it as soon as it starts.
+        if self.active_turn.is_none() && self.starting_turn.is_some() {
+            self.interrupt_on_start = true;
+        }
         self.interrupt_session_work(true)
     }
 
@@ -5211,6 +5218,7 @@ impl DomainState {
         self.pending_steer = None;
         self.pending_redirect = None;
         self.redirect_start = None;
+        self.interrupt_on_start = false;
         self.pending_handoff = None;
         self.resuming_session = None;
         self.item_turns.clear();
@@ -7446,14 +7454,22 @@ impl DomainState {
                     .as_ref()
                     .filter(|prompt| prompt.source_transport.is_none())
                     .map(|prompt| prompt.id.clone());
-                self.observe_turn_started(turn_id);
+                self.observe_turn_started(turn_id.clone());
                 self.latest_failure = None;
+                let mut effects = Vec::new();
                 if let Some(prompt_id) = acknowledged_prompt {
-                    return vec![Effect::AcknowledgeOwnerPromptDispatch {
+                    effects.push(Effect::AcknowledgeOwnerPromptDispatch {
                         session_id: self.nakode_session_id.clone(),
                         prompt_id,
-                    }];
+                    });
                 }
+                if std::mem::take(&mut self.interrupt_on_start) {
+                    match self.cancel_turn(&turn_id) {
+                        Ok(interrupt) => effects.extend(interrupt),
+                        Err(error) => self.set_status(&error.to_string()),
+                    }
+                }
+                return effects;
             }
             BackendEvent::TurnCompleted {
                 turn_id,
@@ -8628,6 +8644,7 @@ impl DomainState {
         self.active_turn = None;
         self.context_compaction = None;
         self.starting_turn = None;
+        self.interrupt_on_start = false;
         self.transcript.set_stream_active(false);
         if self
             .pending_steer

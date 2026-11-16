@@ -12,6 +12,7 @@ claim/acceptance checkpoints. Older servers reject the distinct interrupt RPC.
 checks the inbox and interrupts in one serialized step, so no batch can start dispatching in
 between:
 
+- A turn still starting has no provider turn id yet; it is interrupted as soon as it starts.
 - It refuses with Conflict, interrupting nothing, when the inbox is paused, nothing is pending, a
   claimed batch is blocked, child-evidence ownership is unavailable, or a batch is dispatching.
   A dispatching batch is either in flight or uncertain, and steering would interrupt its own
@@ -31,8 +32,9 @@ between:
 message and steers in the same runtime actor step, so no turn can start or end in between. It
 must match the source call's `steerNow` argument. `MutationResult.followup_steer` reports:
 
-- `INTERRUPTED`: the target was working; that work was interrupted as by `SteerFollowups` and this
-  message delivers in the next batch, after any earlier pending messages.
+- `INTERRUPTED`: the target was working; that work was interrupted as by `SteerFollowups`, or as
+  soon as a turn that was still starting reports it started. Accepted visible-queue prompts and
+  earlier pending messages still run first; the message joins the next bounded batch after them.
 - `IDLE`: nothing was running; nothing was interrupted and the message starts as a plain relay.
 - `PAUSED`: the inbox is paused; the message waits there, nothing was interrupted, and the pause
   is unchanged.

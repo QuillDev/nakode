@@ -1,6 +1,16 @@
 use super::*;
 
 async fn running() -> Harness {
+    let mut h = Box::pin(starting()).await;
+    h.event(BackendEvent::TurnStarted {
+        turn_id: "original".to_owned(),
+    })
+    .await;
+    h
+}
+
+/// The original task has been sent to the provider, which has not yet reported it started.
+async fn starting() -> Harness {
     let mut h = Harness::new().await;
     h.event(BackendEvent::Ready(crate::backend::BackendIdentity {
         provider: CODEX_PROVIDER.to_owned(),
@@ -24,10 +34,6 @@ async fn running() -> Harness {
     .await
     .unwrap();
     h.start();
-    h.event(BackendEvent::TurnStarted {
-        turn_id: "original".to_owned(),
-    })
-    .await;
     h
 }
 
@@ -429,6 +435,26 @@ async fn relay_steer_now_interrupts_working_agent_and_the_message_runs_next() {
     let (_, prompt) = h.start();
     assert!(prompt.contains("New plan"));
     assert!(!prompt.contains("Original task"));
+}
+
+#[tokio::test]
+async fn relay_steer_now_interrupts_a_turn_that_was_still_starting() {
+    let mut h = Box::pin(starting()).await;
+    let chat = h.parent_chat();
+    let accepted = h.steer_now(&chat, "redirect", "New plan").await.unwrap();
+    assert_eq!(accepted.followup_steer, Some(FollowupSteer::Interrupted));
+    h.event(BackendEvent::TurnStarted {
+        turn_id: "original".to_owned(),
+    })
+    .await;
+    assert!(matches!(
+        h.commands.try_recv().unwrap(),
+        BackendCommand::InterruptTurn { .. }
+    ));
+    finish(&mut h).await;
+    h.runtime.dispatch_followups().await;
+    let (_, prompt) = h.start();
+    assert!(prompt.contains("New plan"));
 }
 
 #[tokio::test]
