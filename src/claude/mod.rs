@@ -2006,15 +2006,6 @@ fn turn_completed_event(message: &Value) -> BackendEvent {
     }
 }
 
-/// The Agent SDK catalogue does not report input modalities. Normalize the documented
-/// Opus 5.5 contract here, never from a display label or a client-side provider guess.
-/// A resolved identity takes precedence over mutable aliases; unknown targets fail closed.
-fn claude_native_image_input(id: &str, resolved_model: Option<&str>) -> bool {
-    let identity = resolved_model.unwrap_or(id);
-    matches!(identity, "claude-opus-5-5" | "claude-opus-5-5[1m]")
-        || (resolved_model.is_none() && matches!(id, "opus" | "opus[1m]"))
-}
-
 fn models_event(message: &Value) -> BackendEvent {
     let models = message["models"]
         .as_array()
@@ -2038,11 +2029,9 @@ fn models_event(message: &Value) -> BackendEvent {
                         .and_then(Value::as_str)
                         .unwrap_or(""),
                 ),
+                // Image input is provider-wide for Claude; see `model_configuration`.
                 capabilities: crate::backend::ModelCapabilities {
-                    accepts_image_input: claude_native_image_input(
-                        model.get("id")?.as_str()?,
-                        model.get("resolvedModel").and_then(Value::as_str),
-                    ),
+                    accepts_image_input: false,
                     reasoning_efforts: model
                         .get("supportedEffortLevels")
                         .and_then(Value::as_array)
@@ -4041,36 +4030,6 @@ assert.equal(replacementSent, true, "replacement did not send after child close"
         assert_eq!(request.method, "set_options");
         assert_eq!(request.payload["sessionId"], "claude-session");
         assert_eq!(request.payload["fastMode"], true);
-    }
-
-    #[test]
-    fn claude_image_capability_uses_sdk_identity_not_display_label() {
-        let BackendEvent::Models(models) = models_event(&json!({"models": [
-            {"id":"claude-opus-5-5"},
-            {"id":"opus"},
-            {"id":"opus[1m]", "resolvedModel":"claude-opus-5-5[1m]"},
-            {"id":"default", "resolvedModel":"claude-opus-5-5[1m]"},
-            {"id":"unknown", "displayName":"Opus 5.5"},
-            {"id":"opus", "resolvedModel":"text-only"},
-            {"id":"claude-opus-5-50"}
-        ]})) else {
-            panic!("models event");
-        };
-        for (index, model) in models.iter().enumerate() {
-            assert_eq!(
-                model.capabilities.accepts_image_input,
-                index < 4,
-                "{}",
-                model.id
-            );
-            assert_eq!(
-                crate::state::projection::model_configuration(model, false).accepts_image_input,
-                index < 4
-            );
-        }
-        let legacy: crate::backend::ModelCapabilities =
-            serde_json::from_str("{\"reasoning_efforts\":[]}").expect("legacy cache");
-        assert!(!legacy.accepts_image_input);
     }
 
     #[test]

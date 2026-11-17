@@ -9676,6 +9676,9 @@ impl DomainState {
     }
 
     fn model_supports_images(&self, provider: &str, model: Option<&str>) -> bool {
+        if projection::provider_accepts_image_input_on_every_model(provider) {
+            return true;
+        }
         self.models
             .iter()
             .find(|candidate| {

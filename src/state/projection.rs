@@ -31,8 +31,9 @@ use super::{
 use crate::{
     agent::{AgentDefinition, AgentToolProfile},
     backend::{
-        BackendCapabilities, BackendFailureClassification, BackendFailurePhase, CODEX_PROVIDER,
-        CURSOR_PROVIDER, CapabilitySupport, GLM_PROVIDER, KIMI_PROVIDER, ModelInfo, TodoStatus,
+        BackendCapabilities, BackendFailureClassification, BackendFailurePhase, CLAUDE_PROVIDER,
+        CODEX_PROVIDER, CURSOR_PROVIDER, CapabilitySupport, GLM_PROVIDER, KIMI_PROVIDER, ModelInfo,
+        TodoStatus,
     },
     domain_transcript::{DomainTranscript, EntryKind, EntryStatus, TranscriptEntry},
     memory::MemoryBackend,
@@ -201,6 +202,12 @@ pub fn workspace_bootstrap(
     }
 }
 
+/// Codex and Claude take native image input on every model, including model IDs that discovery
+/// has not listed yet. The provider still reports a real error for a model that refuses images.
+pub(crate) fn provider_accepts_image_input_on_every_model(provider: &str) -> bool {
+    matches!(provider, CODEX_PROVIDER | CLAUDE_PROVIDER)
+}
+
 /// The levels and flags a model takes. The ONE place that rule lives — every frontend, and the
 /// delegated-run path that has to refuse a level a model cannot take, reads this.
 pub(crate) fn model_configuration(
@@ -211,9 +218,10 @@ pub(crate) fn model_configuration(
         reasoning_efforts: model.capabilities.reasoning_efforts.clone(),
         accepts_image_input: vision_add_on_enabled
             || model.capabilities.accepts_image_input
+            || provider_accepts_image_input_on_every_model(&model.provider)
             || matches!(
                 model.provider.as_str(),
-                CODEX_PROVIDER | CURSOR_PROVIDER | KIMI_PROVIDER | GLM_PROVIDER
+                CURSOR_PROVIDER | KIMI_PROVIDER | GLM_PROVIDER
             ),
         ..ModelConfigurationView::default()
     };
@@ -3428,7 +3436,8 @@ mod tests {
             model_configuration(&claude, false).reasoning_efforts,
             ["low", "medium", "high"]
         );
-        assert!(!model_configuration(&claude, false).accepts_image_input);
+        assert!(model_configuration(&claude, false).accepts_image_input);
+        assert!(!model_configuration(&claude, false).vision_eligible);
 
         let cursor = model_configuration(&model(CURSOR_PROVIDER, "composer-2"), false);
         assert!(cursor.reasoning_efforts.is_empty());
