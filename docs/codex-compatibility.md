@@ -4,7 +4,7 @@ Nakode's production `openai-codex` provider is an in-process adapter. It does no
 execute a Codex CLI, install `@openai/codex`, or link a Codex Cargo dependency.
 Updating a separately installed `codex` executable does not update Nakode.
 
-`src/codex/native.rs` advertises **0.155.1**, updated from **0.153.2**, in both
+`src/codex/native.rs` advertises **0.169.0**, updated from **0.162.1**, in both
 the model-discovery query and the discovery/inference version headers. This is
 a protocol compatibility baseline, not a bundled CLI version or a guarantee
 that every upstream feature is implemented.

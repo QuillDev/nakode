@@ -45,7 +45,7 @@ const COMMAND_CAPACITY: usize = 128;
 const EVENT_CAPACITY: usize = 1_024;
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 // Match the stable upstream Codex protocol baseline, not a local CLI installation.
-const CODEX_CLIENT_VERSION: &str = "0.162.1";
+const CODEX_CLIENT_VERSION: &str = "0.169.0";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -3374,10 +3374,13 @@ mod tests {
         let requests = server.await.expect("mock server task");
 
         assert_eq!(requests.len(), 2);
-        assert!(requests[0].starts_with("GET /codex/models?client_version=0.162.1 HTTP/1.1"));
+        let version_header = format!("version: {CODEX_CLIENT_VERSION}");
+        assert!(requests[0].starts_with(&format!(
+            "GET /codex/models?client_version={CODEX_CLIENT_VERSION} HTTP/1.1"
+        )));
         assert!(requests[1].starts_with("POST /codex/responses HTTP/1.1"));
-        assert!(requests[0].contains("version: 0.162.1"));
-        assert!(requests[1].contains("version: 0.162.1"));
+        assert!(requests[0].contains(&version_header));
+        assert!(requests[1].contains(&version_header));
         assert!(requests[1].contains(r#""model":"gpt-6.1-sol""#));
         assert!(requests[1].contains(r#""effort":"ultra""#));
         assert_eq!(output.text, "ready");
