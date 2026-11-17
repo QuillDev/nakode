@@ -9676,6 +9676,9 @@ impl DomainState {
     }
 
     fn model_supports_images(&self, provider: &str, model: Option<&str>) -> bool {
+        if projection::provider_accepts_image_input_on_every_model(provider) {
+            return true;
+        }
         self.models
             .iter()
             .find(|candidate| {
@@ -12608,6 +12611,15 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
             restored.resolve_run_image(None, &reference).is_err(),
             "child images are not implicitly authorized in another run"
         );
+    }
+
+    #[test]
+    fn delegated_images_reach_undiscovered_codex_and_claude_models_only() {
+        let state = ready_state();
+
+        assert!(state.model_supports_images(CODEX_PROVIDER, Some("future-model-9")));
+        assert!(state.model_supports_images(CLAUDE_PROVIDER, Some("future-model-9")));
+        assert!(!state.model_supports_images("devin-acp", Some("future-model-9")));
     }
 
     #[test]

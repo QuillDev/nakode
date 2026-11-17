@@ -5206,9 +5206,18 @@ impl ServerCore {
                     |selected| model.qualified_id() == *selected,
                 )
             });
-            if !model.is_some_and(|model| {
-                crate::state::projection::model_configuration(model, false).accepts_image_input
-            }) {
+            let selected_provider = state
+                .selected_model
+                .as_deref()
+                .and_then(|selected| selected.split_once('/'))
+                .map_or(state.backend_provider.as_str(), |(provider, _)| provider);
+            let accepts_image_input =
+                crate::state::projection::provider_accepts_image_input_on_every_model(
+                    selected_provider,
+                ) || model.is_some_and(|model| {
+                    crate::state::projection::model_configuration(model, false).accepts_image_input
+                });
+            if !accepts_image_input {
                 return Err(DomainCommandError::Invalid("the selected provider/model does not advertise native image input; choose a vision-capable model (no text-only fallback)".to_owned()));
             }
         }
@@ -10996,72 +11005,53 @@ enabled = false
     }
 
     #[test]
-    fn claude_image_sends_follow_refreshed_selected_model_capabilities() {
-        for id in ["claude-opus-5-5", "opus", "opus[1m]", "default"] {
-            let mut state = AppState::new_for_backend(
-                project_workspace(),
-                None,
-                100,
-                CLAUDE_PROVIDER,
-                "Claude",
-            );
-            state.provider_session_id = Some("claude-session".to_owned());
-            state.selected_model = Some(format!("{CLAUDE_PROVIDER}/{id}"));
-            let model = |accepts_image_input| ModelInfo {
-                provider: CLAUDE_PROVIDER.to_owned(),
-                id: id.to_owned(),
-                display_name: None,
-                is_default: true,
-                capabilities: ModelCapabilities {
-                    accepts_image_input,
-                    ..Default::default()
-                },
-            };
-            state.handle_backend(BackendEvent::Models(vec![model(false)]));
-            let session_id = SessionId::from(state.nakode_session_id.clone());
-            let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
-            let prompt = |text: &str| PromptInput {
-                text: text.to_owned(),
-                attachments: vec![ProtocolPromptAttachment::InlineImage {
-                    label: "tiny.png".to_owned(),
-                    media_type: "image/png".to_owned(),
-                    data: crate::image_handoff::tests::png(16, 8),
-                }],
-            };
-            assert!(
-                core.convert_prompt(&session_id, prompt("")).is_err(),
-                "stale/unknown capability"
-            );
-            core.engine_for_mut(&session_id)
-                .unwrap()
-                .state_mut()
-                .handle_backend(BackendEvent::Models(vec![model(true)]));
-            for text in ["Inspect", ""] {
-                let (actual, attachments) = core.convert_prompt(&session_id, prompt(text)).unwrap();
-                assert_eq!(actual, text);
-                assert_eq!(
-                    attachments[0].image.as_ref().unwrap().mime_type,
-                    "image/png"
-                );
-            }
-            core.engine_for_mut(&session_id)
-                .unwrap()
-                .state_mut()
-                .handle_backend(BackendEvent::Models(vec![model(false)]));
-            assert!(
-                core.convert_prompt(&session_id, prompt("Inspect")).is_err(),
-                "withdrawn capability"
-            );
-        }
-    }
+    fn codex_and_claude_accept_images_on_any_model_while_other_providers_still_refuse() {
+        let model_id = "future-model-9";
+        let image_prompt = || PromptInput {
+            text: "Inspect".to_owned(),
+            attachments: vec![ProtocolPromptAttachment::InlineImage {
+                label: "tiny.png".to_owned(),
+                media_type: "image/png".to_owned(),
+                data: crate::image_handoff::tests::png(16, 8),
+            }],
+        };
+        for (provider, accepts_images) in [
+            (CODEX_PROVIDER, true),
+            (CLAUDE_PROVIDER, true),
+            ("devin-acp", false),
+        ] {
+            // Discovery may list the model without declaring images, or not have listed it yet.
+            for discovered in [true, false] {
+                let mut state =
+                    AppState::new_for_backend(project_workspace(), None, 100, provider, "Provider");
+                state.selected_model = Some(format!("{provider}/{model_id}"));
+                if discovered {
+                    state.handle_backend(BackendEvent::Models(vec![ModelInfo {
+                        provider: provider.to_owned(),
+                        id: model_id.to_owned(),
+                        display_name: None,
+                        is_default: true,
+                        capabilities: ModelCapabilities::default(),
+                    }]));
+                }
+                let session_id = SessionId::from(state.nakode_session_id.clone());
+                let core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
 
-    #[test]
-    fn image_handoff_requires_declared_provider_vision_support() {
-        let (mut core, session_id) = ready_codex_server();
-        let error = core
-            .prompt_command(&session_id, prompt_with_image_and_file(), false, None)
-            .unwrap_err();
-        assert!(error.to_string().contains("no text-only fallback"));
+                let result = core.convert_prompt(&session_id, image_prompt());
+
+                let context = format!("{provider} discovered={discovered}");
+                if accepts_images {
+                    let (_, attachments) = result.expect(&context);
+                    assert!(attachments[0].image.is_some(), "{context}");
+                } else {
+                    let error = result.expect_err(&context);
+                    assert!(
+                        error.to_string().contains("no text-only fallback"),
+                        "{context}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
