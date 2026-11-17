@@ -12614,6 +12614,15 @@ fallback_models = ["openai-codex/gpt-5.6-luna"]
     }
 
     #[test]
+    fn delegated_images_reach_undiscovered_codex_and_claude_models_only() {
+        let state = ready_state();
+
+        assert!(state.model_supports_images(CODEX_PROVIDER, Some("future-model-9")));
+        assert!(state.model_supports_images(CLAUDE_PROVIDER, Some("future-model-9")));
+        assert!(!state.model_supports_images("devin-acp", Some("future-model-9")));
+    }
+
+    #[test]
     fn image_handoff_refuses_inaccessible_images_without_creating_children() {
         let mut state = ready_state();
         state.install_agents(explorer_catalog());

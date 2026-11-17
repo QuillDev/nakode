@@ -11035,7 +11035,7 @@ enabled = false
                     }]));
                 }
                 let session_id = SessionId::from(state.nakode_session_id.clone());
-                let mut core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
+                let core = ServerCore::new(ServiceEngine::new(state), Vec::new(), Vec::new());
 
                 let result = core.convert_prompt(&session_id, image_prompt());
 
