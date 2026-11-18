@@ -68,6 +68,7 @@ pub enum ServerRequest {
         /// For a session scope, asks for `SubscriptionView::SessionChanges` since this generation
         /// (zero for a complete first view) instead of a freshly projected session.
         changes_since: Option<u64>,
+        sync: Option<nakode_protocol::sync::Read>,
         respond: oneshot::Sender<Result<Snapshot<SubscriptionView>, ServiceError>>,
     },
 }
@@ -266,6 +267,12 @@ pub const RPC_LANE_CATALOGUE: &[RpcLaneAssignment] = &[
     fixed("NakodeService", "DeleteSession", RequestLane::Control),
     fixed("NakodeService", "ClearSelf", RequestLane::Control),
     fixed("NakodeService", "GetSession", RequestLane::Hydration),
+    fixed(
+        "NakodeService",
+        "GetSessionSyncSnapshot",
+        RequestLane::Subscription,
+    ),
+    fixed("NakodeService", "FollowSession", RequestLane::Subscription),
     fixed("NakodeService", "WatchSession", RequestLane::Subscription),
     fixed("NakodeService", "SendPrompt", RequestLane::Control),
     fixed("NakodeService", "EnqueuePrompt", RequestLane::Control),
@@ -937,6 +944,7 @@ impl ServerEndpoint {
                 subscription_id: self.next_subscription_id(),
                 scope,
                 changes_since: None,
+                sync: None,
                 respond,
             },
         )
@@ -962,10 +970,40 @@ impl ServerEndpoint {
                 subscription_id: self.next_subscription_id(),
                 scope: SubscriptionScope::Session { session_id },
                 changes_since: Some(since),
+                sync: None,
                 respond,
             },
         )
         .await
+    }
+
+    /// Reads a complete replay boundary on the subscription lane, without snapshot caching.
+    ///
+    /// # Errors
+    /// Returns the canonical session lookup or runtime availability error.
+    pub async fn read_session_sync(
+        &self,
+        client_id: ClientId,
+        session_id: nakode_protocol::SessionId,
+        read: nakode_protocol::sync::Read,
+    ) -> Result<SubscriptionView, ServiceError> {
+        self.submit(
+            &self.inner.subscription_requests,
+            RequestLane::Subscription,
+            |timing, respond| ServerRequest::Subscribe {
+                timing,
+                client_id,
+                request_id: RequestId::new(uuid::Uuid::now_v7().to_string()),
+                subscription_id: self.next_subscription_id(),
+                scope: SubscriptionScope::Session { session_id },
+                changes_since: None,
+                sync: Some(read),
+                respond,
+            },
+        )
+        .await
+        .result
+        .map(|snapshot| snapshot.value)
     }
 
     /// Returns the authoritative snapshot for a watch scope.

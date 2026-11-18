@@ -90,12 +90,12 @@ fn spawn_changes_server(path: &Path) -> (TestUnixServer, ServerEndpoint) {
             }));
         }
     });
-    let served = endpoint.clone();
+    let service_endpoint = endpoint.clone();
     let (shutdown, stopped) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .layer(RpcLayer(false))
-            .add_service(nakode_server::grpc::GrpcService::new(served).into_server())
+            .add_service(nakode_server::grpc::GrpcService::new(service_endpoint).into_server())
             .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async {
                 let _ = stopped.await;
             })

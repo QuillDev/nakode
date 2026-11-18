@@ -19,6 +19,7 @@ pub enum ServiceCapability {
     RelayFollowupSteering,
     /// `AdmitExternalChildReport` admits a child in another runtime's report as child evidence.
     ExternalChildReports,
+    SessionSyncV1,
     Subscriptions,
     MultipleClients,
     ArtifactTransfer,
@@ -259,6 +260,7 @@ pub enum SubscriptionView {
     Session(Box<SessionView>),
     Run(Box<RunView>),
     SessionChanges(Box<SessionChangesView>),
+    Sync(crate::sync::Reply),
 }
 
 /// A published session view whose transcript may hold only the entries changed since a watch's

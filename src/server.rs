@@ -470,12 +470,16 @@ impl ServerCore {
             ServerRequest::Subscribe {
                 scope,
                 changes_since,
+                sync,
                 respond,
                 ..
             } => {
                 let cursor = endpoint.cursor();
-                let result = match (&scope, changes_since) {
-                    (SubscriptionScope::Session { session_id }, Some(since)) => self
+                let result = match (&scope, sync, changes_since) {
+                    (SubscriptionScope::Session { session_id }, Some(read), _) => self
+                        .read_session_sync(session_id, read)
+                        .map(SubscriptionView::Sync),
+                    (SubscriptionScope::Session { session_id }, None, Some(since)) => self
                         .session_changes_view(session_id, since)
                         .map(|view| SubscriptionView::SessionChanges(Box::new(view))),
                     _ => self.subscription_view(&scope),
@@ -4156,23 +4160,8 @@ impl ServerCore {
                 &publications,
                 self.publication_generation,
             );
-            // Record the entire authoritative revision before broadcasting any invalidation.
-            // Only explicitly established experimental observers retain history. Legacy watches
-            // still receive exactly their existing events and replacement snapshots.
-            if self.session_histories.observes(session_id)
-                && previous.is_none_or(|previous| previous.view != session.view)
-            {
-                self.session_histories.record(
-                    session_id,
-                    previous.map(|previous| previous.view.revision),
-                    session.view.revision,
-                    &publications
-                        .iter()
-                        .map(|publication| &publication.event)
-                        .collect::<Vec<_>>(),
-                    std::time::Instant::now(),
-                );
-            }
+            self.session_histories
+                .publish(previous, &session, &publications);
             self.published_sessions.insert(session_id.clone(), session);
         }
 

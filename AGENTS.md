@@ -139,7 +139,7 @@ builds are independent of a workspace checkout. It has three concepts:
 1. **Commands** request domain changes and receive accepted or rejected results.
 2. **Queries and snapshots** establish a complete client view at a known
    revision.
-3. **Watches** publish authoritative replacement snapshots to subscribers.
+3. **Watches** publish authoritative replacement snapshots by default. Opt-in `SessionSyncV1` follows a bounded projection through complete cursor-linked change batches. The SDK owns validation, reset, replay and fallback; a viewport eviction never deletes durable history. See `docs/incremental-session-sync.md`.
 
 Protocol messages use stable resource IDs, monotonic revisions, and unique
 idempotency keys for mutating commands. A reconnecting client must be able to

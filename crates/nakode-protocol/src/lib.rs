@@ -54,6 +54,7 @@ pub use mcp::{
     MCP_TOOL_PREFIX, McpGrantPolicy, McpManagementView, McpServerInput, McpServerView,
     McpSessionGrant, McpSessionSurface, McpTemplateView, McpToolView,
 };
+pub mod sync;
 pub use service::{
     BridgeContinuationDisposition, CommandAccepted, Cursor, FollowupSteer, ManageableSkillView,
     QueryResult, ServiceCapabilities, ServiceCapability, SessionChangesView, SessionInventory,

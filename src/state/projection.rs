@@ -490,11 +490,7 @@ fn session_title(state: &DomainState, sessions: &[SessionRecord]) -> String {
                 if let Some(title) = state.creation_title.as_deref() {
                     return first_line(title);
                 }
-                state
-                    .transcript
-                    .entries()
-                    .iter()
-                    .find(|entry| entry.kind == EntryKind::User)
+                transcript_index::first_user(&state.transcript)
                     .map_or_else(|| "New session".to_owned(), |entry| first_line(&entry.body))
             },
             |session| session.title.clone(),
@@ -917,17 +913,19 @@ fn originating_owner_entry(state: &DomainState, run: &SubagentRun) -> Option<Tra
     run.observability
         .originating_owner_entry_id
         .as_deref()
-        .and_then(|entry_id| {
-            state
-                .transcript
-                .entries()
-                .iter()
-                .find(|entry| entry.id == entry_id)
-        })
+        .and_then(|entry_id| transcript_index::entry_by_id(&state.transcript, entry_id))
         .map(|entry| {
             let body = bounded_text(&entry.body).value;
             let digest = entry_digest(&state.transcript, entry);
-            transcript_entry_view(&state.transcript, entry, &digest, &body, false, false)
+            transcript_entry_view(
+                &state.transcript,
+                entry,
+                &digest,
+                &body,
+                false,
+                false,
+                &indexed(&state.transcript).codemode_tools,
+            )
         })
 }
 
@@ -1875,11 +1873,7 @@ fn interaction_option(id: &str, label: &str) -> InteractionOptionView {
 }
 
 fn transcript_page(transcript: &DomainTranscript) -> TranscriptPage {
-    let visible = transcript
-        .entries()
-        .iter()
-        .filter(|entry| visible_transcript_entry(entry))
-        .count();
+    let visible = indexed(transcript).visible.len();
     projected_transcript_page(
         transcript,
         None,
@@ -1922,10 +1916,7 @@ pub(crate) fn transcript_entry_body<'a>(
     run_id: Option<&RunId>,
     entry_id: &EntryId,
 ) -> Option<&'a str> {
-    owner_transcript(state, run_id)?
-        .entries()
-        .iter()
-        .find(|entry| entry.id == entry_id.as_str())
+    transcript_index::entry_by_id(owner_transcript(state, run_id)?, entry_id.as_str())
         .map(|entry| entry.body.as_str())
 }
 
@@ -2030,103 +2021,14 @@ fn entry_digest(
     })
 }
 
-/// A proof per visible prefix: each chains the previous one with the next entry's digest, its
-/// image count and its code-mode parent. Only entries that changed are serialized and hashed
-/// again, and the chain is reused up to the first entry changed since it was last proven, so a
-/// streamed token re-proves the tail rather than the whole history.
-/// The digest of each visible entry, in order, from the proof chain. `None` unless the chain covers
-/// every entry, as it does once `transcript_prefixes` has run since the last change.
-fn visible_entry_digests(
-    transcript: &DomainTranscript,
-) -> Option<Vec<std::sync::Arc<crate::domain_transcript::EntryDigest>>> {
-    let entries = transcript.entries();
-    let proven = transcript.proven_chain();
-    if proven.unchanged != entries.len() || proven.steps.len() != entries.len() {
-        return None;
-    }
-    Some(
-        entries
-            .iter()
-            .zip(&proven.steps)
-            .filter(|(entry, _)| visible_transcript_entry(entry))
-            .map(|(_, step)| std::sync::Arc::clone(&step.digest))
-            .collect(),
-    )
-}
-
-fn transcript_prefixes(transcript: &DomainTranscript) -> Option<Vec<String>> {
-    use sha2::{Digest, Sha256};
-    let entries = transcript.entries();
-    let mut proven = transcript.proven_chain();
-    let mut reusable = proven.unchanged.min(proven.steps.len()).min(entries.len());
-    proven.steps.truncate(reusable);
-
-    let digests = proven
-        .steps
-        .iter()
-        .map(|step| std::sync::Arc::clone(&step.digest))
-        .chain(
-            entries[reusable..]
-                .iter()
-                .map(|entry| entry_digest(transcript, entry)),
-        )
-        .collect::<Vec<_>>();
-    transcript.prune_entry_digests();
-    let codemode_tools = entries
-        .iter()
-        .zip(&digests)
-        .filter(|(_, digest)| digest.codemode_tool)
-        .map(|(entry, _)| entry.id.clone())
-        .collect::<std::collections::HashSet<_>>();
-    // Any entry may name a code-mode parent, so a changed set re-proves the whole chain.
-    if codemode_tools != proven.codemode_tools {
-        reusable = 0;
-        proven.steps.clear();
-    }
-
-    let mut start = Sha256::new();
-    start.update(b"nakode.transcript.prefix.v3");
-    start.update([u8::from(transcript.has_earlier_entries())]);
-    let start: [u8; 32] = start.finalize().into();
-    let mut current = proven.steps.last().map_or(start, |step| step.chain);
-    for (entry, digest) in entries[reusable..].iter().zip(&digests[reusable..]) {
-        let mut prefix = None;
-        if visible_transcript_entry(entry) {
-            let mut step = Sha256::new();
-            step.update(current);
-            step.update(digest.content);
-            step.update(
-                u64::try_from(transcript.image_artifacts(entry).count())
-                    .ok()?
-                    .to_le_bytes(),
-            );
-            match digest
-                .parent_item_id
-                .as_deref()
-                .filter(|parent| codemode_tools.contains(*parent))
-            {
-                Some(parent) => {
-                    step.update([1]);
-                    step.update(u64::try_from(parent.len()).ok()?.to_le_bytes());
-                    step.update(parent.as_bytes());
-                }
-                None => step.update([0]),
-            }
-            current = step.finalize().into();
-            prefix = Some(hex_digest(&current));
-        }
-        proven.steps.push(crate::domain_transcript::ProvenStep {
-            digest: std::sync::Arc::clone(digest),
-            chain: current,
-            prefix,
-        });
-    }
-    proven.codemode_tools = codemode_tools;
-    proven.unchanged = entries.len();
-
-    let mut prefixes = vec![hex_digest(&start)];
-    prefixes.extend(proven.steps.iter().filter_map(|step| step.prefix.clone()));
-    Some(prefixes)
+mod transcript_index;
+use transcript_index::indexed;
+#[cfg(test)]
+fn transcript_prefixes(transcript: &DomainTranscript) -> Vec<String> {
+    let proof = indexed(transcript);
+    std::iter::once(proof.start.clone())
+        .chain(proof.steps.iter().filter_map(|s| s.prefix.clone()))
+        .collect()
 }
 
 fn hex_digest(bytes: &[u8; 32]) -> String {
@@ -2170,36 +2072,24 @@ fn projected_transcript_page(
     limit: usize,
     body_budget: usize,
 ) -> Option<TranscriptPage> {
-    let entries = transcript
-        .entries()
-        .iter()
-        .filter(|entry| visible_transcript_entry(entry))
-        .collect::<Vec<_>>();
-    let end = before.map_or(entries.len(), |before| {
-        entries
+    let proof = indexed(transcript);
+    let entries = transcript.entries();
+    let visible = &proof.visible;
+    let end = match before {
+        None => visible.len(),
+        Some(id) => visible
             .iter()
-            .position(|entry| entry.id == before.as_str())
-            .unwrap_or(usize::MAX)
-    });
-    if end == usize::MAX {
-        return None;
-    }
-
-    let current_owner = if before.is_none() {
-        entries
-            .iter()
-            .rev()
-            .find(|entry| entry.kind == EntryKind::User)
-            .copied()
-    } else {
-        None
+            .position(|&index| entries[index].id == id.as_str())?,
     };
-    let row_window_start = end.saturating_sub(limit);
-    let current_owner_outside_row_window = current_owner.is_some_and(|owner| {
-        entries[..end]
-            .iter()
-            .position(|entry| entry.id == owner.id)
-            .is_some_and(|index| index < row_window_start)
+    let owner_index = before
+        .is_none()
+        .then(|| proof.owners.last().copied())
+        .flatten();
+    let current_owner = owner_index.map(|i| &entries[i]);
+    let current_owner_outside_row_window = owner_index.is_some_and(|i| {
+        visible
+            .get(end.saturating_sub(limit))
+            .is_some_and(|first| i < *first)
     });
     let reserved_coordination_bytes = current_owner
         .and_then(|entry| entry.coordination_json.as_ref())
@@ -2217,19 +2107,9 @@ fn projected_transcript_page(
     let mut remaining_body_bytes =
         body_budget.saturating_sub(reserved_owner_body.map_or(0, str::len));
 
-    // Proving the prefixes brings every entry's digest up to date. Reading them from that chain
-    // saves comparing each whole entry against the digest cache again.
-    let prefixes = transcript.cached_prefixes(|| transcript_prefixes(transcript))?;
-    let digests = visible_entry_digests(transcript);
-    let digest_of = |index: usize, entry: &TranscriptEntry| {
-        digests
-            .as_ref()
-            .and_then(|digests| digests.get(index).cloned())
-            .unwrap_or_else(|| entry_digest(transcript, entry))
-    };
-
-    let mut projected = Vec::with_capacity(limit.min(entries.len()));
-    for (index, entry) in entries[..end].iter().enumerate().rev().take(limit) {
+    let mut projected = Vec::with_capacity(limit.min(end));
+    for &index in visible[..end].iter().rev().take(limit) {
+        let entry = &entries[index];
         // Tool audit envelopes share the same IPC/memory budget as transcript bodies. Providers bound
         // each payload field before it reaches here; the page keeps an envelope whole so a client is
         // never handed valid-looking partial JSON.
@@ -2252,19 +2132,38 @@ fn projected_transcript_page(
         projected.push(transcript_entry_view(
             transcript,
             entry,
-            &digest_of(index, entry),
+            &proof.steps[index].digest,
             body,
             include_audit,
             include_audit,
+            &proof.codemode_tools,
         ));
     }
     projected.reverse();
     let omitted_entries = projected.len() < end;
-    let current_owner_omitted_tool_calls =
-        omitted_owner_tool_calls(&entries, current_owner, &projected);
+    let current_owner_omitted_tool_calls = current_owner
+        .and_then(|e| e.owner_turn_id.as_ref())
+        .map_or(0, |turn| {
+            let included = visible[end - projected.len()..end]
+                .iter()
+                .filter(|&&i| proof.steps[i].tool_turn.as_ref() == Some(turn))
+                .count();
+            proof
+                .tool_counts
+                .get(turn)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(included)
+        });
     let start = end - projected.len();
-    let prefix_before = prefixes.get(start)?.clone();
-    let prefix_through = prefixes.get(end)?.clone();
+    let prefix = |pos: usize| {
+        pos.checked_sub(1)
+            .and_then(|i| proof.steps[visible[i]].prefix.as_ref())
+            .unwrap_or(&proof.start)
+            .clone()
+    };
+    let prefix_before = prefix(start);
+    let prefix_through = prefix(end);
     let next_before_entry_id = (start > 0)
         .then(|| projected.first().map(|entry| entry.id.clone()))
         .flatten();
@@ -2278,6 +2177,7 @@ fn projected_transcript_page(
             &projected,
             reserved_owner_body,
             reserved_coordination_bytes > 0,
+            &proof.codemode_tools,
         ),
         entries: projected,
         has_earlier: transcript.has_earlier_entries() || omitted_entries,
@@ -2288,35 +2188,13 @@ fn projected_transcript_page(
     })
 }
 
-fn omitted_owner_tool_calls(
-    entries: &[&TranscriptEntry],
-    current_owner: Option<&TranscriptEntry>,
-    projected: &[TranscriptEntryView],
-) -> usize {
-    let projected_ids = projected
-        .iter()
-        .map(|entry| entry.id.as_str())
-        .collect::<BTreeSet<_>>();
-    current_owner
-        .and_then(|entry| entry.owner_turn_id.as_deref())
-        .map_or(0, |turn_id| {
-            entries
-                .iter()
-                .filter(|entry| {
-                    matches!(entry.kind, EntryKind::Tool | EntryKind::Diff)
-                        && entry.owner_turn_id.as_deref() == Some(turn_id)
-                        && !projected_ids.contains(entry.id.as_str())
-                })
-                .count()
-        })
-}
-
 fn projected_current_owner(
     transcript: &DomainTranscript,
     current_owner: Option<&TranscriptEntry>,
     projected: &[TranscriptEntryView],
     reserved_owner_body: Option<&str>,
     include_coordination: bool,
+    parents: &std::collections::HashSet<String>,
 ) -> Option<TranscriptEntryView> {
     current_owner.map(|entry| {
         projected
@@ -2332,6 +2210,7 @@ fn projected_current_owner(
                         reserved_owner_body.unwrap_or(""),
                         false,
                         include_coordination,
+                        parents,
                     )
                 },
                 |mut projected| {
@@ -2356,23 +2235,6 @@ fn tool_audit_identity(entry: &TranscriptEntry, field: &str) -> Option<String> {
         })
 }
 
-fn parent_tool_entry_id(transcript: &DomainTranscript, entry: &TranscriptEntry) -> Option<EntryId> {
-    let parent_item_id = tool_audit_identity(entry, "parentItemId")?;
-    transcript
-        .entries()
-        .iter()
-        .find(|candidate| {
-            candidate.kind == EntryKind::Tool
-                && candidate.id == parent_item_id
-                && candidate.tool_audit_json.as_deref().is_some_and(|audit| {
-                    serde_json::from_str::<serde_json::Value>(audit).is_ok_and(|audit| {
-                        audit.get("name").and_then(serde_json::Value::as_str) == Some("codemode")
-                    })
-                })
-        })
-        .map(|parent| EntryId::from(parent.id.clone()))
-}
-
 fn transcript_entry_view(
     transcript: &DomainTranscript,
     entry: &TranscriptEntry,
@@ -2380,6 +2242,7 @@ fn transcript_entry_view(
     body: &str,
     include_audit: bool,
     include_coordination: bool,
+    parents: &std::collections::HashSet<String>,
 ) -> TranscriptEntryView {
     let mut view = TranscriptEntryView {
         body_sha256: digest.body_sha256.clone(),
@@ -2418,7 +2281,11 @@ fn transcript_entry_view(
         coordination_json: include_coordination
             .then(|| entry.coordination_json.clone())
             .flatten(),
-        parent_tool_entry_id: parent_tool_entry_id(transcript, entry),
+        parent_tool_entry_id: digest
+            .parent_item_id
+            .as_ref()
+            .filter(|id| parents.contains(*id))
+            .map(|id| EntryId::from(id.clone())),
     };
     if entry.coordination_json.is_some() && !include_coordination {
         // An undersized view must not fall back to a raw runtime envelope attributed to the owner.
@@ -2577,12 +2444,7 @@ fn first_prompt_preview(state: &DomainState, sessions: &[SessionRecord]) -> Stri
         });
     persisted
         .or_else(|| {
-            state
-                .transcript
-                .entries()
-                .iter()
-                .find(|entry| entry.kind == EntryKind::User)
-                .map(|entry| entry.body.as_str())
+            transcript_index::first_user(&state.transcript).map(|entry| entry.body.as_str())
         })
         .map(|body| body.trim().chars().take(512).collect())
         .unwrap_or_default()
@@ -3069,7 +2931,7 @@ mod tests {
             |t| t.retain_entry_ids("retained-session"),
         ];
         for mutate in mutations {
-            let _warm = super::transcript_prefixes(&transcript).expect("warm");
+            let _warm = super::transcript_prefixes(&transcript);
             mutate(&mut transcript);
             let mut fresh = transcript.clone();
             fresh.share_entry_digests(crate::domain_transcript::EntryDigests::default());
@@ -3094,10 +2956,10 @@ mod tests {
         }
         let digest =
             |t: &DomainTranscript, index: usize| super::entry_digest(t, &t.entries()[index]);
-        let before = super::transcript_prefixes(&transcript).expect("prefixes");
+        let before = super::transcript_prefixes(&transcript);
         let (first, last) = (digest(&transcript, 0), digest(&transcript, 2));
         transcript.append_delta("row-2", EntryKind::Assistant, "answer", " more");
-        let after = super::transcript_prefixes(&transcript).expect("prefixes");
+        let after = super::transcript_prefixes(&transcript);
         assert!(std::sync::Arc::ptr_eq(&first, &digest(&transcript, 0)));
         assert!(!std::sync::Arc::ptr_eq(&last, &digest(&transcript, 2)));
         assert_eq!(before[..3], after[..3]);
@@ -3160,11 +3022,6 @@ mod tests {
             let mut transcript = DomainTranscript::new(1);
             transcript.upsert("row", EntryKind::Tool, "tool", "body", EntryStatus::Running);
             let before = transcript_page(&transcript).prefix_through;
-            assert!(
-                transcript
-                    .cached_prefixes(|| panic!("proof must be cached"))
-                    .is_some()
-            );
             mutate(&mut transcript);
             assert_ne!(before, transcript_page(&transcript).prefix_through);
         }

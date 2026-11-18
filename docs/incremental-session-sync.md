@@ -1,108 +1,50 @@
-# Incremental session synchronization: implementation workshop
+# Incremental session synchronization
 
-**Status:** Owner-approved direction; server-history prototype implemented; public protocol, SDK and FStack integration not implemented. **Owner:** Nakode. **Ticket:** d2b9c745-1ca0-438c-ab1a-083280c4735a. No merge or deployment approval is implied.
+**Status:** Nakode public, opt-in `nakode.v1` contract on the integration branch. Not a rollout in FStack or a published SDK release. No database change. The original workshop's native history prototype is now the replay boundary for this API.
 
-## 1. Abstract and scope
+## Following a session
 
-Long-running sessions should hydrate a bounded initial projection, then obtain complete changes since a session revision. Existing streaming entries remain mutable. Nakode owns history bookkeeping and recovery; frontends render SDK projections. Durable older history remains accessible through paging and is never deleted because it is outside the visible window.
+Prefer `NakodeClient::follow_session(id)` for a stream of render-ready **bounded** `SessionState` values. It does not fetch historical entry bodies, artifacts or older transcript pages. Do not feed every item into `hydrate_session_with_refresh(..., usize::MAX)`: that would put the old cost back. `follow_session_versioned(id)` also returns `FollowedSession.cursor` and `entry_revisions` keyed by stable entry ID. The cursor is absent on the legacy path. Dropping the stream cancels its SDK producer; it does not cancel a turn.
 
-This Markdown companion records the implementation workshop beside source. The original FStack HTML research proposal remains unchanged. The owner explicitly superseded the earlier restriction against incremental contracts; replacement watches remain the compatibility path until integration is verified.
+For generated clients:
 
-## 2. Verified current system
+1. Check `GetServerInfo.capabilities` for the exact string `SessionSyncV1`. Absent: use `WatchSession`. Existing watches, including the per-stream `transcript_changes` option, do not resume from these cursors.
+2. Call `NakodeService.GetSessionSyncSnapshot(GetSessionRequest { session_id })`. `SessionSyncSnapshot` supplies a bounded `SessionState` and `SessionSyncCursor { session_id, incarnation, revision }` from the same actor turn. This RPC always supplies the full bounded projection; it is not a launch-critical or parent-only watch. A publication boundary still in flight returns retryable `ABORTED`. A retained, unattached session has no live producer: the snapshot returns `FAILED_PRECONDITION` with `nakode-sync-retained: 1`. Use the ordinary read-only replacement watch; do not open a provider to observe it.
+3. Call `NakodeService.FollowSession(FollowSessionRequest { session_id, after })`. It is a server stream of `SessionSyncUpdate`, one whole `SessionSyncBatch` per message. A current cursor waits for a push, not periodic empty responses. The service subscribes to publication wakes before reading history; a lagged wake triggers the same actor replay read. Never use the global event sequence as a session cursor.
+4. Resume with the **last applied** cursor on transport failure, using the same endpoint, credential and logical ID. A missing, future, incompatible, expired or non-boundary cursor yields `SessionSyncResetRequired` and ends the stream. Discard the baseline and get a fresh authorized snapshot. `NOT_FOUND` and authorization errors are errors, not resets. No observation retry replays a command or reopens a deleted session.
 
-- `src/server.rs::publish_session_state` builds a complete vector of semantic publications for one session update, then emits separate invalidations. `published_session` builds a **raw server projection**, not the SDK's fully hydrated history.
-- `crates/nakode-protocol/src/view.rs::ViewEvent` already represents entry creation, patches, byte-offset deltas, windows, metadata, queues, interactions, todos and run changes.
-- `crates/nakode-server/src/grpc.rs` uses these publications to reload replacement projections. Raw invalidation cursor progress is not proof that a complete session update was applied.
-- `crates/nakode-sdk/src/lib.rs` hydration pages transcript/runs and then fetches nested bodies/text/artifacts. FStack Host requests `usize::MAX` hydration in session detail/watch.
-- The existing synthetic SDK test at `crates/nakode-sdk/src/tests/hydration_cost.rs` repeats an identical snapshot over isolated real gRPC with an injected 1ms per RPC. At 16/128/512 entries it repeats 1/2/8 page RPCs plus 16/128/512 body RPCs. Observed totals approximately 60/440/1730ms. These are synthetic timings, not live incident attribution.
+## What one batch means
 
-## 3. Decisions and options
+`base` must equal the locally applied cursor. `next` is in the same incarnation and strictly advances. Stage the complete result before advancing. Exact completed batches may be ignored; unknown bases require recovery. An incarnation is an opaque history identity, not a provider session ID. Never share cursors across endpoints, users, or projections.
 
-| Option | Benefit | Limitation | Decision |
-|---|---|---|---|
-| Conditional replacement snapshots | Avoid unchanged responses | Still rebuilds/hydrates changed full history | Compatibility/recovery, not primary long-session solution |
-| Diff fully hydrated snapshots | Smaller wire payload | Pays the same historical hydration first | Reject as primary optimization |
-| Atomic semantic batches before SDK hydration | Changed-entry/control work can be independent of history size | Requires replay, projection and recovery correctness | Owner-approved direction |
-| Shared streaming subscriptions | Reduces duplicate connection and request work | Does not itself reduce hydration | Later transport optimization after correctness |
+`projection` replaces all control and page metadata: queue items and IDs, turns, approvals, external tools, runs, audit/artifact references, owner anchor and omitted-tool counts. Its `transcript.entries` contains **only changed or created entry projections**. A present `TranscriptOrder` gives the complete new window order; absent means preserve order. Reconstruct the active owner agent transcript from the assembled session page. A sent entry replaces its explicit bounded byte range and metadata, including status; it is neither a byte append nor a full historical body. This avoids guessing UTF-8 offsets and supports a textless Running → Complete update. The SDK validates entry IDs, byte spans, order, session and revision before exposing a state. Each sent entry is versioned at `next.revision`.
 
-## 4. Implemented native prototype
+Window eviction is not deletion. For scrollback use `NakodeClient::previous_session_page(session_id, &page, limit)`, keeping older pages separate. Only join a page whose `prefix_through` matches the newer page's `prefix_before`; a historical edit changes that proof even when no visible entry changed. Discard or reload a stale cached page when displaying it. This is invalidation by proof, **not** a live mutation feed for every off-screen row. Older entries and demand-loaded bodies remain addressable through the regular paging and body APIs. Do not treat an entry ID alone as an immutable body or artifact version.
 
-`src/server/session_sync.rs` adds an opt-in native producer on `ServerCore`. This is not an alternative frontend API. No gRPC capability advertises it; the SDK and FStack still use existing snapshots.
+## Producer and costs
 
-- `session_sync_snapshot` reads the existing bounded projection and establishes a cursor in one synchronous actor operation. It refuses a snapshot until its projection agrees with the existing publication baseline, with a retryable conflict. It never modifies that baseline to suppress legacy publications.
-- `publish_session_state` records the **whole** existing publication vector before broadcasting its first invalidation. An unobserved session is not serialized or retained. Legacy event contents and replacement behavior are preserved.
-- `session_sync_changes` returns all complete retained batches through the current cursor, or `ResetRequired`. It never returns a usable prefix followed by a hidden gap.
-- Cursor identity is logical session ID + fresh history incarnation UUID + session revision. Recreating history, evicting a session, or restarting creates a different incarnation. Global transport event sequence is not a session cursor.
-- An unchanged read has zero batches. Missing, future, inside-batch, expired or incompatible cursors reset. A non-monotonic producer update or baseline mismatch invalidates history.
-- Each batch stores immutable serialized semantic events. JSON is private in-memory retention, not a public wire format. Serialization is capped before allocating an oversized retained batch.
-- Current experimental budgets are **8MiB encoded bytes, 256 batches and 64 sessions globally**, with **120-second batch retention**. Overflow evicts complete least-recently-established/published session histories; oversized single batches force snapshot recovery. No subscriber blocks runtime publication.
-- These are retained encoded-payload bounds, not claims about total allocator/RSS. Decoding/cloning response projections costs additional bounded work. Inactive expired batches are reclaimed on history access; global limits always bound retained payload.
-- True session removal clears its history. Missing sessions retain existing lookup errors, rather than being silently recreated by reset.
+The server diffs bounded entry projections, not fully hydrated histories and not individual invalidations. Public followers retain only complete patches; native event observers can additionally retain semantic events. Replay history is process-local: 8 MiB encoded payload, 256 batches, 64 sessions globally, 120-second batch TTL. Limits evict complete histories/batches; oversized batches force snapshot recovery. Inactive expiry is reclaimed on access. These are not RSS bounds. Snapshot establishment cannot consume the legacy publication baseline. Restart, removal and eviction cannot silently continue an old incarnation.
 
-The underlying raw projection/diff construction remains existing work. This prototype does **not** prove all server work is independent of total history size.
+The warmed transcript proof index reuses the unchanged prefix and indexes visible positions, entry IDs, owner anchors, turn tool counts and code-mode parent references. A live-end entry update recomputes its suffix and projects the bounded viewport, not every historical body. Control state and runs are still bounded-view replacements, not field-level patches. SDK staging/render-state cloning costs the visible projection size, not just the number of changed bytes.
 
-## 5. Proposed public contract and SDK rules
+### Measured, isolated live-end update
 
-The language-neutral schema still needs to be added to `crates/nakode-api/proto/nakode/v1/nakode.proto`, with explicit capability/version negotiation and generated mappings. The native prototype types are not a finalized public schema.
+`cargo test --lib --all-features one_live_entry_costs -- --nocapture` drives a native core, isolated Unix gRPC server and real Rust SDK. Nine two-byte appends per length, 256-byte historical rows; medians. Publication includes core commit, projection, diff and retention. Delivery is cumulative from mutation through SDK reduction; neither includes renderer work. Bytes are encoded `SessionSyncUpdate`, not HTTP/2 framing. The fresh canonical query used to check each answer is outside the measured interval.
 
-Proposed responses:
+| Entries | Changed rows | Update bytes | Historical hydration RPCs | Publish µs | Through SDK µs |
+|---:|---:|---:|---:|---:|---:|
+|16|1|772|0|497|1136|
+|128|1|772|0|472|1049|
+|512|1|812|0|2027|4165|
+|2048|1|812|0|1660|4290|
+|4096|1|812|0|1767|6809|
 
-```text
-Snapshot { session_id, incarnation, revision, bounded_projection }
-Changes  { session_id, incarnation, through_revision,
-           batches: [{ base_revision, next_revision, changes }] }
-ResetRequired { reason }
-```
+Debug timings vary with host load. A separate run of the same path measured 774/1616 µs at 2048 and 808/1661 µs at 4096. The reproducible bounds here are the single row, payload and zero historical RPCs, not a latency SLA. Compare the earlier replacement-hydration fixture: 16/128/512 rows required 1/2/8 page RPCs plus 16/128/512 body RPCs per pass.
 
-Required SDK invariants:
+**Limits of the result:** the initial cold index and snapshot cost history work. An edit deep in history, reordering, truncation, or a mutation invalidating from index zero can re-prove the suffix through the end, including affected image content. A change of code-mode parent membership rewinds as far as the earliest dependent child. Some legacy producer paths still scan: e.g. raw transcript-length lookup walks backwards to the oldest visible row (including hidden rows), recoverable-prompt projection resolves a transcript key by search, and delegated-run outcome construction may search a run transcript. Changed body digest computation costs the length of that body. Queues, runs, session discovery, persistence, and frontend rendering were not held to a constant-time guarantee by this experiment. There is no claim of constant time for arbitrary historical edits or of production latency improvement.
 
-1. Match endpoint identity, authorization scope, logical session, incarnation and protocol capability before applying.
-2. For each batch, require `base_revision == locally_applied_revision`. Repeated completed responses are ignored, not appended twice. Unknown/out-of-order bases reset; never guess.
-3. Validate and stage every change before atomically replacing the rendered SDK projection. Advance the cursor only after complete successful apply. Do not replay domain transitions.
-4. Identify entries by stable ID. Each applied change revision versions that entry. Explicit `Running/Complete/Failed/Interrupted` status is authoritative even when no text changed.
-5. Byte appends require exact expected offset and UTF-8 boundaries. Patches replace their explicit range/projection, not an assumed full historical body. A mismatch resets/selectively hydrates under the same cursor fence.
-6. Windows define order and viewport membership. Window eviction is **not** a durable tombstone. Previously loaded older pages remain separately addressable. An evicted entry can still have subsequent authoritative updates; this must be solved before public enablement.
-7. Queue IDs, owner/turn changes, approvals, interactions, run lifecycle, artifacts/audit references, current-owner anchors and omitted owner-tool projections must remain complete. Internal events need coverage auditing before being treated as a complete external projection contract.
-8. Cancellation is an idempotent command, independent of observation retry. Observation recovery never replays a mutation.
-9. Closing/deleting a session remains an authoritative lifecycle operation. Reset cannot swallow genuine NotFound/auth refusal or recreate a closed session.
-10. New SDK + old server and old SDK + new server retain the existing snapshot path. No release pin changes until published compatible artifacts exist.
+## Validation and rollout
 
-## 6. Worked timelines
+Native retention tests cover discontinuity, over-budget, TTL, replacement incarnations and snapshot/publication ordering. SDK tests reject partial mixed control/order changes and preserve textless terminal status. The gRPC fixture compares reduced state to fresh canonical snapshots, replays nine complete batches, detects idle actor exit, and rejects stale historical pages after off-window correction. Failed durable deletion publishes the restored/disconnected projection even without shell activity.
 
-**Streaming:** snapshot `(A,10)` includes entry E, Running. Batch `10→11` appends to E and changes queue state. SDK stages both, applies atomically, advances to 11. Batch `11→12` marks the **same E** Complete with no extra text. SDK advances to 12. It must not wait at E or infer completion from having received E once.
-
-**Recovery:** SDK has `(A,10)`. The server evicts retained batches under the byte budget. A request from `(A,10)` receives ResetRequired, not partial batch 12. An authorized fresh bounded snapshot establishes `(B,12)`; late responses from A cannot overwrite B. Durable older entries remain in Nakode persistence and paging APIs.
-
-**Publication boundary:** native state has changed but its publication baseline has not. A snapshot request returns a retryable conflict without creating history or consuming the legacy baseline. After publication, snapshot and subsequent deltas share the same baseline. This addresses the independent review finding on initial replay continuity.
-
-## 7. Validation and measured acceptance
-
-Implemented focused tests cover whole-batch replay including queue shape, continuation of an existing streaming ID after cursor advancement, textless terminal updates, duplicate/stale/missing baselines, cross-session/incarnation/future/inside-batch cursors, TTL/byte/count/session limits, and resnapshot incarnation changes. An authoritative core test drives real transcript mutation and publication (no provider). A long-history fixture checks small stream batches without removing the original history. These do not validate SDK application or real renderer behavior.
-
-Final focused validation: **9 prototype tests passed**, plus the existing `large_streams_publish_bounded_deltas_instead_of_growing_snapshots` regression (**1 passed**). Log: `.tmp/final-focused-session-sync-20260912T113505.log`. `cargo clippy --locked --lib -- -D warnings`, focused Rust formatting and `git diff --check` passed. This is not the full repository test/all-features gate. Independent review identified the snapshot/publication baseline gap; the correction and regression test passed subsequent focused validation. No second independent review of that correction was performed.
-
-Before public enablement:
-
-- Compare incremental SDK projections to fresh canonical snapshots after every fault-injected batch: mixed text/status/control changes, UTF-8 splitting, patch after append, reorder, true deletion vs window eviction, approvals, delegated runs, tool audits and artifacts.
-- Establish snapshot atomicity across commit/persistence failure, actor query scheduling, restart and epoch rollover. Test publication loss before/after first wakeup, slow consumers and queue overflow.
-- Test cancellation, queued-send identity, disconnect/reconnect, session switch, genuine deletion and closed-session resume across real isolated gRPC → Host → relay → renderer, web and Electron.
-- For 16/128/512/2048-entry synthetic sessions, count nested hydration RPCs and bytes for token-only, queue-only and cancel updates. Target: **zero unchanged historical body/artifact hydration RPCs** after initial hydration. Increasing unchanged history must not increase those RPC counts.
-- Separately measure command acceptance → authoritative publication → watch delivery → render. Capture queue/admission/service durations and p50/p95/p99; do not subtract synthetic times from live latency.
-- Native repository full fmt/test/clippy gates and independent review must pass before commit. Cross-repository integration and UX gates must pass before merge. PR453 remains draft and unmerged.
-
-## 8. Rollout and rollback
-
-1. Native atomic-history prototype and adversarial tests (this stage).
-2. Versioned Protobuf capability, complete semantic projection coverage and SDK atomic apply. Keep disabled in FStack.
-3. Opt-in isolated Host integration, selective hydration, older-page access and renderer parity.
-4. Small explicitly approved canary with bytes/RPC/latency/reset-rate measurement. Stop for increased missed/duplicate updates, cancellation delays, auth/isolation violations, unexplained reset loops or loss of historical access.
-5. Enable more broadly only after reviewed evidence. Roll back capability selection to unchanged replacement snapshots; retain durable data and treat old incremental cursors as invalid. Rollback does not delete history or require database rollback.
-
-## 9. Remaining design and integration gates
-
-- Prove internal semantic events cover every field of bounded `SessionView`, including window-omitted mutable entries and run/current-owner anchors. Existing events were invalidations, not a supported public reducer protocol.
-- Specify exact entry revision representation, explicit tombstones, bounded page corrections and artifact/body version fencing in Protobuf.
-- Decide response chunk budgets without advancing through incomplete batches; oversized updates currently reset. Avoid reset loops for permanently oversized raw projections.
-- Define SDK ownership of retained older pages and shared subscriptions; no frontend orchestration.
-- Confirm actor commit/publication/snapshot ordering under persistence failure rather than inferring durability from a revision number.
-- Live latency attribution, collector configuration/health and measured production improvement remain unknown. Telemetry behavior is unchanged by this prototype.
+FStack must opt in on compatible artifacts, preserve bounded presentation and page older history on demand. No dependency pin, renderer integration, production canary or deployment is part of this Nakode change. Roll back client selection to `WatchSession`; there is no data migration to undo.
