@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -96,8 +96,6 @@ pub struct DomainTranscript {
     images: HashMap<String, Vec<TranscriptImageArtifact>>,
     local_files: HashMap<String, Vec<(String, String)>>,
     history_retention: HistoryRetention,
-    /// Server query proofs, never a client presentation cache. Every mutator invalidates them.
-    prefix_fingerprints: OnceLock<Option<Vec<String>>>,
     /// Per-entry digests behind those proofs, reused while an entry is unchanged.
     entry_digests: EntryDigests,
     /// The proof chain last computed, reused up to the first entry changed since.
@@ -115,10 +113,20 @@ pub(crate) struct ProvenChain {
     pub steps: Vec<ProvenStep>,
     /// The code-mode tool ids the steps were chained against.
     pub codemode_tools: HashSet<String>,
+    pub children_by_parent: HashMap<String, Vec<usize>>,
+    pub visible: Vec<usize>,
+    pub by_id: HashMap<String, usize>,
+    pub owners: Vec<usize>,
+    pub tool_counts: HashMap<String, usize>,
+    pub start: String,
 }
 
 pub(crate) struct ProvenStep {
     pub digest: Arc<EntryDigest>,
+    pub id: String,
+    pub first_user: Option<usize>,
+    pub codemode_id: Option<String>,
+    pub tool_turn: Option<String>,
     /// The chain after this entry; an entry that is not visible leaves it unchanged.
     pub chain: [u8; 32],
     /// The proof after this entry, present only for visible entries.
@@ -127,7 +135,7 @@ pub(crate) struct ProvenStep {
 
 /// A clone starts without a proven chain and proves its first read from scratch.
 #[derive(Default)]
-struct ProvenChainCell(Mutex<ProvenChain>);
+struct ProvenChainCell(Box<Mutex<ProvenChain>>);
 
 impl Clone for ProvenChainCell {
     fn clone(&self) -> Self {
@@ -207,7 +215,6 @@ impl DomainTranscript {
             images: HashMap::new(),
             local_files: HashMap::new(),
             history_retention: HistoryRetention::Complete,
-            prefix_fingerprints: OnceLock::new(),
             entry_digests: EntryDigests::default(),
             proven: ProvenChainCell::default(),
         }
@@ -216,13 +223,6 @@ impl DomainTranscript {
     #[must_use]
     pub fn entries(&self) -> &[TranscriptEntry] {
         &self.entries
-    }
-
-    pub(crate) fn cached_prefixes(
-        &self,
-        compute: impl FnOnce() -> Option<Vec<String>>,
-    ) -> Option<&[String]> {
-        self.prefix_fingerprints.get_or_init(compute).as_deref()
     }
 
     pub(crate) fn entry_digest(
@@ -250,7 +250,6 @@ impl DomainTranscript {
 
     /// Records a mutation: proofs for entries before `index` still hold.
     fn changed_from(&mut self, index: usize) {
-        self.prefix_fingerprints.take();
         let proven = self
             .proven
             .0
@@ -721,7 +720,6 @@ impl DomainTranscript {
 
     fn reindex(&mut self) {
         // Indices only; the entries and their proofs are unchanged.
-        self.prefix_fingerprints.take();
         self.item_indices.clear();
         for (index, entry) in self.entries.iter().enumerate() {
             if let Some(key) = &entry.key {

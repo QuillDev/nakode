@@ -83,6 +83,8 @@ service NakodeService {
   // Exact pending ClearSelf call; terminates only its own suspended turn after child guards.
   rpc ClearSelf(ClearSelfRequest) returns (MutationResult);
   rpc GetSession(GetSessionRequest) returns (SessionSnapshot);
+  rpc GetSessionSyncSnapshot(GetSessionRequest) returns (SessionSyncSnapshot);
+  rpc FollowSession(FollowSessionRequest) returns (stream SessionSyncUpdate);
   rpc WatchSession(WatchSessionRequest) returns (stream SessionSnapshot);
   // Appends one owner prompt and evaluates start-versus-queue against authoritative state when the
   // command executes. expected_revision does not fence this operation; idempotency_key distinguishes
@@ -971,6 +973,21 @@ enum SessionHydration {
   // Status and pending external-tool control only; never a transcript replacement.
   SESSION_HYDRATION_OVERVIEW = 4;
 }
+// SessionSyncV1 cursors are scoped to the authenticated endpoint and logical session.
+message SessionSyncCursor { string session_id = 1; string incarnation = 2; uint64 revision = 3; }
+message SessionSyncSnapshot { SessionSyncCursor cursor = 1; SessionState state = 2; }
+message FollowSessionRequest { string session_id = 1; SessionSyncCursor after = 2; }
+message SessionSyncBatch {
+  SessionSyncCursor base = 1;
+  SessionSyncCursor next = 2;
+  // Complete control projection and page metadata. Entries are bounded replacements by ID,
+  // not appended text or complete durable bodies. The active agent page mirrors the owner page.
+  SessionState projection = 3;
+  // Absent preserves prior window order. Eviction never deletes durable history.
+  TranscriptOrder order = 4;
+}
+message SessionSyncResetRequired { string reason = 1; }
+message SessionSyncUpdate { oneof update { SessionSyncBatch batch = 1; SessionSyncResetRequired reset_required = 2; } }
 message GetSessionRequest {
   string session_id = 1;
   bool launch_critical_only = 3;

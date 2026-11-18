@@ -2623,6 +2623,9 @@ impl NativeServerRuntime {
                     .engine_mut()
                     .state_mut()
                     .session_store_failed(error.to_string());
+                let id = self.core.default_session_id().clone();
+                self.core
+                    .commit_and_publish_session_delta(&self.endpoint, &id);
             }
             return;
         }
@@ -3435,9 +3438,7 @@ impl NativeServerRuntime {
         shell_ids: &[String],
         reason: &str,
     ) {
-        if shell_ids.is_empty() {
-            return;
-        }
+        // The restored backend was disconnected even when it owned no shells.
         if let Some(engine) = self.core.engine_for_mut(session_id) {
             for shell_id in shell_ids {
                 engine.state_mut().shell_failed(shell_id, reason);
@@ -3625,6 +3626,7 @@ fn native_service_capabilities() -> ServiceCapabilities {
     ServiceCapabilities {
         supported: [
             ServiceCapability::Subscriptions,
+            ServiceCapability::SessionSyncV1,
             ServiceCapability::MultipleClients,
             ServiceCapability::ArtifactTransfer,
             ServiceCapability::ExternalTools,
@@ -12177,6 +12179,14 @@ mod tests {
         else {
             panic!("session query result")
         };
+        endpoint
+            .read_session_sync(
+                ClientId::from("rollback-observer"),
+                session_id.clone(),
+                nakode_protocol::sync::Read::Snapshot,
+            )
+            .await
+            .expect("restored disconnect must reach the publication boundary");
         assert_eq!(restored.id, session_id);
         assert_eq!(
             crate::session_environment::read(Some(session_id.as_str()))

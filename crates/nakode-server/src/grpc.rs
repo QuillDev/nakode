@@ -17,6 +17,7 @@ use crate::{
 };
 
 mod materials;
+mod session_sync;
 
 const LAUNCH_CRITICAL_RUN_TEXT_BYTES: usize = 512;
 const DEFERRED_RUN_SUMMARY_BYTES: usize = 1_024;
@@ -1586,6 +1587,24 @@ impl api::nakode_service_server::NakodeService for GrpcService {
             },
             &timing,
         ))
+    }
+
+    async fn get_session_sync_snapshot(
+        &self,
+        request: tonic::Request<api::GetSessionRequest>,
+    ) -> Result<tonic::Response<api::SessionSyncSnapshot>, tonic::Status> {
+        self.sync_snapshot(request.into_inner().session_id)
+            .await
+            .map(tonic::Response::new)
+    }
+    type FollowSessionStream = ApiStream<api::SessionSyncUpdate>;
+    async fn follow_session(
+        &self,
+        request: tonic::Request<api::FollowSessionRequest>,
+    ) -> Result<tonic::Response<Self::FollowSessionStream>, tonic::Status> {
+        self.sync_stream(request.into_inner())
+            .await
+            .map(tonic::Response::new)
     }
 
     type WatchSessionStream = ApiStream<api::SessionSnapshot>;

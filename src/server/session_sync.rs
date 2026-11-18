@@ -1,7 +1,7 @@
-//! Experimental server-owned incremental history. Not advertised by the public service yet.
+//! Bounded replay history for the public `SessionSyncV1` stream.
 //!
 //! Stores complete semantic publication batches, before SDK body/artifact hydration. JSON is
-//! private in-memory storage, not a second public transport. The eventual transport is Protobuf.
+//! private in-memory storage, not a second public transport. The public transport is Protobuf.
 //! A cursor is meaningful only for this server history incarnation and logical session.
 
 use nakode_protocol::{SessionId, SessionView, ViewEvent};
@@ -18,13 +18,8 @@ use super::{ServerCore, ServiceError};
 #[cfg(test)]
 mod tests;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionSyncCursor {
-    pub session_id: SessionId,
-    pub incarnation: String,
-    pub revision: u64,
-}
-
+pub use nakode_protocol::sync::Cursor as SessionSyncCursor;
+mod projection;
 #[derive(Clone, Debug)]
 pub struct SessionSyncSnapshot {
     pub cursor: SessionSyncCursor,
@@ -36,6 +31,7 @@ pub struct SessionChangeBatch {
     pub base: SessionSyncCursor,
     pub next: SessionSyncCursor,
     pub events: Vec<ViewEvent>,
+    projection: Option<projection::Patch>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +57,7 @@ struct StoredBatch {
 struct History {
     cursor: SessionSyncCursor,
     batches: VecDeque<StoredBatch>,
+    native_events: bool,
 }
 
 #[derive(Clone)]
@@ -133,6 +130,7 @@ impl SessionHistories {
             History {
                 cursor: cursor.clone(),
                 batches: VecDeque::new(),
+                native_events: false,
             },
         );
         self.order.push_back(session_id.clone());
@@ -174,12 +172,24 @@ impl SessionHistories {
         }
     }
 
-    pub(super) fn record(
+    #[cfg(test)]
+    fn record(
+        &mut self,
+        id: &SessionId,
+        base: Option<u64>,
+        next: u64,
+        events: &[&ViewEvent],
+        now: Instant,
+    ) {
+        self.record_patch(id, base, next, &(events, None), now);
+    }
+
+    fn record_patch(
         &mut self,
         session_id: &SessionId,
         base: Option<u64>,
         next: u64,
-        events: &[&ViewEvent],
+        payload: &(&[&ViewEvent], Option<projection::Patch>),
         now: Instant,
     ) {
         self.expire(now);
@@ -195,7 +205,7 @@ impl SessionHistories {
             bytes: Vec::new(),
             limit: self.max_bytes,
         };
-        if serde_json::to_writer(&mut encoding, events).is_err() {
+        if serde_json::to_writer(&mut encoding, payload).is_err() {
             self.remove(session_id);
             return;
         }
@@ -234,14 +244,19 @@ impl SessionHistories {
             if batch.base != revision {
                 return SessionChanges::ResetRequired;
             }
-            let Ok(events) = serde_json::from_slice(&batch.encoded) else {
+            let Ok((events, projection)) = serde_json::from_slice(&batch.encoded) else {
                 return SessionChanges::ResetRequired;
             };
             let mut base = cursor.clone();
             base.revision = batch.base;
             let mut next = cursor.clone();
             next.revision = batch.next;
-            batches.push(SessionChangeBatch { base, next, events });
+            batches.push(SessionChangeBatch {
+                base,
+                next,
+                events,
+                projection,
+            });
             revision = batch.next;
         }
         if revision != history.cursor.revision {
@@ -255,13 +270,23 @@ impl SessionHistories {
 }
 
 impl ServerCore {
-    /// Establishes an experimental bounded projection and cursor in the same actor turn.
-    /// This native producer is not a frontend API; gRPC capability negotiation is not wired yet.
+    /// Establishes a native semantic-event observer at the public projection boundary.
     ///
     /// # Errors
     /// Returns the existing session lookup error for a missing session, or a retryable conflict
     /// until the canonical projection has reached the publication boundary.
     pub fn session_sync_snapshot(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<SessionSyncSnapshot, ServiceError> {
+        let snapshot = self.projection_snapshot(session_id)?;
+        if let Some(history) = self.session_histories.sessions.get_mut(session_id) {
+            history.native_events = true;
+        }
+        Ok(snapshot)
+    }
+
+    fn projection_snapshot(
         &mut self,
         session_id: &SessionId,
     ) -> Result<SessionSyncSnapshot, ServiceError> {

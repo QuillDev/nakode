@@ -229,3 +229,6 @@ async fn authoritative_stream_and_terminal_publications_replay_after_cursor_adva
         .is_empty()
     );
 }
+
+#[cfg(unix)]
+mod follow;

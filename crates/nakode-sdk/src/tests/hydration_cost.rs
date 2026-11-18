@@ -153,10 +153,10 @@ async fn repeated_full_history_hydration_cost_scales_with_history() {
             let before_pages = pages.load(Ordering::SeqCst);
             let before_bodies = bodies.load(Ordering::SeqCst);
             let started = std::time::Instant::now();
-            let hydrated = client
-                .hydrate_session_with_refresh(snapshot.clone(), usize::MAX)
-                .await
-                .expect("hydrate full history");
+            let hydrated =
+                Box::pin(client.hydrate_session_with_refresh(snapshot.clone(), usize::MAX))
+                    .await
+                    .expect("hydrate full history");
             let elapsed = started.elapsed();
             let page_calls = pages.load(Ordering::SeqCst) - before_pages;
             let body_calls = bodies.load(Ordering::SeqCst) - before_bodies;

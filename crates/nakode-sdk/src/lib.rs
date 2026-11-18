@@ -34,6 +34,8 @@ use tower::{Layer, service_fn};
 
 pub use nakode_api::v1;
 pub mod materials;
+mod session_sync;
+pub use session_sync::FollowedSession;
 
 const RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_TRANSPORT_ATTEMPTS: usize = 4;
@@ -3929,7 +3931,7 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            let result = client.hydrate_session_with_refresh(stale, 128).await;
+            let result = Box::pin(client.hydrate_session_with_refresh(stale, 128)).await;
             match mode {
                 SessionServerMode::HydrationFresh => {
                     let hydrated = result.expect("fresh authoritative transcript");
